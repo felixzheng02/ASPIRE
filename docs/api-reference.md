@@ -132,6 +132,10 @@ schema.
 | `extension` | `libero.get_controller_metadata()` | Action dimension/bounds, arms, cameras, frequency/period, controller, gripper and joint-command semantics, action modes |
 | `extension` | `robosuite.get_task_metadata()` | `arms`, `camera_names`, `environment`, `family`, `language`, `robots`, `suite_name`, task identity |
 | `extension` | `robosuite.get_controller_metadata()` | Action dimension/bounds, arms, base frame, cameras, frequency/period, controller, controllable grippers, action modes |
+| `extension` | `robocasa.get_task_metadata()` | `arms`, `camera_names`, `environment`, `family`, `language`, `robots`, `suite_name`, task identity |
+| `extension` | `robocasa.get_controller_metadata()` | Action dimension, arms, base frame `robot0_link0`, cameras, frequency/period, controller, gripper semantics, action modes, `mobile_base`, `joint_limits` |
+| `extension` | `robocasa.get_base_pose()` | `Pose` of the mobile base in `world`. Proprioception a real mobile robot also has, not simulator state |
+| `extension` | `robocasa.navigate_to_pose(dx, dy, dyaw)` | Closed-loop RELATIVE base motion in the current base frame. No collision checking by design: a blocked path fails to converge and returns `ExecutionResult(ok=False)` with a `base_translation_m` diagnostic. Forward motion from the spawn pose is usually blocked by a counter; lateral and yaw converge |
 | `extension` | `behavior.get_task_metadata()` | `activity_name`, `arms`, `camera_names`, `family`, `instance_id`, `language`, `scene_model`, `suite_name`, `support_prompt`, `target_prompt`, task identity |
 | `extension` | `behavior.get_controller_metadata()` | Action dimension/bounds, arms, base frame `odom`, `base_pose`, cameras, frequency/period, controller, controllable grippers, `torso_positions`, `torso_lower_bounds`, `torso_upper_bounds` |
 | `extension` | `behavior.get_base_pose()` | `(x, y, yaw)` of the base footprint in `odom` |

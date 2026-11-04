@@ -10,6 +10,7 @@ import http.client
 import importlib
 from importlib import metadata as importlib_metadata
 import importlib.metadata
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -169,7 +170,11 @@ class DoctorConfig:
         )
 
     def resolved_environment_root(self) -> Path:
-        return self.environment_root or self.repository_root / ".venv-libero"
+        if self.environment_root is not None:
+            return self.environment_root
+        if self.embodiment == "robocasa":
+            return self.repository_root / ".venv-robocasa"
+        return self.repository_root / ".venv-libero"
 
     def resolved_libero_submodule(self) -> Path:
         if self.libero_submodule is not None:
@@ -439,7 +444,11 @@ def check_egl(config: DoctorConfig) -> CheckResult:
     library = ctypes.util.find_library("EGL")
     # Isaac Sim renders through Vulkan and ignores the MuJoCo EGL switches; only the MuJoCo
     # runtimes need MUJOCO_GL/PYOPENGL_PLATFORM to be set.
-    env_ok = config.embodiment == "behavior" or (mujoco_gl == "egl" and pyopengl == "egl")
+    # robocasa is exempt for the opposite reason to behavior: its client has no renderer at
+    # all. The simulator process owns the only GL context, and it sets EGL for itself.
+    env_ok = config.embodiment in ("behavior", "robocasa") or (
+        mujoco_gl == "egl" and pyopengl == "egl"
+    )
     config_ok = bool(vendor_files) and bool(library)
     return _result(
         "egl",
@@ -581,6 +590,34 @@ def check_robosuite_source(config: DoctorConfig) -> CheckResult:
         "Robosuite checkout matches the dependency lock",
         "Robosuite checkout is missing or does not match the dependency lock",
         {"path": str(checkout), "expected": expected, "actual": actual, "error": error},
+    )
+
+
+def check_robocasa_packages(config: DoctorConfig) -> CheckResult:
+    """Client transport present, and the simulator stack absent.
+
+    Every other runtime checks that its simulator imports. This one checks the opposite: the
+    RoboCasa environment lives in another process, and if mujoco/robosuite/robocasa were
+    importable here, generated code could reach simulator state directly and results would
+    stop transferring to hardware. The boundary is only structural if something fails when it
+    is breached.
+    """
+    imported, failures = _import_packages(("zmq", "msgpack", "robot_driver"))
+    leaked = [
+        name
+        for name in ("mujoco", "robosuite", "robocasa")
+        if importlib.util.find_spec(name) is not None
+    ]
+    ok = not failures and not leaked
+    return _result(
+        "robocasa_package_imports",
+        ok,
+        not config.unit_mode,
+        "client transport imports and no simulator package is reachable",
+        "the RoboCasa client environment is wrong"
+        + (f"; missing: {sorted(failures)}" if failures else "")
+        + (f"; simulator packages leaked in: {leaked}" if leaked else ""),
+        {"imported": imported, "failures": failures, "leaked": leaked},
     )
 
 
@@ -869,6 +906,28 @@ def _default_reset_probe(target: ResetTarget) -> Mapping[str, Any]:
             "seed": target.seed,
             "task_language_present": bool(language),
         }
+    if target.embodiment == "robocasa":
+        from cap_harness.robocasa.adapter import RobocasaAdapter
+        from cap_harness.robocasa.registry import RobocasaTaskRegistry
+        from cap_harness.validation import validate_observation_schema
+
+        registry = RobocasaTaskRegistry()
+        task_name = target.suite or registry.available_tasks[0]
+        metadata = registry.resolve(task_name, target.task_id)
+        adapter = RobocasaAdapter(registry=registry)
+        try:
+            observation = adapter.reset(metadata, target.seed)
+            language = adapter.get_task_context().language
+            validate_observation_schema(observation)
+        finally:
+            adapter.close()
+        return {
+            "embodiment": "robocasa",
+            "suite": metadata.suite_name,
+            "task_id": metadata.task_id,
+            "seed": target.seed,
+            "task_language_present": bool(language),
+        }
     if target.embodiment == "behavior":
         from cap_harness.behavior.adapter import BehaviorAdapter
         from cap_harness.behavior.registry import BehaviorTaskRegistry
@@ -894,7 +953,9 @@ def _default_reset_probe(target: ResetTarget) -> Mapping[str, Any]:
             "task_language_present": bool(language),
         }
     if target.embodiment != "libero":
-        raise ValueError("reset embodiment must be 'behavior', 'libero' or 'robosuite'")
+        raise ValueError(
+            "reset embodiment must be 'behavior', 'libero', 'robocasa' or 'robosuite'"
+        )
 
     from cap_harness.validation import (
         _default_adapter_factory,
@@ -1021,6 +1082,14 @@ def run_doctor(
             ),
             ("libero_paths", not config.unit_mode, lambda: check_libero_paths(config)),
         )
+    elif config.embodiment == "robocasa":
+        embodiment_checks = (
+            (
+                "robocasa_package_imports",
+                not config.unit_mode,
+                lambda: check_robocasa_packages(config),
+            ),
+        )
     elif config.embodiment == "behavior":
         embodiment_checks = (
             (
@@ -1042,7 +1111,9 @@ def run_doctor(
             ),
         )
     else:
-        raise ValueError("doctor embodiment must be 'behavior', 'libero' or 'robosuite'")
+        raise ValueError(
+            "doctor embodiment must be 'behavior', 'libero', 'robocasa' or 'robosuite'"
+        )
     operations: tuple[tuple[str, bool, Callable[[], CheckResult]], ...] = (
         ("python", True, lambda: check_python(config)),
         ("platform", not config.unit_mode, lambda: check_platform(config)),

@@ -48,6 +48,23 @@ LIBERO_PUBLIC_TOOL_NAMES = frozenset(
 
 DEFAULT_LIBERO_PUBLIC_ALLOWLIST = LIBERO_PUBLIC_TOOL_NAMES
 
+ROBOCASA_PUBLIC_TOOL_NAMES = frozenset(
+    {
+        "robocasa.get_base_pose",
+        "robocasa.get_controller_metadata",
+        "robocasa.get_task_metadata",
+        "robocasa.navigate_to_pose",
+    }
+)
+"""Nonprivileged RoboCasa (PandaOmron) metadata and mobile-base extensions.
+
+PandaOmron is a mobile manipulator and the shared tool set has no base motion, so without
+these the generated program cannot reposition and every target beyond the arm's ~0.85 m reach
+from the spawn pose is unreachable. The three BEHAVIOR standoff-geometry tools
+(``plan_approach_pose``, ``base_pose_is_free``, ``plan_standoff_pose``) are deliberately absent:
+they need collision queries this simulator does not serve yet.
+"""
+
 ROBOSUITE_PUBLIC_TOOL_NAMES = frozenset(
     {
         "robosuite.get_controller_metadata",
@@ -77,6 +94,7 @@ YAM_REAL_PUBLIC_TOOL_NAMES = frozenset(
 
 _APPROVED_EMBODIMENT_PREFIXES = (
     "behavior.",
+    "robocasa.",
     "yam_real.",
     "libero.",
     "robosuite.",
@@ -367,6 +385,7 @@ __all__ = [
     "BEHAVIOR_PUBLIC_TOOL_NAMES",
     "DEFAULT_LIBERO_PUBLIC_ALLOWLIST",
     "LIBERO_PUBLIC_TOOL_NAMES",
+    "ROBOCASA_PUBLIC_TOOL_NAMES",
     "ROBOSUITE_PUBLIC_TOOL_NAMES",
     "SHARED_PUBLIC_TOOL_NAMES",
     "YAM_REAL_PUBLIC_TOOL_NAMES",

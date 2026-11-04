@@ -83,8 +83,10 @@ def run_program(
     allow_motion: bool = False,
 ) -> RunOutcome:
     """Run an episode, using its task horizon when max_steps is not supplied."""
-    if benchmark not in {"behavior", "libero-pro", "robosuite", "yam_real"}:
-        raise ValueError("benchmark must be behavior, libero-pro, robosuite, or yam_real")
+    if benchmark not in {"behavior", "libero-pro", "robocasa", "robosuite", "yam_real"}:
+        raise ValueError(
+            "benchmark must be behavior, libero-pro, robocasa, robosuite, or yam_real"
+        )
     if init_mode not in {"saved", "seeded"}:
         raise ValueError("init_mode must be 'saved' or 'seeded'")
     if init_mode != "saved" and benchmark != "libero-pro":
@@ -113,6 +115,15 @@ def run_program(
         metadata = registry.resolve(suite, task_id)
         adapter_type = BehaviorAdapter
         extension_allowlist = BEHAVIOR_PUBLIC_TOOL_NAMES
+    elif benchmark == "robocasa":
+        from cap_harness.registry import ROBOCASA_PUBLIC_TOOL_NAMES
+        from cap_harness.robocasa.adapter import RobocasaAdapter
+        from cap_harness.robocasa.registry import RobocasaTaskRegistry
+
+        registry = RobocasaTaskRegistry()
+        metadata = registry.resolve(suite, task_id)
+        adapter_type = RobocasaAdapter
+        extension_allowlist = ROBOCASA_PUBLIC_TOOL_NAMES
     elif benchmark == "yam_real":
         from .registry import YAM_REAL_PUBLIC_TOOL_NAMES
         from .yam_real.adapter import YamRealAdapter

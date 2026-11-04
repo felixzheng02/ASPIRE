@@ -86,6 +86,18 @@ providers-sam3 = [
   "pydantic>=2.7",
   "setuptools<81",
 ]
+# RoboCasa reaches its simulator over the CaP-X ZeroMQ wire protocol instead of importing it,
+# so this extra carries no mujoco/robosuite/robocasa: just the transport and the shared
+# closed-loop driver. See docs/robocasa.md.
+robocasa = [
+  "pyzmq>=25",
+  "msgpack>=1",
+  "msgpack-numpy>=0.4.8",
+  "robot-driver",
+  # Artifact writing, not simulation: the run recorder saves episode videos and frames.
+  "imageio[ffmpeg]>=2.34",
+  "pillow>=10",
+]
 providers-pyroki = [
   "pyroki",
   "fastapi>=0.115",
@@ -159,6 +171,9 @@ cap_harness = [
 ]
 [tool.uv.sources]
 contact-graspnet-pytorch = { path = "third_party/contact_graspnet_pytorch", editable = true }
+# Outside this repo on purpose: CaP-X's .venv-client consumes the same package, and the two
+# harnesses must share one MotionProfile rather than drift apart.
+robot-driver = { path = "../robot-driver", editable = true }
 libero = { path = "third_party/LIBERO-PRO", editable = true }
 pyroki = { git = "https://github.com/chungmin99/pyroki.git", rev = "388e43e1fc0d0ee382968d3dd72970fd62a0450c" }
 robosuite = { path = "third_party/robosuite", editable = true }

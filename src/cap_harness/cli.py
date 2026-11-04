@@ -50,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     doctor.add_argument(
         "--runtime",
-        choices=("behavior", "libero", "robosuite"),
+        choices=("behavior", "libero", "robocasa", "robosuite"),
         help="dependency/runtime checks to perform (defaults to reset embodiment)",
     )
     doctor.add_argument(
@@ -86,7 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--reset-suite", help="suite for --reset (default: representative)")
     doctor.add_argument(
         "--reset-embodiment",
-        choices=("behavior", "libero", "robosuite"),
+        choices=("behavior", "libero", "robocasa", "robosuite"),
         default="libero",
         help="simulation embodiment for --reset (default: libero)",
     )
@@ -141,7 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run", help="execute and record one Code-as-Policy episode")
     run.add_argument(
         "--benchmark",
-        choices=("behavior", "libero-pro", "robosuite", "yam_real"),
+        choices=("behavior", "libero-pro", "robocasa", "robosuite", "yam_real"),
         default="libero-pro",
     )
     run.add_argument("--suite", required=True)
@@ -204,7 +204,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     batch.add_argument(
         "--benchmark",
-        choices=("libero-pro", "robosuite"),
+        choices=("libero-pro", "robocasa", "robosuite"),
         default="libero-pro",
     )
     batch.add_argument("--suite", required=True)

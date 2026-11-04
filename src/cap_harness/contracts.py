@@ -16,6 +16,8 @@ JOINT_DIMENSIONS: Mapping[str, int] = MappingProxyType(
     {
         "behavior": 7,
         "libero": 7,
+        # RoboCasa's PandaOmron: a 7-DOF Panda arm on an Omron mobile base.
+        "robocasa": 7,
         "robosuite": 7,
         "yam_real": 6,
     }

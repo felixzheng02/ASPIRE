@@ -21,6 +21,13 @@
       "extras": [],
       "client_only": true,
       "external_bootstrap": "scripts/bootstrap_behavior.sh"
+    },
+    "robocasa": {
+      "venv": ".venv-robocasa",
+      "extras": [
+        "robocasa"
+      ],
+      "client_only": true
     }
   },
   "providers": {

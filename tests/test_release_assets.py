@@ -9,6 +9,7 @@ from cap_harness.api import CapApi
 from cap_harness.registry import (
     BEHAVIOR_PUBLIC_TOOL_NAMES,
     LIBERO_PUBLIC_TOOL_NAMES,
+    ROBOCASA_PUBLIC_TOOL_NAMES,
     ROBOSUITE_PUBLIC_TOOL_NAMES,
     SHARED_PUBLIC_TOOL_NAMES,
     ToolRegistry,
@@ -270,6 +271,7 @@ def test_api_reference_tracks_registered_surfaces_and_is_linked() -> None:
     assert documented_extensions == set().union(
         BEHAVIOR_PUBLIC_TOOL_NAMES,
         LIBERO_PUBLIC_TOOL_NAMES,
+        ROBOCASA_PUBLIC_TOOL_NAMES,
         ROBOSUITE_PUBLIC_TOOL_NAMES,
     )
 
