@@ -832,10 +832,15 @@ def check_libero_paths(config: DoctorConfig) -> CheckResult:
     )
 
 
-def _http_status(host: str, port: int, timeout_s: float) -> tuple[bool, int | None, str | None]:
+def _http_status(
+    host: str,
+    port: int,
+    timeout_s: float,
+    path: str = "/openapi.json",
+) -> tuple[bool, int | None, str | None]:
     connection = http.client.HTTPConnection(host, port, timeout=timeout_s)
     try:
-        connection.request("GET", "/openapi.json", headers={"Accept": "application/json"})
+        connection.request("GET", path, headers={"Accept": "application/json"})
         response = connection.getresponse()
         response.read(4096)
         responding = 200 <= response.status < 300
@@ -858,8 +863,9 @@ def check_services(config: DoctorConfig) -> CheckResult:
         )
     results: list[dict[str, Any]] = []
     for name, port in config.services:
+        path = "/healthz" if name == "sam3" else "/openapi.json"
         responding, status, error = _http_status(
-            config.service_host, port, config.service_timeout_s
+            config.service_host, port, config.service_timeout_s, path=path
         )
         results.append(
             {

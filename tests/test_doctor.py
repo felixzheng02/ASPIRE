@@ -153,8 +153,8 @@ def test_nvidia_absence_is_warning_in_cpu_only_mode(monkeypatch):
 def test_service_health_checks_exact_required_ports(monkeypatch):
     calls = []
 
-    def http_status(host, port, timeout):
-        calls.append((host, port, timeout))
+    def http_status(host, port, timeout, path="/openapi.json"):
+        calls.append((host, port, timeout, path))
         return True, 200, None
 
     monkeypatch.setattr("cap_harness.doctor._http_status", http_status)
@@ -163,9 +163,9 @@ def test_service_health_checks_exact_required_ports(monkeypatch):
 
     assert check.status == "pass"
     assert calls == [
-        ("127.0.0.1", 8114, 0.25),
-        ("127.0.0.1", 8115, 0.25),
-        ("127.0.0.1", 8116, 0.25),
+        ("127.0.0.1", 8114, 0.25, "/healthz"),
+        ("127.0.0.1", 8115, 0.25, "/openapi.json"),
+        ("127.0.0.1", 8116, 0.25, "/openapi.json"),
     ]
 
 

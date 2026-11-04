@@ -88,9 +88,6 @@ meta = robocasa.get_controller_metadata()
 record("mobile_base", bool(meta["mobile_base"]), meta["mobile_base"])
 
 # --------------------------------------------------------------------------- scene SAM
-# "cabinet", not "drawer": ground-truth segmentation resolves whole bodies, and
-# RoboCasa's drawers are geometry inside cab_* bodies with no drawer body of
-# their own. segment_text(..., "drawer") returning nothing is expected.
 
 found = localize_object("cabinet", camera_name="agentview")
 cabinet_mask = None
@@ -163,16 +160,21 @@ for query in ["counter", "cabinet", "robot"]:
     if probed.ok and probed.segmentations:
         wrist_prompt = query
         break
-report["wrist_segment_text"] = {
-    "ok": wrist_prompt is not None,
-    "detail": wrist_prompt or "no fallback prompt hit; not a required check",
-}
+record(
+    "wrist_segment_text",
+    wrist_prompt is not None,
+    wrist_prompt or error_text(probed.error) or "no scene prompt hit on the wrist camera",
+)
 
 clicked = segment_points("robot0_eye_in_hand", [[float(wrist_w) / 2.0, float(wrist_h) / 2.0]])
+point_pixels = 0
+if clicked.ok and clicked.segmentations:
+    mask = clicked.segmentations[0].mask.tolist()
+    point_pixels = int(sum(sum(row) for row in mask))
 record(
     "segment_points",
-    clicked.ok,
-    error_text(clicked.error) if not clicked.ok else "point prompt HTTP ok",
+    clicked.ok and point_pixels > 0,
+    error_text(clicked.error) if not clicked.ok else {"pixels": point_pixels},
 )
 
 # --------------------------------------------------------------------------- gripper

@@ -384,26 +384,30 @@ def _validate_command(args: argparse.Namespace) -> int:
 
 
 def _run_command(args: argparse.Namespace) -> int:
-    from cap_harness.run import run_program
+    from cap_harness.run import Sam3ServiceUnavailable, run_program
 
-    outcome = run_program(
-        benchmark=args.benchmark,
-        suite=args.suite,
-        task_id=args.task_id,
-        seed=args.seed,
-        program_path=args.program,
-        output_root=args.output_root,
-        max_steps=args.max_steps,
-        camera_width=args.camera_width,
-        camera_height=args.camera_height,
-        model_trace=args.model_trace,
-        init_mode=args.init_mode,
-        flat_layout=args.flat_run_dir,
-        capture_videos=not args.no_videos,
-        station=args.station,
-        station_config_root=args.station_config_root,
-        allow_motion=args.allow_motion,
-    )
+    try:
+        outcome = run_program(
+            benchmark=args.benchmark,
+            suite=args.suite,
+            task_id=args.task_id,
+            seed=args.seed,
+            program_path=args.program,
+            output_root=args.output_root,
+            max_steps=args.max_steps,
+            camera_width=args.camera_width,
+            camera_height=args.camera_height,
+            model_trace=args.model_trace,
+            init_mode=args.init_mode,
+            flat_layout=args.flat_run_dir,
+            capture_videos=not args.no_videos,
+            station=args.station,
+            station_config_root=args.station_config_root,
+            allow_motion=args.allow_motion,
+        )
+    except Sam3ServiceUnavailable as exc:
+        print(str(exc), file=sys.stderr, flush=True)
+        return 1
     # Flushed explicitly: a simulator that segfaults on interpreter teardown (Isaac Sim does)
     # would otherwise discard these lines when stdout is a file.
     print(f"run: {outcome.run_dir}", flush=True)

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import http.client
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .api import CapApi
 from .artifacts import RunRecorder, StepLimitReached, TracedProvider, redact
@@ -18,10 +20,40 @@ from .registry import ToolRegistry
 from .runtime import ProgramExecutionResult, ProgramExecutor
 
 DEFAULT_MAX_STEPS = 1000
+SAM3_UNAVAILABLE = "SAM3 is not running on :8114"
 
 _CLOSE_AFTER_RECORDING = frozenset({"behavior"})
 """Benchmarks whose simulator must outlive artifact finalization (Isaac Sim ends the process)."""
 BEHAVIOR_VIDEO_FRAME_STRIDE = 3
+
+
+class Sam3ServiceUnavailable(RuntimeError):
+    """Infrastructure abort: RoboCasa requires a live SAM3 /healthz before any program."""
+
+
+def require_sam3_health(base_url: str | None = None, timeout_s: float = 2.0) -> None:
+    """GET /healthz on the SAM3 URL. The fake matcher does not serve that route."""
+    url = (base_url or os.environ.get("CAP_HARNESS_SAM3_URL") or DEFAULT_SAM3_URL).rstrip("/")
+    parsed = urlsplit(url)
+    host = parsed.hostname or "127.0.0.1"
+    if parsed.port is not None:
+        port = parsed.port
+    elif parsed.scheme == "https":
+        port = 443
+    else:
+        port = 80
+    connection = http.client.HTTPConnection(host, port, timeout=timeout_s)
+    try:
+        connection.request("GET", "/healthz", headers={"Accept": "application/json"})
+        response = connection.getresponse()
+        response.read(4096)
+        if 200 <= response.status < 300:
+            return
+    except (OSError, http.client.HTTPException):
+        pass
+    finally:
+        connection.close()
+    raise Sam3ServiceUnavailable(SAM3_UNAVAILABLE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +156,7 @@ def run_program(
         metadata = registry.resolve(suite, task_id)
         adapter_type = RobocasaAdapter
         extension_allowlist = ROBOCASA_PUBLIC_TOOL_NAMES
+        require_sam3_health()
     elif benchmark == "yam_real":
         from .registry import YAM_REAL_PUBLIC_TOOL_NAMES
         from .yam_real.adapter import YamRealAdapter
@@ -461,4 +494,11 @@ def run_program(
     )
 
 
-__all__ = ["RunOutcome", "run_program", "run_program_with_api"]
+__all__ = [
+    "SAM3_UNAVAILABLE",
+    "RunOutcome",
+    "Sam3ServiceUnavailable",
+    "require_sam3_health",
+    "run_program",
+    "run_program_with_api",
+]

@@ -13,15 +13,19 @@ simulator for hardware is a driver change, not a rewrite. See
 aspire/.venv-robocasa  ──ZMQ DEALER→ROUTER (msgpack, ipc:///tmp/capx-sim-0.sock)──┐
   cap_harness.robocasa                                                            ▼
   NO mujoco/robosuite/robocasa                      robocasa/capx_sim_server (its own venv)
-                       ──HTTP :8114, the SAM3 contract backed by ground truth──────┘
+
+aspire/.venv-sam3      ──HTTP :8114 /segment, /segment_point, /healthz────────────┘
 ```
 
 ## Setup
 
 ```bash
 scripts/bootstrap_robocasa.sh          # creates .venv-robocasa
+scripts/bootstrap_sam3.sh --profile rtx5090   # creates .venv-sam3; see host-setup.md
 source .venv-robocasa/bin/activate
 ```
+
+SAM3 weights are gated. Request access at [huggingface.co/facebook/sam3](https://huggingface.co/facebook/sam3), then `huggingface-cli login`. The checkpoint downloads on first service start. See [host-setup.md](host-setup.md).
 
 The environment is deliberately tiny — cap-harness's four core dependencies, the transport, the
 shared `robot-driver` package, and `imageio`/`pillow` for artifacts. The bootstrap **asserts
@@ -34,15 +38,20 @@ the only GL context and sets EGL for itself. `doctor` exempts this runtime accor
 
 ## Running
 
-The simulator comes up first, in its own process:
+SAM3 is a separate process on `http://127.0.0.1:8114`. The simulator does not serve it. From the workspace root:
 
 ```bash
-cd ..   # workspace root
+scripts/ensure_sam3.sh    # starts SAM3 if :8114 is empty; never kills it
+```
+
+Then the simulator, still from the workspace root:
+
+```bash
 MUJOCO_GL=egl robocasa/capx_sim_server/.venv/bin/python \
     robocasa/capx_sim_server/server.py --task OpenDrawer
 ```
 
-Then:
+Then, from `aspire/`:
 
 ```bash
 cap-harness doctor --runtime robocasa --expected-environment-name .venv-robocasa \
@@ -129,9 +138,13 @@ costmap — so they are a missing service rather than forbidden knowledge.
 4. **Base stiction.** The base joints carry `frictionloss=250` against an actuator gain of
    1000, so commands below ~0.25 move nothing at all. The driver's `MotionProfile` floors each
    axis at 0.45; a plain proportional law stalls and never starts short moves.
-5. **Ground truth segments whole bodies.** RoboCasa's drawers are geometry *inside*
-   `cab_*_main_group` bodies with no drawer body of their own, so `segment_text(..., "drawer")`
-   returns nothing. Ask for `cabinet` or `counter`.
+5. **SAM3 must already be running.** `cap-harness run` checks `GET /healthz` on
+   `:8114` before the program starts and exits with `SAM3 is not running on :8114`
+   if it is not. That is infrastructure, not a policy failure. Start it with
+   `scripts/ensure_sam3.sh` (workspace root) or
+   `python -m cap_harness.providers.sam3.service`. `cabinet` and `counter` are
+   reliable scene prompts; do not assume every English noun in the instruction
+   will return a mask.
 6. **`ndarray` methods break the program sandbox.** `points.mean(axis=0)`, `.min(axis=0)` and
    `.sum(axis=0)` trigger a lazy numpy import, and the sandbox passes `__builtins__` as a
    mappingproxy, so the import machinery fails with

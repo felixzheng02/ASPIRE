@@ -70,7 +70,8 @@ RoboCasa bootstrap complete.
   cache:        $UV_CACHE_ROOT
   driver:       $REPO_ROOT/../robot-driver
 
-Start the simulator first (separate process, its own venv):
+Start SAM3, then the simulator (separate processes):
+  cd $REPO_ROOT/.. && scripts/ensure_sam3.sh
   cd $REPO_ROOT/.. && MUJOCO_GL=egl \\
     robocasa/capx_sim_server/.venv/bin/python \\
     robocasa/capx_sim_server/server.py --task OpenDrawer
