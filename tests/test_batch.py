@@ -110,7 +110,7 @@ def test_unusable_seed_arguments_are_refused(text) -> None:
         parse_seed_arguments(text)
 
 
-@pytest.mark.parametrize("benchmark", ["behavior", "yam_real", "yam_sim", "robocasa"])
+@pytest.mark.parametrize("benchmark", ["behavior", "yam_real", "yam_sim"])
 def test_unsupported_worker_reuse_is_refused(program, tmp_path, benchmark) -> None:
     """Do not reuse Isaac runtimes or offer embodiments absent from this repo."""
     with pytest.raises(ValueError, match=benchmark):
@@ -121,6 +121,37 @@ def test_unsupported_worker_reuse_is_refused(program, tmp_path, benchmark) -> No
             program_path=program,
             output_root=tmp_path / "out",
             seeds=[1, 2],
+        )
+
+
+def test_robocasa_batch_accepts_one_worker(program, tmp_path) -> None:
+    results = run_seeds(
+        benchmark="robocasa",
+        suite="OpenDrawer",
+        task_id=0,
+        program_path=program,
+        output_root=tmp_path / "out",
+        seeds=[101, 102],
+        workers=1,
+        recycle_after=0,
+        init_mode="saved",
+        flat_layout=True,
+    )
+    assert [row.seed for row in results] == [101, 102]
+    assert all(row.ok for row in results)
+
+
+def test_robocasa_batch_refuses_multiple_workers(program, tmp_path) -> None:
+    with pytest.raises(ValueError, match="workers=1"):
+        run_seeds(
+            benchmark="robocasa",
+            suite="OpenDrawer",
+            task_id=0,
+            program_path=program,
+            output_root=tmp_path / "out",
+            seeds=[101, 102],
+            workers=2,
+            init_mode="saved",
         )
 
 

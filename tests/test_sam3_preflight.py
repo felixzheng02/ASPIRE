@@ -190,6 +190,94 @@ def test_robocasa_run_proceeds_when_healthz_is_up(tmp_path, monkeypatch) -> None
     assert outcome.program_ok is True
 
 
+def test_robocasa_run_forwards_endpoint_from_the_environment(tmp_path, monkeypatch) -> None:
+    metadata = SimpleNamespace(
+        suite_name="OpenDrawer",
+        task_id=0,
+        task_name="OpenDrawer",
+        horizon=10,
+    )
+    seen: list[dict] = []
+
+    class Adapter:
+        def __init__(self, **kwargs) -> None:
+            seen.append(kwargs)
+
+        def reset(self, metadata, seed: int) -> None:
+            del metadata, seed
+
+        def check_success(self) -> bool:
+            return False
+
+        def close(self) -> None:
+            return None
+
+    class Recorder:
+        def __init__(self, *, output_root: Path, **kwargs) -> None:
+            del kwargs
+            self.root = output_root / "run"
+            (self.root / "logs").mkdir(parents=True)
+            self.timing = RunTiming()
+            self.frequency = 20.0
+            self.terminal_reason = None
+            self.terminated = False
+            self.truncated = False
+
+        def save_program(self, path: Path) -> None:
+            del path
+
+        def import_model_trace(self, path: Path | None) -> None:
+            del path
+
+        def finalize(self, **kwargs) -> None:
+            del kwargs
+
+        def close_incomplete(self, error: BaseException, **kwargs) -> None:
+            raise AssertionError(f"unexpected incomplete run: {error!r}, {kwargs!r}")
+
+    monkeypatch.setattr(
+        "cap_harness.robocasa.registry.RobocasaTaskRegistry",
+        lambda: SimpleNamespace(resolve=lambda *args: metadata),
+    )
+    monkeypatch.setattr("cap_harness.robocasa.adapter.RobocasaAdapter", Adapter)
+    monkeypatch.setattr(run_module, "RunRecorder", Recorder)
+    monkeypatch.setattr(run_module, "Sam3Provider", lambda **kwargs: object())
+    monkeypatch.setattr(run_module, "ContactGraspNetProvider", lambda: object())
+    monkeypatch.setattr(run_module, "PyRokiProvider", lambda: object())
+    monkeypatch.setattr(run_module, "CuRoboProvider", lambda **kwargs: object())
+    monkeypatch.setattr(run_module, "TracedProvider", lambda provider, *args: provider)
+    monkeypatch.setattr(
+        run_module,
+        "CapApi",
+        lambda *args, **kwargs: SimpleNamespace(register_tools=lambda registry: registry),
+    )
+    monkeypatch.setattr(
+        run_module,
+        "ProgramExecutor",
+        lambda tools, recorder=None: SimpleNamespace(
+            execute_program=lambda source: ProgramExecutionResult(
+                ok=True, result=source, stdout="", calls=()
+            )
+        ),
+    )
+    monkeypatch.setattr(run_module, "require_sam3_health", lambda **kwargs: None)
+    monkeypatch.setenv("CAP_HARNESS_ROBOCASA_ENDPOINT", "ipc:///tmp/capx-sim-7.sock")
+    program = tmp_path / "policy.py"
+    program.write_text("result = 1", encoding="utf-8")
+
+    outcome = run_module.run_program(
+        benchmark="robocasa",
+        suite="OpenDrawer",
+        task_id=0,
+        seed=101,
+        program_path=program,
+        output_root=tmp_path / "outputs",
+        max_steps=10,
+    )
+    assert outcome.program_ok is True
+    assert seen[0]["endpoint"] == "ipc:///tmp/capx-sim-7.sock"
+
+
 def test_doctor_probes_sam3_on_healthz(monkeypatch) -> None:
     calls = []
 

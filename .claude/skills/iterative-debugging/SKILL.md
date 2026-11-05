@@ -8,8 +8,15 @@ description: "Run the baseline-free CaP iterative debugging (fix loop) pipeline 
 For BEHAVIOR-1K (R1 Pro on Isaac Sim) use the sibling folder
 [behavior/SKILL.md](behavior/SKILL.md). It is a **different protocol**, not just different
 prompts: those tasks are long-horizon, so each seed grows its own policy one code block at a
-time, and the campaign freezes a skill library rather than a program. Everything below is for
-the tabletop benchmarks (LIBERO-Pro, Robosuite).
+time, and the campaign freezes a skill library rather than a program.
+
+For RoboCasa (PandaOmron, out-of-process kitchen sim) use
+[robocasa/SKILL.md](robocasa/SKILL.md). Same **product** as below (one frozen program, held-out
+replay), different **embodiment**: worker-owned simulator, shared SAM3 via
+`scripts/ensure_sam3.sh`, `run-batch --workers 1` only. Do not follow the `--workers 4` commands
+or LIBERO seed defaults on that benchmark.
+
+Everything below is for the tabletop benchmarks (LIBERO-Pro, Robosuite).
 
 Use this skill to run a coordinated debugging campaign over any list of CaP benchmark tasks.
 No external baseline code or baseline output directory is used. Runs use

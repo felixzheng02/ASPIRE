@@ -78,6 +78,18 @@ the protocol's `CLOSE`, because `cap-harness run` closes the adapter after *ever
 `CLOSE` terminates the simulator process — episode 2 of a sweep would find nothing listening.
 Tearing the simulator down is the supervisor's job.
 
+## Campaign
+
+The write / run / refine loop is the sibling skill
+[`.claude/skills/iterative-debugging/robocasa/SKILL.md`](../.claude/skills/iterative-debugging/robocasa/SKILL.md),
+not the tabletop parent. Same product (one frozen program, held-out replay). The worker starts
+the simulator (`--idle-timeout 0`); SAM3 is start-if-idle via `scripts/ensure_sam3.sh` and is
+never killed. Sweeps are `cap-harness run-batch --workers 1 --recycle-after 0 --init-mode saved`.
+
+The first campaign is OpenDrawer only. Seeds, recorded in `campaign.json`: development
+**101 102 103**, unseen-check **126**, held-out **1 2 3**. Widening later keeps the TRAIN ≥101 /
+TEST 1–100 cut described above.
+
 ## Registry
 
 `OpenDrawer` and `PickPlaceCounterToStove`. `task_name` equals the environment name, so the same

@@ -23,6 +23,7 @@ pointer exists to prevent. If you want to add pipeline detail, add it there, not
 | `.claude/skills/iterative-debugging/subagent-prompt.md` | the per-task worker template |
 | `.claude/skills/iterative-debugging/skills/` | accumulated topic knowledge |
 | `.claude/skills/iterative-debugging/scripts/` | campaign scripts, shared by both harnesses |
+| `.claude/skills/iterative-debugging/robocasa/SKILL.md` | RoboCasa embodiment of the tabletop product |
 | `agents/openai.yaml` | this harness's own manifest, which has no counterpart under `.claude` |
 
 ## The one thing the canonical file cannot tell you from its title
@@ -32,3 +33,8 @@ BEHAVIOR-1K campaigns (R1 Pro on Isaac Sim) use the sibling folder
 different prompts for the same one: each seed grows its own policy one code block at a time, the
 campaign freezes a skill library rather than a program, and scoring is per final policy rather
 than per attempt. Do not carry the tabletop seed partitions or the tabletop scoring across to it.
+
+RoboCasa kitchen campaigns use `.claude/skills/iterative-debugging/robocasa/SKILL.md`. Same
+product as the tabletop loop (one frozen program, held-out replay), different embodiment:
+worker-owned simulator, shared SAM3 via `scripts/ensure_sam3.sh`, `run-batch --workers 1` only.
+Do not use the parent `--workers 4` path or LIBERO seed defaults on that benchmark.

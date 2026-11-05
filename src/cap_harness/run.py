@@ -289,6 +289,10 @@ def run_program(
             }
             if benchmark == "libero-pro":
                 adapter_kwargs["init_mode"] = init_mode
+            if benchmark == "robocasa":
+                endpoint = os.environ.get("CAP_HARNESS_ROBOCASA_ENDPOINT") or None
+                if endpoint:
+                    adapter_kwargs["endpoint"] = endpoint
             if benchmark == "yam_real":
                 from .yam_real.station import build_real_station
 

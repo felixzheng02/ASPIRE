@@ -21,8 +21,11 @@ independent of what its worker ran before it:
   closing GL contexts in one process is the classic place for a driver-side
   leak, and a bounded worker lifetime bounds the exposure.
 
-Only LIBERO-Pro and Robosuite support worker reuse. BEHAVIOR tears down its
-Isaac runtime on close and must keep using one fresh process per episode.
+LIBERO-Pro and Robosuite support a process pool (``workers > 1``): each worker
+builds its own in-process environment. RoboCasa may use ``run-batch`` only with
+``workers=1`` — one remote simulator cannot interleave two episodes. BEHAVIOR
+tears down its Isaac runtime on close and must keep using one fresh process per
+episode.
 """
 
 from __future__ import annotations
@@ -305,10 +308,16 @@ def run_seeds(
     Results stream to ``results_jsonl`` as they land, so an interrupted sweep
     leaves the seeds it finished on disk rather than nothing at all.
     """
-    if benchmark not in {"libero-pro", "robosuite"}:
+    if benchmark == "robocasa":
+        if workers != 1:
+            raise ValueError(
+                "run-batch accepts robocasa only with workers=1: one simulator "
+                "cannot interleave two episodes"
+            )
+    elif benchmark not in {"libero-pro", "robosuite"}:
         raise ValueError(
             f"run-batch does not accept {benchmark}: only libero-pro and robosuite "
-            "support worker reuse. Use a fresh `cap-harness run` process for each episode."
+            "support a worker pool. Use a fresh `cap-harness run` process for each episode."
         )
     if init_mode not in {"saved", "seeded"}:
         raise ValueError("init_mode must be 'saved' or 'seeded'")

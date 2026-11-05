@@ -599,6 +599,8 @@ def test_codex_entry_points_are_pointers_not_copies() -> None:
     # The behavior protocol is a different one, and the entry point must say so.
     debug = (codex / "iterative-debugging" / "SKILL.md").read_text(encoding="utf-8")
     assert "behavior/SKILL.md" in debug and "different protocol" in debug
+    # RoboCasa is the tabletop product with embodiment constraints, not a third Codex skill.
+    assert "robocasa/SKILL.md" in debug
 
 
 def _front_matter_field(text: str, field: str) -> str:
