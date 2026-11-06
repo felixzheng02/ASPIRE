@@ -17,8 +17,10 @@ What is different is the **embodiment**, not the scientific claim:
 | Simulator is another process | The Stage 1 worker starts `server.py` and keeps a PID file. `cap-harness` close does not kill it. |
 | One kitchen at a time | `run-batch --workers 1 --recycle-after 0` only. Never raise `--workers`. |
 | SAM3 is a shared process on `:8114` | Start-if-idle with `scripts/ensure_sam3.sh`. Never kill it. `GET /healthz` before episodes. |
-| No cartesian stack | Do not build a strategy on tools that return unsupported. Joint motion, interpolated trajectories, gripper 0/1, and `robocasa.navigate_to_pose` are the motion surface. |
-| Spawn faces a counter | Forward base motion often fails; lateral and yaw converge. Reach from spawn is ~0.85 m. |
+| PyRoki is a shared process on `:8116` | Start-if-idle with `scripts/ensure_pyroki.sh`. Never kill it. `GET /healthz` before episodes. `solve_ik` / `move_to_pose` are live. |
+| GraspNet is a shared process on `:8115` | Start-if-idle with `scripts/ensure_graspnet.sh`. Never kill it. `generate_grasps` / `select_grasp` are live. Not required for every `cap-harness run`. |
+| cuRobo is a shared process on `:8118` | Start-if-idle with `scripts/ensure_curobo.sh`. Never kill it. Collision-aware `plan_motion` is live on observed RGB-D. Not required for every `cap-harness run`. |
+| Spawn faces a counter | Forward base motion often fails; lateral and yaw converge. Reach from spawn is ~0.85 m. `robocasa.base_pose_is_free` is world-frame; arm/SAM poses are `robot0_link0`. |
 
 This folder has no `skills/` library and no verifier. The worker writes `findings.md`. Promotion
 into a shared library is a later campaign.
@@ -32,8 +34,10 @@ Working directory for harness commands is the CaP harness repo (`aspire/`, the d
 1. `aspire/scripts/bootstrap_robocasa.sh` once per machine (see [docs/robocasa.md](../../../../docs/robocasa.md)).
 2. SAM3 weights are gated. Request access, then `aspire/.venv-sam3/bin/hf auth login` if
    `ensure_sam3.sh` says to. Do not paste tokens.
-3. From `$WORKSPACE_ROOT`: `./scripts/ensure_sam3.sh` (start-if-idle; never kills). Confirm
-   `GET /healthz` on `http://127.0.0.1:8114` is 200.
+3. From `$WORKSPACE_ROOT`: `./scripts/ensure_sam3.sh`, `./scripts/ensure_pyroki.sh`,
+   `./scripts/ensure_graspnet.sh`, and `./scripts/ensure_curobo.sh` (start-if-idle; never
+   kills). Confirm `GET /healthz` on `:8114` and `:8116` is 200. `:8115` / `:8118` are
+   needed for grasps / collision-aware `plan_motion`, not for every run.
 4. Read [docs/api-reference.md](../../../../docs/api-reference.md) (the `robocasa.*` rows),
    [docs/robocasa.md](../../../../docs/robocasa.md), [docs/run-artifacts.md](../../../../docs/run-artifacts.md),
    and [main-agent-prompt.md](main-agent-prompt.md).
@@ -74,7 +78,8 @@ campaign's seed lists (see [main-agent-prompt.md](main-agent-prompt.md)).
 1. Write `tasks.json` with the single case
    `{"benchmark": "robocasa", "suite": "OpenDrawer", "task_id": 0}` and initialize the campaign
    root as in [main-agent-prompt.md](main-agent-prompt.md).
-2. `./scripts/ensure_sam3.sh` from `$WORKSPACE_ROOT`.
+2. `./scripts/ensure_sam3.sh`, `./scripts/ensure_pyroki.sh`, `./scripts/ensure_graspnet.sh`,
+   and `./scripts/ensure_curobo.sh` from `$WORKSPACE_ROOT`.
 3. Dispatch one Stage 1 worker with [subagent-prompt.md](subagent-prompt.md). The worker starts
    the simulator, explores seed 101, writes and scores versions on 101 102 103, freezes
    `fix_code.py`, measures once on 126, and returns.

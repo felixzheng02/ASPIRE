@@ -15,6 +15,9 @@ aspire/.venv-robocasa  ──ZMQ DEALER→ROUTER (msgpack, ipc:///tmp/capx-sim-0
   NO mujoco/robosuite/robocasa                      robocasa/capx_sim_server (its own venv)
 
 aspire/.venv-sam3      ──HTTP :8114 /segment, /segment_point, /healthz────────────┘
+aspire/.venv-pyroki    ──HTTP :8116 /ik, /healthz
+aspire/.venv-graspnet  ──HTTP :8115 /plan_point_clouds, /healthz
+aspire/.venv-curobo    ──HTTP :8118 /plan, /ik, /healthz
 ```
 
 ## Setup
@@ -41,7 +44,10 @@ the only GL context and sets EGL for itself. `doctor` exempts this runtime accor
 SAM3 is a separate process on `http://127.0.0.1:8114`. The simulator does not serve it. From the workspace root:
 
 ```bash
-scripts/ensure_sam3.sh    # starts SAM3 if :8114 is empty; never kills it
+scripts/ensure_sam3.sh      # starts SAM3 if :8114 is empty; never kills it
+scripts/ensure_pyroki.sh    # starts PyRoki if :8116 is empty; never kills it
+scripts/ensure_graspnet.sh  # starts GraspNet if :8115 is empty; never kills it
+scripts/ensure_curobo.sh    # starts cuRobo if :8118 is empty; never kills it
 ```
 
 Then the simulator, still from the workspace root:
@@ -64,11 +70,16 @@ cap-harness run --benchmark robocasa --suite OpenDrawer --task-id 0 --seed 101 \
 
 `examples/robocasa/connectivity_check.py` is an **integration gate**, not a policy. It
 measures that the public path actually moves and sees things (SAM on both cameras, gripper
-open/close, `move_to_joints`, `execute_trajectory`, `go_home`, lateral + yaw base motion) and
-raises if a required check fails, so `program_ok=False`. `task_success` will still be false —
-the script does not try to open the drawer. `solve_ik`, `generate_grasps`, and an intermediate
-`set_gripper` are asserted *absent* (RoboCasa has no IK/grasp backend and the jaw only holds
-0 or 1). A green `program_ok` with `task_success=false` is the healthy result.
+open/close, `move_to_joints`, `execute_trajectory`, `go_home`, `solve_ik` / `move_to_pose`,
+`generate_grasps` / `select_grasp`, collision-aware `plan_motion`, spawn-free vs
+counter-blocked `base_pose_is_free`, standoff/approach, lateral + yaw) and raises if a
+required check fails, so `program_ok=False`. `task_success` will still be false — the
+script does not try to open the drawer. An intermediate `set_gripper` is asserted *absent*
+(the jaw only holds 0 or 1). A green `program_ok` with `task_success=false` is the healthy
+result. `cap-harness run --benchmark robocasa` aborts if SAM3 `:8114` or PyRoki `:8116` is
+not serving `/healthz`. GraspNet `:8115` and cuRobo `:8118` are optional for a run that
+does not call those backends; start them with `scripts/ensure_graspnet.sh` and
+`scripts/ensure_curobo.sh`.
 
 `--init-mode` must be `saved`; `seeded` is a LIBERO-only concept (it indexes LIBERO's saved
 initial-state files). All RoboCasa variation comes from `--seed`.
@@ -83,8 +94,10 @@ Tearing the simulator down is the supervisor's job.
 The write / run / refine loop is the sibling skill
 [`.claude/skills/iterative-debugging/robocasa/SKILL.md`](../.claude/skills/iterative-debugging/robocasa/SKILL.md),
 not the tabletop parent. Same product (one frozen program, held-out replay). The worker starts
-the simulator (`--idle-timeout 0`); SAM3 is start-if-idle via `scripts/ensure_sam3.sh` and is
-never killed. Sweeps are `cap-harness run-batch --workers 1 --recycle-after 0 --init-mode saved`.
+the simulator (`--idle-timeout 0`); SAM3, PyRoki, GraspNet, and cuRobo are start-if-idle
+via `scripts/ensure_sam3.sh` / `scripts/ensure_pyroki.sh` / `scripts/ensure_graspnet.sh` /
+`scripts/ensure_curobo.sh` and are never killed. Sweeps are
+`cap-harness run-batch --workers 1 --recycle-after 0 --init-mode saved`.
 
 The first campaign is OpenDrawer only. Seeds, recorded in `campaign.json`: development
 **101 102 103**, unseen-check **126**, held-out **1 2 3**. Widening later keeps the TRAIN ≥101 /
@@ -129,10 +142,12 @@ PandaOmron is mobile and the shared tool set has no base motion, so `robocasa.ge
 `robocasa.navigate_to_pose` are public extensions. Without them every target beyond the arm's
 ~0.85 m reach from the spawn pose is unreachable.
 
-BEHAVIOR's three standoff-geometry tools (`plan_approach_pose`, `base_pose_is_free`,
-`plan_standoff_pose`) are deliberately **absent**: they need collision queries this simulator
-does not serve. They are legitimate by ASPIRE's own precedent — a real mobile robot has a
-costmap — so they are a missing service rather than forbidden knowledge.
+`robocasa.base_pose_is_free(x, y)` is a world-frame yes/no (same frame as `get_base_pose`)
+against non-robot collision geoms. It is not a grid and it is not always-True.
+`robocasa.plan_standoff_pose` / `robocasa.plan_approach_pose` are the BEHAVIOR hull helpers
+copied onto this adapter; they inherit the cloud frame. Request those clouds in `world`, or
+transform `robot0_link0` points, before feeding a candidate to `base_pose_is_free`.
+`navigate_to_pose` stays relative P-control — it does not consult the footprint query.
 
 ## Things that will cost you time
 
@@ -150,12 +165,15 @@ costmap — so they are a missing service rather than forbidden knowledge.
 4. **Base stiction.** The base joints carry `frictionloss=250` against an actuator gain of
    1000, so commands below ~0.25 move nothing at all. The driver's `MotionProfile` floors each
    axis at 0.45; a plain proportional law stalls and never starts short moves.
-5. **SAM3 must already be running.** `cap-harness run` checks `GET /healthz` on
-   `:8114` before the program starts and exits with `SAM3 is not running on :8114`
-   if it is not. That is infrastructure, not a policy failure. Start it with
-   `scripts/ensure_sam3.sh` (workspace root) or
-   `python -m cap_harness.providers.sam3.service`. `cabinet` and `counter` are
-   reliable scene prompts; do not assume every English noun in the instruction
+5. **SAM3 and PyRoki must already be running.** `cap-harness run` checks `GET /healthz`
+   on `:8114` and `:8116` before the program starts. That is infrastructure, not a policy
+   failure. Start them with `scripts/ensure_sam3.sh` and `scripts/ensure_pyroki.sh`
+   (workspace root). `solve_ik` / `move_to_pose` use PyRoki; poses must be in
+   `robot0_link0`. `generate_grasps` needs GraspNet on `:8115`
+   (`scripts/ensure_graspnet.sh`); clouds are in `robot0_link0`. Collision-aware
+   `plan_motion` needs cuRobo on `:8118` (`scripts/ensure_curobo.sh`) and plans
+   against the fused public RGB-D cloud in `robot0_link0`. `cabinet` and `counter`
+   are reliable scene prompts; do not assume every English noun in the instruction
    will return a mask.
 6. **`ndarray` methods break the program sandbox.** `points.mean(axis=0)`, `.min(axis=0)` and
    `.sum(axis=0)` trigger a lazy numpy import, and the sandbox passes `__builtins__` as a
@@ -169,3 +187,5 @@ costmap — so they are a missing service rather than forbidden knowledge.
 8. **`joint_velocities` are zeros.** The wire protocol carries no velocity channel. Nothing in
    the RoboCasa tool surface consumes them; if a planner ever does, the fix is a velocity field
    on the wire, not a finite difference in the adapter.
+9. **`base_pose_is_free` is world; arm poses are `robot0_link0`.** Mixing them without a
+   transform looks like a free pose that is actually inside the counter, or the reverse.

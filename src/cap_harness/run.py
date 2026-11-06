@@ -14,13 +14,14 @@ from .libero.adapter import LiberoAdapter
 from .libero.registry import LiberoSuiteRegistry
 from .providers.curobo.client import DEFAULT_CUROBO_URL, CuRoboProvider
 from .providers.graspnet.client import ContactGraspNetProvider
-from .providers.pyroki.client import PyRokiProvider
+from .providers.pyroki.client import DEFAULT_PYROKI_URL, PyRokiProvider
 from .providers.sam3.client import DEFAULT_SAM3_URL, Sam3Provider
 from .registry import ToolRegistry
 from .runtime import ProgramExecutionResult, ProgramExecutor
 
 DEFAULT_MAX_STEPS = 1000
 SAM3_UNAVAILABLE = "SAM3 is not running on :8114"
+PYROKI_UNAVAILABLE = "PyRoki is not running on :8116"
 
 _CLOSE_AFTER_RECORDING = frozenset({"behavior"})
 """Benchmarks whose simulator must outlive artifact finalization (Isaac Sim ends the process)."""
@@ -31,10 +32,18 @@ class Sam3ServiceUnavailable(RuntimeError):
     """Infrastructure abort: RoboCasa requires a live SAM3 /healthz before any program."""
 
 
-def require_sam3_health(base_url: str | None = None, timeout_s: float = 2.0) -> None:
-    """GET /healthz on the SAM3 URL. The fake matcher does not serve that route."""
-    url = (base_url or os.environ.get("CAP_HARNESS_SAM3_URL") or DEFAULT_SAM3_URL).rstrip("/")
-    parsed = urlsplit(url)
+class PyRokiServiceUnavailable(RuntimeError):
+    """Infrastructure abort: RoboCasa requires a live PyRoki /healthz before any program."""
+
+
+def _require_healthz(
+    url: str,
+    timeout_s: float,
+    *,
+    error: type[RuntimeError],
+    message: str,
+) -> None:
+    parsed = urlsplit(url.rstrip("/"))
     host = parsed.hostname or "127.0.0.1"
     if parsed.port is not None:
         port = parsed.port
@@ -53,7 +62,23 @@ def require_sam3_health(base_url: str | None = None, timeout_s: float = 2.0) -> 
         pass
     finally:
         connection.close()
-    raise Sam3ServiceUnavailable(SAM3_UNAVAILABLE)
+    raise error(message)
+
+
+def require_sam3_health(base_url: str | None = None, timeout_s: float = 2.0) -> None:
+    """GET /healthz on the SAM3 URL. The fake matcher does not serve that route."""
+    url = base_url or os.environ.get("CAP_HARNESS_SAM3_URL") or DEFAULT_SAM3_URL
+    _require_healthz(
+        url, timeout_s, error=Sam3ServiceUnavailable, message=SAM3_UNAVAILABLE
+    )
+
+
+def require_pyroki_health(base_url: str | None = None, timeout_s: float = 2.0) -> None:
+    """GET /healthz on the PyRoki URL. OpenAPI-only listeners are not a solver."""
+    url = base_url or os.environ.get("CAP_HARNESS_PYROKI_URL") or DEFAULT_PYROKI_URL
+    _require_healthz(
+        url, timeout_s, error=PyRokiServiceUnavailable, message=PYROKI_UNAVAILABLE
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +182,7 @@ def run_program(
         adapter_type = RobocasaAdapter
         extension_allowlist = ROBOCASA_PUBLIC_TOOL_NAMES
         require_sam3_health()
+        require_pyroki_health()
     elif benchmark == "yam_real":
         from .registry import YAM_REAL_PUBLIC_TOOL_NAMES
         from .yam_real.adapter import YamRealAdapter
@@ -499,9 +525,12 @@ def run_program(
 
 
 __all__ = [
+    "PYROKI_UNAVAILABLE",
     "SAM3_UNAVAILABLE",
+    "PyRokiServiceUnavailable",
     "RunOutcome",
     "Sam3ServiceUnavailable",
+    "require_pyroki_health",
     "require_sam3_health",
     "run_program",
     "run_program_with_api",

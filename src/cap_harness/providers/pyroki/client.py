@@ -9,7 +9,7 @@ import requests
 
 from cap_harness.contracts import JOINT_DIMENSION, IKResult, Pose, RobotState
 from cap_harness.errors import ApiError, ErrorCode
-from cap_harness.geometry import quaternion_wxyz_to_matrix
+from cap_harness.geometry import matrix_to_quaternion_wxyz, quaternion_wxyz_to_matrix
 
 from ..http import HttpProviderClient, ProviderHttpError
 from .wire import IK_PATH
@@ -17,8 +17,30 @@ from .wire import IK_PATH
 DEFAULT_PYROKI_URL = "http://127.0.0.1:8116"
 PYROKI_CONFIGURATION_DIMENSION = JOINT_DIMENSION + 1
 PANDA_EEF_TO_HAND_OFFSET_M = np.array([0.0, 0.0, -0.1], dtype=np.float64)
+# gripper0_right_eef in RoboCasa's panda_gripper.xml sits on right_gripper, whose
+# body quat is Rz(-90°). LIBERO's robot0_eef is already panda_hand-aligned, so
+# only robocasa right-multiplies this local-Z +90° to recover panda_hand.
+_ROBOCASA_HAND_FROM_EEF_ROTATION = np.array(
+    [
+        [0.0, -1.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ],
+    dtype=np.float64,
+)
 MAX_POSITION_ERROR_M = 0.02
 MAX_ORIENTATION_ERROR_RAD = 0.15
+SUPPORTED_EMBODIMENTS = frozenset({"libero", "robocasa", "robosuite"})
+
+
+def _panda_hand_target(target_pose: Pose, embodiment: str) -> np.ndarray:
+    """Map a public EEF pose to the panda_hand wxyz_xyz PyRoki solves."""
+    rotation = quaternion_wxyz_to_matrix(target_pose.quaternion_wxyz)
+    hand_position = target_pose.position + (rotation @ PANDA_EEF_TO_HAND_OFFSET_M)
+    hand_rotation = rotation
+    if embodiment == "robocasa":
+        hand_rotation = rotation @ _ROBOCASA_HAND_FROM_EEF_ROTATION
+    return np.concatenate((matrix_to_quaternion_wxyz(hand_rotation), hand_position))
 
 
 class PyRokiProvider:
@@ -64,7 +86,7 @@ class PyRokiProvider:
                 arm=arm,
                 embodiment=embodiment,
             )
-        if robot_state.embodiment not in {"libero", "robosuite"}:
+        if robot_state.embodiment not in SUPPORTED_EMBODIMENTS:
             return self._failure(
                 ErrorCode.UNSUPPORTED,
                 f"PyRoki does not support embodiment {robot_state.embodiment!r}",
@@ -109,12 +131,9 @@ class PyRokiProvider:
                 embodiment=embodiment,
             )
 
-        # The public pose targets LIBERO's robot0_eef frame, while the pinned
-        # PyRoki service solves panda_hand. Convert only at the provider boundary.
-        hand_position = target_pose.position + (
-            quaternion_wxyz_to_matrix(target_pose.quaternion_wxyz) @ PANDA_EEF_TO_HAND_OFFSET_M
-        )
-        target_wxyz_xyz = np.concatenate((target_pose.quaternion_wxyz, hand_position))
+        # The public pose targets the embodiment EEF, while the pinned PyRoki
+        # service solves panda_hand. Convert only at the provider boundary.
+        target_wxyz_xyz = _panda_hand_target(target_pose, embodiment)
         provider_seed = np.concatenate((seed, np.zeros(1, dtype=np.float64)))
         payload = {
             "target_pose_wxyz_xyz": target_wxyz_xyz.tolist(),
@@ -199,4 +218,10 @@ class PyRokiProvider:
 PyrokiProvider = PyRokiProvider
 PyRokiClient = PyRokiProvider
 
-__all__ = ["DEFAULT_PYROKI_URL", "PyRokiClient", "PyRokiProvider", "PyrokiProvider"]
+__all__ = [
+    "DEFAULT_PYROKI_URL",
+    "SUPPORTED_EMBODIMENTS",
+    "PyRokiClient",
+    "PyRokiProvider",
+    "PyrokiProvider",
+]

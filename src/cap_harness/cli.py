@@ -384,7 +384,7 @@ def _validate_command(args: argparse.Namespace) -> int:
 
 
 def _run_command(args: argparse.Namespace) -> int:
-    from cap_harness.run import Sam3ServiceUnavailable, run_program
+    from cap_harness.run import PyRokiServiceUnavailable, Sam3ServiceUnavailable, run_program
 
     try:
         outcome = run_program(
@@ -405,7 +405,7 @@ def _run_command(args: argparse.Namespace) -> int:
             station_config_root=args.station_config_root,
             allow_motion=args.allow_motion,
         )
-    except Sam3ServiceUnavailable as exc:
+    except (Sam3ServiceUnavailable, PyRokiServiceUnavailable) as exc:
         print(str(exc), file=sys.stderr, flush=True)
         return 1
     # Flushed explicitly: a simulator that segfaults on interpreter teardown (Isaac Sim does)

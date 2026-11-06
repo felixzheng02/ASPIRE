@@ -11,8 +11,11 @@ from cap_harness.artifacts import RunTiming
 from cap_harness.doctor import DoctorConfig, _http_status, check_services
 import cap_harness.run as run_module
 from cap_harness.run import (
+    PYROKI_UNAVAILABLE,
     SAM3_UNAVAILABLE,
+    PyRokiServiceUnavailable,
     Sam3ServiceUnavailable,
+    require_pyroki_health,
     require_sam3_health,
 )
 from cap_harness.runtime import ProgramExecutionResult
@@ -69,6 +72,28 @@ def test_require_sam3_health_rejects_down_port() -> None:
         require_sam3_health(base_url="http://127.0.0.1:1", timeout_s=0.2)
 
 
+def test_require_pyroki_health_accepts_healthz() -> None:
+    server, url = _serve(_HealthzHandler)
+    try:
+        require_pyroki_health(base_url=url, timeout_s=1.0)
+    finally:
+        server.shutdown()
+
+
+def test_require_pyroki_health_rejects_openapi_only() -> None:
+    server, url = _serve(_OpenApiOnlyHandler)
+    try:
+        with pytest.raises(PyRokiServiceUnavailable, match=PYROKI_UNAVAILABLE):
+            require_pyroki_health(base_url=url, timeout_s=1.0)
+    finally:
+        server.shutdown()
+
+
+def test_require_pyroki_health_rejects_down_port() -> None:
+    with pytest.raises(PyRokiServiceUnavailable, match=PYROKI_UNAVAILABLE):
+        require_pyroki_health(base_url="http://127.0.0.1:1", timeout_s=0.2)
+
+
 def test_robocasa_run_aborts_before_the_program(tmp_path, monkeypatch) -> None:
     metadata = SimpleNamespace(
         suite_name="OpenDrawer",
@@ -86,10 +111,45 @@ def test_robocasa_run_aborts_before_the_program(tmp_path, monkeypatch) -> None:
         raise Sam3ServiceUnavailable(SAM3_UNAVAILABLE)
 
     monkeypatch.setattr(run_module, "require_sam3_health", boom)
+    monkeypatch.setattr(run_module, "require_pyroki_health", lambda **kwargs: None)
     program = tmp_path / "policy.py"
     program.write_text("result = 1", encoding="utf-8")
 
     with pytest.raises(Sam3ServiceUnavailable, match=SAM3_UNAVAILABLE):
+        run_module.run_program(
+            benchmark="robocasa",
+            suite="OpenDrawer",
+            task_id=0,
+            seed=101,
+            program_path=program,
+            output_root=tmp_path / "outputs",
+            max_steps=10,
+        )
+    assert not list((tmp_path / "outputs").glob("**/*"))
+
+
+def test_robocasa_run_aborts_when_pyroki_is_down(tmp_path, monkeypatch) -> None:
+    metadata = SimpleNamespace(
+        suite_name="OpenDrawer",
+        task_id=0,
+        task_name="OpenDrawer",
+        horizon=10,
+    )
+    monkeypatch.setattr(
+        "cap_harness.robocasa.registry.RobocasaTaskRegistry",
+        lambda: SimpleNamespace(resolve=lambda *args: metadata),
+    )
+
+    def boom(base_url=None, timeout_s=2.0):
+        del base_url, timeout_s
+        raise PyRokiServiceUnavailable(PYROKI_UNAVAILABLE)
+
+    monkeypatch.setattr(run_module, "require_sam3_health", lambda **kwargs: None)
+    monkeypatch.setattr(run_module, "require_pyroki_health", boom)
+    program = tmp_path / "policy.py"
+    program.write_text("result = 1", encoding="utf-8")
+
+    with pytest.raises(PyRokiServiceUnavailable, match=PYROKI_UNAVAILABLE):
         run_module.run_program(
             benchmark="robocasa",
             suite="OpenDrawer",
@@ -175,6 +235,7 @@ def test_robocasa_run_proceeds_when_healthz_is_up(tmp_path, monkeypatch) -> None
         ),
     )
     monkeypatch.setattr(run_module, "require_sam3_health", lambda **kwargs: None)
+    monkeypatch.setattr(run_module, "require_pyroki_health", lambda **kwargs: None)
     program = tmp_path / "policy.py"
     program.write_text("result = 1", encoding="utf-8")
 
@@ -261,6 +322,7 @@ def test_robocasa_run_forwards_endpoint_from_the_environment(tmp_path, monkeypat
         ),
     )
     monkeypatch.setattr(run_module, "require_sam3_health", lambda **kwargs: None)
+    monkeypatch.setattr(run_module, "require_pyroki_health", lambda **kwargs: None)
     monkeypatch.setenv("CAP_HARNESS_ROBOCASA_ENDPOINT", "ipc:///tmp/capx-sim-7.sock")
     program = tmp_path / "policy.py"
     program.write_text("result = 1", encoding="utf-8")

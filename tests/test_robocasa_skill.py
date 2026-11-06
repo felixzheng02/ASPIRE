@@ -54,6 +54,7 @@ def test_robocasa_skill_is_the_tabletop_product_with_embodiment_constraints() ->
     assert "/healthz" in overview and "/healthz" in subagent and "/healthz" in coordinator
     assert "Never kill SAM3" in subagent or "never kill SAM3" in subagent.lower()
     assert "Never kill SAM3" in slate or "never kill SAM3" in slate.lower()
+    assert "ensure_graspnet.sh" in slate
 
     for text in texts:
         assert "--workers 4" not in text
@@ -61,8 +62,15 @@ def test_robocasa_skill_is_the_tabletop_product_with_embodiment_constraints() ->
         assert "ROBOCASA_PERCEPTION" not in text
         assert "fake matcher" not in text.lower()
         assert "ground truth SAM" not in text
-        assert "solve_ik" not in text
         assert "51" not in _without_benign(text)
+    assert "solve_ik" in subagent and "move_to_pose" in subagent
+    assert "generate_grasps" in subagent and "select_grasp" in subagent
+    assert "plan_motion" in subagent
+    assert "base_pose_is_free" in subagent and "plan_standoff_pose" in subagent
+    assert "plan_approach_pose" in subagent
+    assert "ensure_pyroki.sh" in overview and "ensure_pyroki.sh" in subagent
+    assert "ensure_graspnet.sh" in overview and "ensure_graspnet.sh" in subagent
+    assert "ensure_curobo.sh" in overview and "ensure_curobo.sh" in subagent
 
     for text in (overview, subagent, coordinator):
         assert "101" in text and "102" in text and "103" in text

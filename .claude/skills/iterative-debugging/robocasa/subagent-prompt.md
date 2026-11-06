@@ -54,8 +54,10 @@ You have full tool access (Bash, Read, Write, Edit, Glob, Grep).
 **Your scope — read carefully:**
 
 - You own Stage 0 (explore + initial code) and Stage 1 (debug `$DEV_SEEDS`) ONLY.
-- **You start and own the simulator process.** SAM3 is shared and already required by
-  `cap-harness`; you may call `ensure_sam3.sh` to reuse it. You never kill SAM3.
+- **You start and own the simulator process.** SAM3 and PyRoki are shared and already
+  required by `cap-harness`; you may call `ensure_sam3.sh`, `ensure_pyroki.sh`, and
+  `ensure_graspnet.sh`, and `ensure_curobo.sh` to reuse them. You never kill SAM3, PyRoki,
+  GraspNet, or cuRobo.
 - You own GPU $GPU for the simulator. This campaign has one simulator.
 - **Seeds in $UNSEEN_SEEDS are for one measurement, at the end (Stage 1 Step 4).** Never debug
   against them and never run them twice.
@@ -109,9 +111,15 @@ Provenance, not only an API-name ban:
   Perception:   segment_text(camera, text), segment_points(camera, points_px),
                 mask_to_point_cloud(mask, camera, frame=...), estimate_geometry(point_cloud),
                 localize_object(query, camera_name=..., target_frame=...)
-  Motion:       execute_trajectory(trajectory), move_to_joints(target), go_home(), step(action)
+  Grasps:       generate_grasps(camera, mask), select_grasp(grasps)
+  Motion:       execute_trajectory(trajectory), move_to_joints(target),
+                move_to_pose(pose), solve_ik(pose),
+                plan_motion(goal, strategy=MotionStrategy(...)), go_home(), step(action)
   Gripper:      open_gripper(), close_gripper()
   Extensions:   robocasa.get_base_pose(), robocasa.navigate_to_pose(dx, dy, dyaw),
+                robocasa.base_pose_is_free(x, y),
+                robocasa.plan_standoff_pose(support_cloud, object_cloud, standoff_m),
+                robocasa.plan_approach_pose(object_cloud, distance_m),
                 robocasa.get_task_metadata(), robocasa.get_controller_metadata()
 
 `get_task_context().language` is the instruction. Cameras are `agentview` and
@@ -120,29 +128,35 @@ Provenance, not only an API-name ban:
 width.
 
 **Not a strategy.** These names may exist and return unsupported. Do not call them, do not wait
-for them, do not write a program that is only a cartesian recipe:
+for them:
 
-- cartesian IK / `move_to_pose` / planned collision-free paths
-- grasp-generation backends
 - intermediate jaw width
-- BEHAVIOR standoff-geometry tools (no costmap on this simulator)
 
 **venv:** `$CAP_HARNESS` only. Never repair `.venv-robocasa`. The harness does not render; do not
 export `MUJOCO_GL` on harness commands.
 
 ---
 
-## Simulator and SAM3
+## Simulator and shared providers
 
-SAM3 is shared. From `$WORKSPACE_ROOT`:
+SAM3, PyRoki, GraspNet, and cuRobo are shared. From `$WORKSPACE_ROOT`:
 
 ```bash
 "$WORKSPACE_ROOT/scripts/ensure_sam3.sh"
+"$WORKSPACE_ROOT/scripts/ensure_pyroki.sh"
+"$WORKSPACE_ROOT/scripts/ensure_graspnet.sh"
+"$WORKSPACE_ROOT/scripts/ensure_curobo.sh"
 curl -sS -o /dev/null -w '%{http_code}\n' --max-time 3 http://127.0.0.1:8114/healthz
+curl -sS -o /dev/null -w '%{http_code}\n' --max-time 3 http://127.0.0.1:8116/healthz
+curl -sS -o /dev/null -w '%{http_code}\n' --max-time 3 http://127.0.0.1:8115/healthz
+curl -sS -o /dev/null -w '%{http_code}\n' --max-time 3 http://127.0.0.1:8118/healthz
 ```
 
-200 on `/healthz` is up. If `cap-harness` prints `SAM3 is not running on :8114`, rerun
-`ensure_sam3.sh` and stop if it still fails. **Never kill SAM3.**
+200 on SAM3 and PyRoki `/healthz` is required by `cap-harness`. GraspNet `:8115` and
+cuRobo `:8118` are start-if-idle for grasps / collision-aware `plan_motion`; OpenDrawer
+can run without them. If `cap-harness` prints `SAM3 is not running on :8114` or
+`PyRoki is not running on :8116`, rerun the matching `ensure_*.sh` and stop if it still
+fails. **Never kill SAM3, PyRoki, GraspNet, or cuRobo.**
 
 Start the simulator **once**, without extra flags that would bind HTTP:
 
@@ -176,13 +190,27 @@ reason to give up on language. Confirm overlays in `media/overlays/` before trus
 ## Motion that actually exists
 
 - `robocasa.navigate_to_pose(dx, dy, dyaw)` is **relative** in the current base frame, closed
-  loop, no collision checking. Spawn faces a counter: a forward `dx` often returns `ok=False`.
+  loop, no map-aware driving. Spawn faces a counter: a forward `dx` often returns `ok=False`.
   Lateral and yaw converge. Targets beyond ~0.85 m from spawn need a base move first.
+- `robocasa.base_pose_is_free(x, y)` is world-frame (same as `get_base_pose`). Arm poses and
+  default SAM clouds are `robot0_link0`. Transform, or request clouds in `world`, before
+  testing a standoff/approach candidate. The answer is a boolean, not a map.
+- `robocasa.plan_standoff_pose(support, object)` / `robocasa.plan_approach_pose(object)`
+  return `(x, y, yaw)` in the cloud frame. A counter cloud as support and a cabinet/handle
+  cloud as object is the usual OpenDrawer pair.
 - `move_to_joints` is the closed-loop arm path (absolute joint targets).
-- `execute_trajectory` applies **one control tick per waypoint** and checks the last against
-  0.02 rad. Interpolate densely and hold the goal, as in
-  `examples/robocasa/connectivity_check.py` (25 interpolation steps + 10 holds). Two waypoints
-  0.10 rad apart miss.
+- `solve_ik(pose)` / `move_to_pose(pose)` are live (PyRoki on `:8116`). Poses must use
+  `get_robot_state().base_frame` (`robot0_link0`).
+- `generate_grasps(camera, mask)` / `select_grasp(grasps)` are live (GraspNet on `:8115`).
+  Clouds are projected into `robot0_link0`. Confirm the SAM overlay in `media/overlays/`
+  before trusting the mask you passed in.
+- `plan_motion(..., strategy=MotionStrategy(ik_solver="pyroki", trajectory_planner="curobo"))`
+  is live (cuRobo on `:8118`) against the fused public RGB-D cloud in `robot0_link0`.
+  Interpolation `plan_motion` still works without cuRobo. A `PLANNING_FAILED` result is
+  a real collision/IK refusal, not a missing backend.
+- `execute_trajectory` densifies steps above 0.05 rad, plays intermediates one tick each,
+  then closed-loop servos the last waypoint. `move_to_joints` is the same closed-loop
+  primitive used for that last waypoint.
 
 ```python
 n_traj = 25

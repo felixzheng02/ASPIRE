@@ -50,19 +50,22 @@ DEFAULT_LIBERO_PUBLIC_ALLOWLIST = LIBERO_PUBLIC_TOOL_NAMES
 
 ROBOCASA_PUBLIC_TOOL_NAMES = frozenset(
     {
+        "robocasa.base_pose_is_free",
         "robocasa.get_base_pose",
         "robocasa.get_controller_metadata",
         "robocasa.get_task_metadata",
         "robocasa.navigate_to_pose",
+        "robocasa.plan_approach_pose",
+        "robocasa.plan_standoff_pose",
     }
 )
 """Nonprivileged RoboCasa (PandaOmron) metadata and mobile-base extensions.
 
 PandaOmron is a mobile manipulator and the shared tool set has no base motion, so without
 these the generated program cannot reposition and every target beyond the arm's ~0.85 m reach
-from the spawn pose is unreachable. The three BEHAVIOR standoff-geometry tools
-(``plan_approach_pose``, ``base_pose_is_free``, ``plan_standoff_pose``) are deliberately absent:
-they need collision queries this simulator does not serve yet.
+from the spawn pose is unreachable. ``base_pose_is_free`` is a world-frame yes/no against
+scene geoms (same frame as ``get_base_pose``). ``plan_standoff_pose`` / ``plan_approach_pose``
+are the BEHAVIOR hull helpers copied here; they inherit the cloud frame.
 """
 
 ROBOSUITE_PUBLIC_TOOL_NAMES = frozenset(

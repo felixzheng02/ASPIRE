@@ -1,7 +1,8 @@
 # Integration gate for the RoboCasa adapter. NOT a policy for the task.
 #
 # A real program takes this path -- observation, SAM, back-projection, gripper,
-# joint motion, execute_trajectory, go_home, mobile base -- and this file
+# joint motion, execute_trajectory, go_home, cartesian IK, grasps, mobile base,
+# footprint occupancy, standoff geometry -- and this file
 # *measures* that each step did something. It does not try to open the drawer;
 # writing the task program is the agent's job. task_success will still be false.
 #
@@ -89,12 +90,15 @@ record("mobile_base", bool(meta["mobile_base"]), meta["mobile_base"])
 
 # --------------------------------------------------------------------------- scene SAM
 
+cabinet_cloud = None
+counter_cloud = None
 found = localize_object("cabinet", camera_name="agentview")
 cabinet_mask = None
 if found.ok:
-    points = found.point_cloud.points
+    cabinet_cloud = found.point_cloud
+    points = cabinet_cloud.points
     n_points = int(len(points))
-    cloud_frame = found.point_cloud.frame
+    cloud_frame = cabinet_cloud.frame
     centroid = centroid_of(points)
     cabinet_mask = found.segmentation
     record(
@@ -129,6 +133,7 @@ if seen.ok and seen.segmentations:
     # which matches no adapter's base frame. localize_object resolves it from
     # robot state; this entry point does not.
     cloud = mask_to_point_cloud(best, "agentview", state.base_frame)
+    counter_cloud = cloud
     record(
         "segment_counter",
         len(cloud.points) >= 20 and cloud.frame == state.base_frame,
@@ -141,6 +146,67 @@ if seen.ok and seen.segmentations:
     )
 else:
     record("segment_counter", False, error_text(seen.error) or "empty mask")
+
+# --------------------------------------------------------------------------- footprint + standoff
+# base_pose_is_free is world (same frame as get_base_pose). Default SAM clouds
+# are robot0_link0; transform a centroid before the free check. Geometry
+# helpers inherit the cloud frame and only need finite (x, y, yaw).
+
+
+def qrot(q, v):
+    w, x, y, z = [float(a) for a in q]
+    vx, vy, vz = [float(a) for a in v]
+    tx = 2.0 * (y * vz - z * vy)
+    ty = 2.0 * (z * vx - x * vz)
+    tz = 2.0 * (x * vy - y * vx)
+    return [
+        vx + w * tx + (y * tz - z * ty),
+        vy + w * ty + (z * tx - x * tz),
+        vz + w * tz + (x * ty - y * tx),
+    ]
+
+
+spawn = robocasa.get_base_pose()
+sx = float(spawn.position[0])
+sy = float(spawn.position[1])
+spawn_yaw = yaw_of(spawn)
+spawn_free = robocasa.base_pose_is_free(sx, sy, spawn_yaw)
+record(
+    "spawn_free",
+    spawn_free is True,
+    {"x": round(sx, 3), "y": round(sy, 3), "yaw": round(spawn_yaw, 3), "free": spawn_free},
+)
+
+if counter_cloud is None:
+    record("counter_blocked", False, "no counter cloud")
+else:
+    c = centroid_of(counter_cloud.points)
+    rotated = qrot(spawn.quaternion_wxyz, c)
+    cx = sx + rotated[0]
+    cy = sy + rotated[1]
+    counter_free = robocasa.base_pose_is_free(cx, cy)
+    record(
+        "counter_blocked",
+        counter_free is False,
+        {"x": round(cx, 3), "y": round(cy, 3), "free": counter_free},
+    )
+
+if counter_cloud is None or cabinet_cloud is None:
+    record("plan_standoff_pose", False, "need counter and cabinet clouds")
+    record("plan_approach_pose", False, "need a cabinet cloud")
+else:
+    standoff = robocasa.plan_standoff_pose(counter_cloud, cabinet_cloud, 0.3)
+    record(
+        "plan_standoff_pose",
+        all(math.isfinite(float(v)) for v in standoff),
+        {"xyyaw": [round(float(v), 3) for v in standoff]},
+    )
+    approach = robocasa.plan_approach_pose(cabinet_cloud, 0.7)
+    record(
+        "plan_approach_pose",
+        all(math.isfinite(float(v)) for v in approach),
+        {"xyyaw": [round(float(v), 3) for v in approach]},
+    )
 
 # --------------------------------------------------------------------------- wrist SAM
 
@@ -307,24 +373,104 @@ record(
     },
 )
 
-# --------------------------------------------------------------------------- expected failures: IK, grasps, mid-range gripper are
-# not wired for RoboCasa. If they start succeeding, that is a regression.
+# --------------------------------------------------------------------------- cartesian IK, GraspNet, and collision-aware plan_motion are live.
+# Mid-range gripper is still unwired: if set_gripper(0.5) starts succeeding,
+# that is a regression of *this* gate, not automatically a finished feature.
 
-ik = solve_ik(get_robot_state().end_effector_poses["primary"])
+ee = get_robot_state().end_effector_poses["primary"]
+ik = solve_ik(ee)
 record(
-    "solve_ik_unsupported",
-    not ik.ok,
-    error_text(ik.error) or "solve_ik unexpectedly succeeded",
+    "solve_ik_ok",
+    ik.ok,
+    {
+        "command_ok": ik.ok,
+        "n_joints": 0 if ik.joint_positions is None else len(ik.joint_positions),
+        "error": error_text(ik.error),
+    },
+)
+
+# Home EE is already near the Panda's ~0.85 m ceiling; lift fails IK. Lower it.
+lowered = {
+    "position": [float(ee.position[0]), float(ee.position[1]), float(ee.position[2]) - 0.04],
+    "quaternion_wxyz": [float(v) for v in ee.quaternion_wxyz],
+    "frame": ee.frame,
+}
+posed = move_to_pose(lowered, tolerance=0.03, max_steps=200)
+ee_after = get_robot_state().end_effector_poses["primary"]
+z_error = abs(float(ee_after.position[2]) - float(lowered["position"][2]))
+record(
+    "move_to_pose",
+    posed.ok and z_error <= 0.04,
+    {
+        "command_ok": posed.ok,
+        "z_before": round(float(ee.position[2]), 3),
+        "z_after": round(float(ee_after.position[2]), 3),
+        "z_target": round(float(lowered["position"][2]), 3),
+        "z_error": round(z_error, 3),
+        "error": error_text(posed.error),
+    },
+)
+
+current = joints_of(get_robot_state())
+joint_goal = list(current)
+joint_goal[2] = current[2] + 0.06
+interpolated = plan_motion(joint_goal)
+n_interp = 0 if interpolated.trajectory is None else len(interpolated.trajectory.joint_positions)
+record(
+    "plan_motion_interpolation",
+    interpolated.ok and n_interp >= 2,
+    {
+        "command_ok": interpolated.ok,
+        "n_waypoints": n_interp,
+        "error": error_text(interpolated.error),
+    },
+)
+curobo_plan = plan_motion(
+    joint_goal,
+    strategy=MotionStrategy(ik_solver="pyroki", trajectory_planner="curobo"),
+)
+curobo_code = "" if curobo_plan.error is None else str(curobo_plan.error.code)
+curobo_aware = None
+if curobo_plan.trajectory is not None:
+    curobo_aware = bool(curobo_plan.trajectory.collision_aware)
+record(
+    "plan_motion_curobo",
+    curobo_plan.ok or curobo_code == "planning_failed",
+    {
+        "command_ok": curobo_plan.ok,
+        "code": curobo_code,
+        "collision_aware": curobo_aware,
+        "error": error_text(curobo_plan.error),
+    },
 )
 
 if cabinet_mask is None:
-    record("generate_grasps_unsupported", False, "no cabinet mask to pass to generate_grasps")
+    record("generate_grasps_ok", False, "no cabinet mask to pass to generate_grasps")
+    record("select_grasp", False, "no grasps")
 else:
     grasps = generate_grasps("agentview", cabinet_mask)
+    n_grasps = 0 if (not grasps.ok or grasps.grasps is None) else len(grasps.grasps)
+    grasp_frame = ""
+    if n_grasps > 0:
+        grasp_frame = grasps.grasps[0].pose.frame
     record(
-        "generate_grasps_unsupported",
-        not grasps.ok,
-        error_text(grasps.error) or "generate_grasps unexpectedly succeeded",
+        "generate_grasps_ok",
+        grasps.ok and n_grasps > 0 and grasp_frame == state.base_frame,
+        {
+            "command_ok": grasps.ok,
+            "n": n_grasps,
+            "frame": grasp_frame,
+            "error": error_text(grasps.error),
+        },
+    )
+    chosen = select_grasp(grasps, "highest_score") if grasps.ok else None
+    record(
+        "select_grasp",
+        chosen is not None and chosen.pose.frame == state.base_frame,
+        {
+            "frame": "" if chosen is None else chosen.pose.frame,
+            "score": None if chosen is None else round(float(chosen.score), 3),
+        },
     )
 
 mid_grip = set_gripper(0.5)

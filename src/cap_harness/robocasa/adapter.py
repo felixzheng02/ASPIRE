@@ -20,6 +20,7 @@ Consequences worth knowing before reading on:
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+import math
 from types import MappingProxyType
 from typing import Any
 
@@ -31,6 +32,7 @@ from cap_harness.contracts import (
     Observation,
     Pose,
     RobotAction,
+    RobotPlanningContext,
     RobotState,
     StepResult,
     TaskContext,
@@ -39,11 +41,48 @@ from cap_harness.contracts import (
 from cap_harness.errors import ApiError, ErrorCode
 from cap_harness.geometry import invert_transform, matrix_to_pose, quaternion_wxyz_to_matrix
 from cap_harness.robocasa.codec import RobocasaActionCodec
+from cap_harness.robocasa.geometry import (
+    plan_approach_pose as approach_from_cloud,
+)
+from cap_harness.robocasa.geometry import (
+    plan_standoff_pose as standoff_from_clouds,
+)
 from cap_harness.robocasa.registry import (
     RobocasaTaskMetadata,
     RobocasaTaskRegistry,
     scene_group_for_seed,
 )
+
+#: CapApi interpolates at this scale; two sparse waypoints 0.10 rad apart miss
+#: the 0.02 rad execute_trajectory tolerance (trap 17).
+TRAJECTORY_MAX_JOINT_STEP_RAD = 0.05
+#: Closed-loop budget for the last waypoint (``RobotClient.move_to_joints``).
+TRAJECTORY_GOAL_MAX_STEPS = 120
+#: cuRobo's panda model names. The public RobotState still reports joint_0..6.
+PANDA_JOINT_NAMES = tuple(f"panda_joint{index}" for index in range(1, 8))
+
+
+def densify_joint_waypoints(
+    waypoints: np.ndarray,
+    *,
+    max_step_rad: float = TRAJECTORY_MAX_JOINT_STEP_RAD,
+) -> np.ndarray:
+    """Insert linearly interpolated joints so no step exceeds ``max_step_rad``."""
+    points = np.asarray(waypoints, dtype=np.float64)
+    if points.ndim != 2 or points.shape[0] == 0:
+        return points
+    if not np.isfinite(max_step_rad) or max_step_rad <= 0.0:
+        raise ValueError("max_step_rad must be positive and finite")
+    densified = [points[0]]
+    for nxt in points[1:]:
+        prev = densified[-1]
+        delta = nxt - prev
+        span = float(np.max(np.abs(delta)))
+        count = 1 if span <= max_step_rad else int(np.ceil(span / max_step_rad))
+        for index in range(1, count + 1):
+            densified.append(prev + (index / count) * delta)
+        densified[-1] = nxt
+    return np.asarray(densified, dtype=np.float64)
 
 
 def _transform_from_quaternion_and_position(quaternion_wxyz: Any, position: Any) -> np.ndarray:
@@ -51,6 +90,11 @@ def _transform_from_quaternion_and_position(quaternion_wxyz: Any, position: Any)
     transform[:3, :3] = quaternion_wxyz_to_matrix(quaternion_wxyz)
     transform[:3, 3] = np.asarray(position, dtype=np.float64).reshape(3)
     return transform
+
+
+def _yaw_from_wxyz(quaternion_wxyz: Any) -> float:
+    w, x, y, z = (float(v) for v in np.asarray(quaternion_wxyz, dtype=np.float64).reshape(4))
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
 
 class RobocasaAdapter:
@@ -277,6 +321,19 @@ class RobocasaAdapter:
             raise RuntimeError("reset() must be called before reading the task context")
         return self._task_context
 
+    def get_planning_context(self) -> RobotPlanningContext:
+        """Panda calibration in ``robot0_link0``. Identity because the fused
+        planning scene already lives in ``BASE_FRAME`` — never ``robot0_base``.
+        """
+        arm = "primary"
+        return RobotPlanningContext(
+            embodiment=self.embodiment,
+            model="panda",
+            joint_names={arm: PANDA_JOINT_NAMES},
+            base_transforms={arm: np.eye(4, dtype=np.float64)},
+            end_effector_links={arm: "panda_hand"},
+        )
+
     def get_observation(self) -> Observation:
         return Observation(
             cameras={name: self._camera_observation(name) for name in self.metadata.camera_names},
@@ -328,6 +385,42 @@ class RobocasaAdapter:
             ),
             final_errors={"base_translation_m": moved},
         )
+
+    def base_pose_is_free(self, x: float, y: float, yaw: float = 0.0) -> bool:
+        """Whether a PandaOmron footprint at world ``(x, y)`` is empty of scene geometry.
+
+        Same frame as :meth:`get_base_pose`. Arm poses and default SAM clouds are
+        ``robot0_link0``; transform those into world before calling this. The
+        answer is a boolean, not a map.
+        """
+        return bool(self._require_client().base_pose_is_free(float(x), float(y), float(yaw)))
+
+    @staticmethod
+    def plan_standoff_pose(
+        support_cloud: Any, object_cloud: Any, standoff_m: float = 0.3
+    ) -> tuple[float, float, float]:
+        """Pure geometry: ``(x, y, yaw)`` outside the support hull, in the clouds' frame."""
+        return standoff_from_clouds(support_cloud, object_cloud, standoff_m)
+
+    def plan_approach_pose(
+        self, object_cloud: Any, distance_m: float = 0.7
+    ) -> tuple[float, float, float]:
+        """Pure geometry: ``distance_m`` short of the object along the current line of sight.
+
+        The answer is in the cloud's frame. ``world`` clouds use :meth:`get_base_pose`;
+        ``robot0_link0`` clouds use the origin of that frame as the current base.
+        """
+        frame = getattr(object_cloud, "frame", None)
+        if frame == self.BASE_FRAME:
+            base = (0.0, 0.0, 0.0)
+        else:
+            pose = self.get_base_pose()
+            base = (
+                float(pose.position[0]),
+                float(pose.position[1]),
+                _yaw_from_wxyz(pose.quaternion_wxyz),
+            )
+        return approach_from_cloud(object_cloud, base, distance_m)
 
     # ---------------------------------------------------------------------- step
 
@@ -381,7 +474,7 @@ class RobocasaAdapter:
         trajectory: Trajectory,
         *,
         tolerance: float = 0.02,
-        settle_steps: int = 0,
+        settle_steps: int = TRAJECTORY_GOAL_MAX_STEPS,
     ) -> ExecutionResult:
         if not isinstance(trajectory, Trajectory):
             raise ValueError("trajectory must be a Trajectory")
@@ -395,25 +488,41 @@ class RobocasaAdapter:
                     code=ErrorCode.INVALID_REQUEST, message=f"unknown arm {arm!r}"
                 ),
             )
-        waypoints = np.asarray(trajectory.joint_positions, dtype=np.float64)
-        grips = (
+        waypoints = densify_joint_waypoints(
+            np.asarray(trajectory.joint_positions, dtype=np.float64)
+        )
+        raw_grips = (
             None
             if trajectory.gripper_positions is None
             else np.asarray(trajectory.gripper_positions, dtype=np.float64).reshape(-1)
         )
+        grips = None
+        if raw_grips is not None and raw_grips.size and waypoints.size:
+            grips = np.full(waypoints.shape[0], float(raw_grips[-1]))
         executed = 0
-        for index, waypoint in enumerate(waypoints):
+        truncated_early = False
+        play = waypoints[:-1] if waypoints.shape[0] > 1 else waypoints[:0]
+        for index, waypoint in enumerate(play):
             if grips is not None and index < grips.size:
                 client.set_gripper_target(float(grips[index]))
             client.step(client.build_action(waypoint[:7]))
             executed += 1
             self._elapsed_steps += 1
             if self._truncated():
+                truncated_early = True
                 break
-        for _ in range(max(0, int(settle_steps))):
-            client.step(client.build_action())
-            executed += 1
-            self._elapsed_steps += 1
+        if not truncated_early and waypoints.size:
+            if grips is not None:
+                client.set_gripper_target(float(grips[-1]))
+            start_steps = client.sim_step_count()
+            client.move_to_joints(
+                waypoints[-1][:7],
+                tolerance=float(tolerance),
+                max_steps=max(1, int(settle_steps)),
+            )
+            extra = max(0, client.sim_step_count() - start_steps)
+            executed += extra
+            self._elapsed_steps += extra
         final = np.asarray(client.joint_pos(), dtype=np.float64).reshape(-1)[:7]
         error = float(np.linalg.norm(final - waypoints[-1][:7])) if waypoints.size else 0.0
         converged = error <= float(tolerance)
@@ -543,4 +652,9 @@ class RobocasaAdapter:
                 self._client = None
 
 
-__all__ = ["RobocasaAdapter"]
+__all__ = [
+    "TRAJECTORY_GOAL_MAX_STEPS",
+    "TRAJECTORY_MAX_JOINT_STEP_RAD",
+    "RobocasaAdapter",
+    "densify_joint_waypoints",
+]

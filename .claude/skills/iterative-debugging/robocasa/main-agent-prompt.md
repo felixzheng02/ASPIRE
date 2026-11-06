@@ -14,7 +14,7 @@ The parent's provenance gate still applies: `Non-privileged API audit: PASS` bef
 - One task: `robocasa` / `OpenDrawer` / `task_id 0`.
 - Development 101 102 103, unseen-check 126, held-out 1 2 3. `--init-mode saved`. `MAX_STEPS` 1000.
 - One Stage 1 worker. That worker starts the simulator and leaves it up. You reuse it for Stage 2.
-- SAM3 is shared. You start-if-idle it once. You never kill it.
+- SAM3, PyRoki, GraspNet, and cuRobo are shared. You start-if-idle them once. You never kill them.
 - No verifier, no skill promotion, no GPU ledger beyond that one worker.
 
 ## Initialization
@@ -40,10 +40,16 @@ From `$WORKSPACE_ROOT` (parent of `aspire/`):
 
 ```bash
 ./scripts/ensure_sam3.sh
+./scripts/ensure_pyroki.sh
+./scripts/ensure_graspnet.sh
+./scripts/ensure_curobo.sh
 curl -sS -o /dev/null -w '%{http_code}\n' --max-time 3 http://127.0.0.1:8114/healthz
+curl -sS -o /dev/null -w '%{http_code}\n' --max-time 3 http://127.0.0.1:8116/healthz
+curl -sS -o /dev/null -w '%{http_code}\n' --max-time 3 http://127.0.0.1:8115/healthz
+curl -sS -o /dev/null -w '%{http_code}\n' --max-time 3 http://127.0.0.1:8118/healthz
 ```
 
-200 on `/healthz` is required. If `ensure_sam3.sh` tells you to log in to Hugging Face, stop and
+200 on SAM3 and PyRoki `/healthz` is required. GraspNet `:8115` is for `generate_grasps`. cuRobo `:8118` is for collision-aware `plan_motion`. If `ensure_sam3.sh` tells you to log in to Hugging Face, stop and
 tell the operator to run `aspire/.venv-sam3/bin/hf auth login`. Do not paste tokens.
 
 Do not start `scripts/supervise_services.sh`.
@@ -71,7 +77,8 @@ From `$TASK_DIR=$RUN_ROOT/robocasa/OpenDrawer/task_0`:
    `${CAP_HARNESS_ROBOCASA_ENDPOINT:-ipc:///tmp/capx-sim-0.sock}` is listening. If the socket is
    gone, restart **the simulator** the way the worker prompt does (`--idle-timeout 0`, no extra
    HTTP flags). Leave SAM3 alone.
-4. `/healthz` on `:8114` is still 200.
+4. `/healthz` on `:8114` and `:8116` is still 200. `:8115` / `:8118` are live if the worker
+   called `ensure_graspnet.sh` / `ensure_curobo.sh`.
 
 ## Stage 2
 
@@ -92,4 +99,4 @@ for development tuning. Regenerate progress after it finishes.
 ## After the campaign
 
 The simulator PID in `$TASK_DIR/simulator.pid` can be stopped (kill that PID only). **Never kill
-SAM3.**
+SAM3, PyRoki, GraspNet, or cuRobo.**
