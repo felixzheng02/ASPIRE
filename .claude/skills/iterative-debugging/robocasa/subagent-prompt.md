@@ -1,23 +1,23 @@
 ---
 name: iterative-debugging-robocasa-subagent-prompt
-description: Self-contained prompt template for the RoboCasa OpenDrawer Stage 1 worker. Copy, fill in GPU/RUN_ROOT, and pass to the Agent tool. Owns write/run/refine and the simulator, not SAM3.
+description: Self-contained prompt template for a RoboCasa Stage 1 worker. Copy, fill in SUITE/TASK_ID/GPU/RUN_ROOT from tasks.json, and pass to the Agent tool. Owns write/run/refine and the simulator, not SAM3. The instruction is get_task_context().language.
 ---
 
 # RoboCasa Fix Loop Subagent Prompt Template
 
-When dispatching a subagent for OpenDrawer, copy everything between the `TEMPLATE START` and
-`TEMPLATE END` markers, fill in the assignment variables, and pass it as the `prompt`. Dispatch
-instructions live in [main-agent-prompt.md](main-agent-prompt.md). The parent template
-([../subagent-prompt.md](../subagent-prompt.md)) is for in-process tabletop benchmarks; do not
-mix it with this one.
+When dispatching a subagent for one RoboCasa task, copy everything between the `TEMPLATE START`
+and `TEMPLATE END` markers, fill in the assignment variables from `tasks.json`, and pass it as
+the `prompt`. Dispatch instructions live in [main-agent-prompt.md](main-agent-prompt.md). The
+parent template ([../subagent-prompt.md](../subagent-prompt.md)) is for in-process tabletop
+benchmarks; do not mix it with this one.
 
 <!-- ==================== TEMPLATE START ==================== -->
 
 ## Task Assignment
 
 BENCHMARK: robocasa
-SUITE:     OpenDrawer
-TASK_ID:   0
+SUITE:     <$SUITE from tasks.json>
+TASK_ID:   <$TASK_ID from tasks.json>
 GPU:       <assigned simulation GPU>
 RUN_ROOT:  <campaign root, e.g. outputs/runs/2026-11-04_16-00-00>
 
@@ -35,8 +35,8 @@ export WORKSPACE_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
 export CAP_HARNESS="$REPO_ROOT/.venv-robocasa/bin/cap-harness"
 export INIT_MODE=saved
 export BENCHMARK=robocasa
-export SUITE=OpenDrawer
-export TASK_ID=0
+export SUITE=<$SUITE from tasks.json>
+export TASK_ID=<$TASK_ID from tasks.json>
 export DEV_SEEDS="101 102 103"
 export UNSEEN_SEEDS="126"
 export CAP_HARNESS_ROBOCASA_ENDPOINT="${CAP_HARNESS_ROBOCASA_ENDPOINT:-ipc:///tmp/capx-sim-0.sock}"
@@ -47,8 +47,9 @@ TASK_DIR="$RUN_ROOT/$BENCHMARK/$SUITE/task_$TASK_ID"
 
 ## What You Are
 
-You are a fix loop subagent for RoboCasa OpenDrawer. Your job is to write one generalizable
-program, debug it on the three development kitchens, freeze it as `fix_code.py`, and report.
+You are a fix loop subagent for this RoboCasa task (`$SUITE` / task `$TASK_ID`). Your job is
+to write one generalizable program, debug it on the three development kitchens, freeze it as
+`fix_code.py`, and report.
 You have full tool access (Bash, Read, Write, Edit, Glob, Grep).
 
 **Your scope — read carefully:**
@@ -63,8 +64,13 @@ You have full tool access (Bash, Read, Write, Edit, Glob, Grep).
   against them and never run them twice.
 - **Do NOT run held-out seeds 1–$HELDOUT_COUNT. Do NOT run `run_validation.py`.** The coordinator
   runs Stage 2 after you return.
-- Do NOT edit anything under `.claude/skills/iterative-debugging/`. There is no shared skill
-  library in this campaign. Your channel for what you learned is `findings.md`.
+- **MAY read** `.claude/skills/iterative-debugging/robocasa/skills/` (this campaign's only
+  library). Consult it before writing `v00`. Grade it in `skill_report.json`.
+- **Do NOT edit** that library — only the coordinator promotes verified entries. Do NOT edit
+  the tabletop parent `.claude/skills/iterative-debugging/skills/` either.
+- **Do NOT read any other task's directory under `$RUN_ROOT`** — not its `findings.md`, not
+  its programs, not its run artifacts. The RoboCasa library is the only sanctioned cross-task
+  channel.
 - **Every file you create lives inside `$TASK_DIR`.** Every harness run must use one of the
   `--output-root` values defined below.
 - **If a tool refuses an action, do NOT reach for a different tool to accomplish the same thing.**
@@ -122,10 +128,13 @@ Provenance, not only an API-name ban:
                 robocasa.plan_approach_pose(object_cloud, distance_m),
                 robocasa.get_task_metadata(), robocasa.get_controller_metadata()
 
-`get_task_context().language` is the instruction. Cameras are `agentview` and
-`robot0_eye_in_hand`. `get_robot_state().base_frame` is `robot0_link0` — pass it explicitly to
-`localize_object` / `mask_to_point_cloud`. The jaw holds 0 or 1; do not command an intermediate
-width.
+`get_task_context().language` is the **only** per-episode instruction. Call it at runtime
+(`context = get_task_context()`; see `examples/robocasa/connectivity_check.py` for that call,
+not as a policy to copy). Parse object names from `context.language`. Do **not** infer the
+goal from `$SUITE`, do not bake seed-101 nouns into the program, and do not hardcode
+`drawer` / `handle` / a food name. Cameras are `agentview` and `robot0_eye_in_hand`.
+`get_robot_state().base_frame` is `robot0_link0` — pass it explicitly to `localize_object` /
+`mask_to_point_cloud`. The jaw holds 0 or 1; do not command an intermediate width.
 
 **Not a strategy.** These names may exist and return unsupported. Do not call them, do not wait
 for them:
@@ -153,17 +162,18 @@ curl -sS -o /dev/null -w '%{http_code}\n' --max-time 3 http://127.0.0.1:8118/hea
 ```
 
 200 on SAM3 and PyRoki `/healthz` is required by `cap-harness`. GraspNet `:8115` and
-cuRobo `:8118` are start-if-idle for grasps / collision-aware `plan_motion`; OpenDrawer
-can run without them. If `cap-harness` prints `SAM3 is not running on :8114` or
+cuRobo `:8118` are start-if-idle for grasps / collision-aware `plan_motion`; not every
+program needs them. If `cap-harness` prints `SAM3 is not running on :8114` or
 `PyRoki is not running on :8116`, rerun the matching `ensure_*.sh` and stop if it still
 fails. **Never kill SAM3, PyRoki, GraspNet, or cuRobo.**
 
-Start the simulator **once**, without extra flags that would bind HTTP:
+Start the simulator **once**, without extra flags that would bind HTTP. `--task` must equal
+`$SUITE` (the same string as `--suite`):
 
 ```bash
 mkdir -p "$TASK_DIR"
 MUJOCO_GL=egl "$WORKSPACE_ROOT/robocasa/capx_sim_server/.venv/bin/python" \
-  "$WORKSPACE_ROOT/robocasa/capx_sim_server/server.py" --task OpenDrawer \
+  "$WORKSPACE_ROOT/robocasa/capx_sim_server/server.py" --task "$SUITE" \
   --endpoint "$CAP_HARNESS_ROBOCASA_ENDPOINT" \
   --idle-timeout 0 \
   >"$TASK_DIR/simulator.log" 2>&1 &
@@ -181,9 +191,11 @@ process up across every `cap-harness` invocation — adapter close must not shut
 
 ## Perception
 
-This is image SAM3. Prompt the instruction nouns (`drawer`, `handle` for OpenDrawer). `cabinet`
-and `counter` are reliable fallbacks. Check `.ok` and mask size; empty is a prompt miss, not a
-reason to give up on language. Confirm overlays in `media/overlays/` before trusting a centroid.
+This is image SAM3. Prompt the nouns in `get_task_context().language`. `cabinet` and `counter`
+are kitchen fallbacks when a noun misses; they are not the goal. Check `.ok` and mask size;
+empty is a prompt miss, not a reason to give up on language. Confirm overlays in
+`media/overlays/` before trusting a centroid. `localize_object` returns SAM's first mask —
+often the counter — so pick the mask that matches the instruction noun, not the first hit.
 
 ---
 
@@ -196,8 +208,8 @@ reason to give up on language. Confirm overlays in `media/overlays/` before trus
   default SAM clouds are `robot0_link0`. Transform, or request clouds in `world`, before
   testing a standoff/approach candidate. The answer is a boolean, not a map.
 - `robocasa.plan_standoff_pose(support, object)` / `robocasa.plan_approach_pose(object)`
-  return `(x, y, yaw)` in the cloud frame. A counter cloud as support and a cabinet/handle
-  cloud as object is the usual OpenDrawer pair.
+  return `(x, y, yaw)` in the cloud frame. Choose support and object clouds from what the
+  instruction names (a counter as support is common; do not assume a cabinet/handle pair).
 - `move_to_joints` is the closed-loop arm path (absolute joint targets).
 - `solve_ik(pose)` / `move_to_pose(pose)` are live (PyRoki on `:8116`). Poses must use
   `get_robot_state().base_frame` (`robot0_link0`).
@@ -249,6 +261,8 @@ mkdir -p "$TASK_DIR/code" \
 | `$TASK_DIR/debug/blocked/` | `<mode>.md` when the per-mode budget is spent |
 | `$TASK_DIR/fix_code.py` | selected program — Stage 2 reads this exact path |
 | `$TASK_DIR/findings.md` | Step 5 report |
+| `$TASK_DIR/skill_report.json` | Step 6 grades of the RoboCasa library |
+| `$TASK_DIR/debug/evosearch/` | Stage 1b only when `campaign.json["evosearch"]` is true |
 | `$TASK_DIR/simulator.pid` | simulator PID |
 | `$TASK_DIR/validation/` | coordinator-owned — never write here |
 
@@ -258,7 +272,7 @@ Sweep command (one per program version — the seed loop is inside `run-batch`):
 
 ```bash
 "$CAP_HARNESS" run-batch \
-  --benchmark robocasa --suite OpenDrawer --task-id 0 --seeds $DEV_SEEDS \
+  --benchmark robocasa --suite "$SUITE" --task-id "$TASK_ID" --seeds $DEV_SEEDS \
   --program "$TASK_DIR/code/v<NN>_<slug>.py" \
   --output-root "$SWEEP" --flat-run-dir --init-mode saved \
   --workers 1 --recycle-after 0 \
@@ -273,19 +287,26 @@ Never raise `--workers`. Never a shell `for` over `cap-harness run` for the deve
 ## Stage 0: Explore Once and Generate Initial Code
 
 Copy `.claude/skills/iterative-debugging/scripts/scene_snapshot.py` into `$TASK_DIR/code/` as
-`probe_scene.py`. Set `PROBE_PROMPTS` to the instruction nouns (`drawer`, `handle`) plus
-`cabinet`. Run it on seed **101**:
+`probe_scene.py`. First run with `PROBE_PROMPTS = []` so `program-result.json` records
+`get_task_context().language` (and suite / task_name). Then set `PROBE_PROMPTS` from the
+**nouns in that language**, not from `$SUITE`, and re-run. Kitchen fallbacks (`cabinet`,
+`counter`) may be added after a miss. Run it on seed **101**:
 
 ```bash
 "$CAP_HARNESS" run \
-  --benchmark robocasa --suite OpenDrawer --task-id 0 --seed 101 \
+  --benchmark robocasa --suite "$SUITE" --task-id "$TASK_ID" --seed 101 \
   --program "$TASK_DIR/code/probe_scene.py" \
   --output-root "$TASK_DIR/debug/explore" --flat-run-dir --no-videos --init-mode saved
 ```
 
 Read `source/program-result.json`, `media/overlays/`, and `media/keyframes/`. Save
 `task_analysis.md`. The analysis may be wrong — it is one kitchen. Treat geometry and strategy
-as hypotheses.
+as hypotheses. The program you write next must call `get_task_context()` itself; do not copy
+the seed-101 instruction string into constants.
+
+Read `.claude/skills/iterative-debugging/robocasa/skills/` before writing `v00`. There are no
+verified entries yet; still open the stubs so you can grade them in Step 6. Do not copy
+tabletop parent snippets (`robot_base` / LIBERO).
 
 Write `$TASK_DIR/code/v00_initial.py` using only allowed APIs, and start
 `$TASK_DIR/code/CHANGELOG.md` with `v00 — initial program from scene analysis`. Run it on all
@@ -332,7 +353,7 @@ A seed passes on `task_success` alone. Then read failed seeds in this order
 | Perception | Wrong/missing mask | Prompt fallback, other camera, check overlays. |
 | Reach / base | Target outside the arm, forward nav `ok=False` | Lateral/yaw `navigate_to_pose`, then arm. |
 | Execution | Trajectory or joints miss tolerance | Denser waypoints, `move_to_joints`, hold the goal. |
-| Contact | Gripper on air, drawer unmoved | Staging, approach direction, close only at contact. |
+| Contact | Gripper on air, target unmoved | Staging, approach direction, close only at contact. |
 | Task predicate | Program completes, `task_success=false` | Final geometry and incomplete subgoals. |
 
 Write the grouping into `CHANGELOG.md`, most seeds first.
@@ -363,13 +384,19 @@ minimal legal program (`get_observation()` and `result = {}`) so Stage 2 can sti
 Copy the selection to `$TASK_DIR/fix_code.py` and record it:
 `SELECTED: v0N — n/3 development seeds`.
 
+If `$RUN_ROOT/campaign.json` has `"evosearch": true`, run Stage 1b **now**
+([evosearch.md](evosearch.md)) on this worker and this simulator: seed `candidate_A` from the
+current `fix_code.py`, K=4, T=3, `--parallel-per-gpu 1`, `--workers 1`, seeds 101 102 103.
+Copy a winner over `fix_code.py` only if it beats the freeze-loop development pass-count.
+If `evosearch` is missing or `false`, skip Stage 1b.
+
 ### Step 4 — Check it on the seed you have never run
 
 Once, on 126:
 
 ```bash
 "$CAP_HARNESS" run-batch \
-  --benchmark robocasa --suite OpenDrawer --task-id 0 --seeds $UNSEEN_SEEDS \
+  --benchmark robocasa --suite "$SUITE" --task-id "$TASK_ID" --seeds $UNSEEN_SEEDS \
   --program "$TASK_DIR/fix_code.py" \
   --output-root "$TASK_DIR/debug/holdout" --flat-run-dir --init-mode saved \
   --workers 1 --recycle-after 0 \
@@ -382,29 +409,78 @@ Do not fix anything against 126 and do not run it twice.
 ### Step 5 — Write findings.md (REQUIRED)
 
 ```
-# Findings: robocasa/OpenDrawer/task_0
+# Findings: robocasa/$SUITE/task_$TASK_ID
 
 ## Root causes observed
 ## What fixed them
 ## Development vs unseen
 ## Generalizable patterns
+## Skill report
+(see Step 6 — one line per library section you opened)
 ## Blocked modes
 ## Non-privileged API audit
 PASS, or QUARANTINED with the forbidden dependency
 ```
 
-There is no skill library and no `skill_report.json` in this campaign.
+### Step 6 — Grade the skills you used (REQUIRED)
+
+You consulted `.claude/skills/iterative-debugging/robocasa/skills/` before writing code. Say
+how it did. A missing report looks exactly like a task that had nothing to say.
+
+Get the library hash first — it records which version of **this** RoboCasa library you
+worked from:
+
+```bash
+python3 .claude/skills/iterative-debugging/scripts/campaign.py \
+  --skills-dir .claude/skills/iterative-debugging/robocasa/skills \
+  --skill-library-sha
+```
+
+Write `$TASK_DIR/skill_report.json`:
+
+```json
+{
+  "schema_version": 1,
+  "benchmark": "robocasa",
+  "suite": "<$SUITE>",
+  "task_id": <$TASK_ID>,
+  "skill_library_sha": "<output of the command above>",
+  "consulted": [],
+  "proposed_edits": [],
+  "proposed_new": []
+}
+```
+
+`consulted[]` entries: `skill` (an existing file in the RoboCasa library: `localize.md` |
+`grasp.md` | `navigation.md` | `manipulation.md`), `section`, `verdict` (`useful` |
+`misleading` | `wrong` | `not-applicable`), `evidence`. Empty lists are a valid result
+while the library has no verified entries.
+
+`proposed_new[]` must include `skill`, `title`, `trigger`, `code`, `evidence`. The verifier
+sees only this text. `proposed_edits[]` must include `skill`, `change`, `why`. Propose only
+what you have evidence for. Target filenames must already exist in the RoboCasa library —
+do not name tabletop `transport.md`.
+
+Then check it:
+
+```bash
+python3 .claude/skills/iterative-debugging/scripts/campaign.py \
+  --skills-dir .claude/skills/iterative-debugging/robocasa/skills \
+  --validate-skill-report "$TASK_DIR/skill_report.json"
+```
+
+Fix and re-run until it prints OK.
 
 ---
 
 ## What to Return
 
-You are done after Step 5. Do NOT run held-out seeds 1–3. Return exactly this summary:
+You are done after Step 6. Do NOT run held-out seeds 1–3. Return exactly this summary:
 
 ```
 BENCHMARK: robocasa
-SUITE: OpenDrawer
-TASK_ID: 0
+SUITE: <$SUITE>
+TASK_ID: <$TASK_ID>
 GPU: <N>
 SIM_PID: <contents of simulator.pid>
 ENDPOINT: <CAP_HARNESS_ROBOCASA_ENDPOINT>
@@ -416,6 +492,7 @@ Stage 1 Results:
   Failure modes blocked: <mode + root cause>
   fix_code.py written: yes/no
   findings.md written: yes/no
+  skill_report.json written: yes/no
   Non-privileged API audit: PASS/QUARANTINED (<reason if quarantined>)
 
 Key findings:

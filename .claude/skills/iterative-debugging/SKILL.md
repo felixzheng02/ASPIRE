@@ -13,7 +13,9 @@ time, and the campaign freezes a skill library rather than a program.
 For RoboCasa (PandaOmron, out-of-process kitchen sim) use
 [robocasa/SKILL.md](robocasa/SKILL.md). Same **product** as below (one frozen program, held-out
 replay), different **embodiment**: worker-owned simulator, shared SAM3 via
-`scripts/ensure_sam3.sh`, `run-batch --workers 1` only. Do not follow the `--workers 4` commands
+`scripts/ensure_sam3.sh`, `run-batch --workers 1` only. The sibling includes a local skill
+library and a verifier (serialized after Stage 2 on the one kitchen). Evolutionary search is
+`init_run.py --evosearch`, default off. Do not follow the `--workers 4` commands
 or LIBERO seed defaults on that benchmark.
 
 Everything below is for the tabletop benchmarks (LIBERO-Pro, Robosuite).

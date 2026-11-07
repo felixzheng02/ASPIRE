@@ -115,9 +115,9 @@ def run_program_with_api(
     )
     tools = api.register_tools(registry)
     if recorder is None:
-        return ProgramExecutor(tools).execute_program(source)
+        return ProgramExecutor(tools).execute_program(source, filename=str(path))
     recorder.save_program(path)
-    return ProgramExecutor(tools, recorder=recorder).execute_program(source)
+    return ProgramExecutor(tools, recorder=recorder).execute_program(source, filename=str(path))
 
 
 def run_program(
@@ -154,6 +154,7 @@ def run_program(
         raise ValueError("max_steps must be positive")
     if camera_width <= 0 or camera_height <= 0:
         raise ValueError("camera dimensions must be positive")
+    program_path = Path(program_path).expanduser().resolve()
     source = program_path.read_text(encoding="utf-8")
     if not source.strip():
         raise ValueError("program file must contain non-empty Python source")
@@ -435,7 +436,9 @@ def run_program(
             if extension_allowlist is not None
             else ToolRegistry()
         )
-        execution = ProgramExecutor(tools, recorder=recorder).execute_program(source)
+        execution = ProgramExecutor(tools, recorder=recorder).execute_program(
+            source, filename=str(program_path)
+        )
         sanitized_stdout = redact(execution.stdout)
         (recorder.root / "logs/program.stdout").write_text(str(sanitized_stdout), encoding="utf-8")
         (recorder.root / "logs/program.stderr").write_text("", encoding="utf-8")

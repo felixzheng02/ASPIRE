@@ -230,15 +230,24 @@ class ProgramExecutor:
             parent[path[-1]] = _ToolNamespace(branches[path])
         return MappingProxyType(root)
 
-    def execute_program(self, code: str) -> ProgramExecutionResult:
-        """Execute one complete program; this never performs an implicit robot step."""
+    def execute_program(
+        self, code: str, *, filename: str = "<generated-program>"
+    ) -> ProgramExecutionResult:
+        """Execute one complete program; this never performs an implicit robot step.
+
+        ``filename`` is the path shown in tracebacks and bound by a debugger.
+        File-backed ``cap-harness run --program`` passes the real path so
+        breakpoints in that file hit; generated snippets keep the default.
+        """
         self._calls = []
         if not isinstance(code, str) or not code.strip():
             return self._failure(ErrorCode.INVALID_REQUEST, "code must be a non-empty string")
+        if not isinstance(filename, str) or not filename.strip():
+            filename = "<generated-program>"
         try:
-            tree = ast.parse(code, mode="exec")
+            tree = ast.parse(code, filename=filename, mode="exec")
             _ProgramValidator().visit(tree)
-            compiled = compile(tree, "<generated-program>", "exec")
+            compiled = compile(tree, filename, "exec")
         except (SyntaxError, ValueError) as exc:
             return self._failure(
                 ErrorCode.INVALID_REQUEST,

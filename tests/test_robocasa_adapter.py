@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
-from cap_harness.contracts import PointCloud
+from cap_harness.contracts import (
+    CameraObservation,
+    Observation,
+    PointCloud,
+    Pose,
+    RobotState,
+    StepResult,
+    Trajectory,
+)
 from cap_harness.robocasa.adapter import (
     PANDA_JOINT_NAMES,
     TRAJECTORY_MAX_JOINT_STEP_RAD,
@@ -104,3 +113,88 @@ def test_adapter_plan_approach_pose_in_link0_does_not_need_client() -> None:
     )
     x, y, yaw = adapter.plan_approach_pose(cloud, 0.3)
     assert math.isfinite(x) and math.isfinite(y) and math.isfinite(yaw)
+
+
+def _pose() -> Pose:
+    return Pose(np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0]), "robot0_link0")
+
+
+def _state(joints: np.ndarray) -> RobotState:
+    target = np.asarray(joints, dtype=np.float64).reshape(7)
+    return RobotState(
+        joint_positions={"primary": target},
+        joint_velocities={"primary": np.zeros(7)},
+        end_effector_poses={"primary": _pose()},
+        gripper_positions={"primary": 1.0},
+        base_frame="robot0_link0",
+        embodiment="robocasa",
+    )
+
+
+def _observation(joints: np.ndarray) -> Observation:
+    pose = _pose()
+    return Observation(
+        cameras={
+            "agentview": CameraObservation(
+                rgb=np.zeros((8, 8, 3), dtype=np.uint8),
+                depth_m=np.ones((8, 8)),
+                intrinsics=np.eye(3),
+                frame="camera/agentview",
+                camera_pose=pose,
+            )
+        },
+        robot_state=_state(joints),
+    )
+
+
+def _trajectory(points: np.ndarray) -> Trajectory:
+    start = _state(points[0])
+    return Trajectory(
+        joint_positions=np.asarray(points, dtype=np.float64),
+        dt_s=0.05,
+        joint_names=tuple(start.joint_names["primary"]),
+        planner="test",
+        collision_aware=False,
+        expected_start=start,
+        arm="primary",
+        embodiment="robocasa",
+    )
+
+
+def _adapter_with_recording_step() -> tuple[RobocasaAdapter, list]:
+    adapter = RobocasaAdapter()
+    adapter._metadata = adapter.registry.resolve("OpenDrawer")
+    calls: list = []
+
+    def fake_step(action):
+        target = np.asarray(action.arms["primary"].target, dtype=np.float64)
+        calls.append(action)
+        adapter._elapsed_steps += 1
+        return StepResult(ok=True, observation=_observation(target))
+
+    adapter.step = fake_step  # type: ignore[method-assign]
+    return adapter, calls
+
+
+def test_execute_trajectory_plays_waypoints_through_step() -> None:
+    """Video frames are recorded in ``step()``; the driver loop used to skip it."""
+    adapter, calls = _adapter_with_recording_step()
+    points = np.vstack([np.zeros(7), np.array([0.10, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])])
+    dense = densify_joint_waypoints(points)
+    result = adapter.execute_trajectory(_trajectory(points), settle_steps=4)
+    assert result.ok
+    assert len(calls) == dense.shape[0]
+    assert result.steps_executed == dense.shape[0]
+    np.testing.assert_allclose(calls[-1].arms["primary"].target, dense[-1])
+
+
+def test_close_gripper_settles_through_step() -> None:
+    adapter, calls = _adapter_with_recording_step()
+    adapter._client = SimpleNamespace(profile=SimpleNamespace(gripper_settle_steps=4))
+    adapter._closed = False
+    adapter.get_robot_state = lambda: _state(np.zeros(7))  # type: ignore[method-assign]
+    adapter._measured_gripper = lambda: 0.0  # type: ignore[method-assign]
+    result = adapter.close_gripper()
+    assert result.ok
+    assert len(calls) == 4
+    assert all(call.arms["primary"].gripper_position == 0.0 for call in calls)

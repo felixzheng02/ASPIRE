@@ -24,6 +24,7 @@ import numpy as np
 
 from cap_harness.contracts import (
     CameraObservation,
+    GraspSet,
     Observation,
     PointCloud,
     RobotAction,
@@ -31,6 +32,7 @@ from cap_harness.contracts import (
     SegmentationSet,
     StepResult,
 )
+from cap_harness.geometry import invert_transform, mask_to_point_cloud
 
 SCHEMA_VERSION = "1.0"
 TERMINATION_REASONS = {
@@ -50,6 +52,17 @@ TERMINATION_REASONS = {
 #: 57 kB of a 492 kB file. Keyframes are written twice per motion call, so that
 #: default was ~16% of a recorded episode's wall clock.
 PNG_COMPRESS_LEVEL = 1
+_SCENE3D_SIZE = 480
+_SCENE3D_MARGIN = 28
+_MAX_SCENE_POINTS = 5000
+_MAX_OBJECT_POINTS = 2500
+_OBJECT_COLORS = (
+    (255, 64, 64),
+    (64, 255, 64),
+    (64, 128, 255),
+    (255, 192, 64),
+    (224, 64, 255),
+)
 _PARENT: contextvars.ContextVar[str | None] = contextvars.ContextVar("trace_parent", default=None)
 _SECRET_KEY = re.compile(r"authorization|cookie|credential|password|secret|token", re.IGNORECASE)
 _SECRET_TEXT = re.compile(r"(?i)\b(?:bearer\s+\S+|hf_[A-Za-z0-9]{12,})")
@@ -113,6 +126,44 @@ def slug(value: object) -> str:
 
 def _component(value: object) -> str:
     return (re.sub(r"[^a-z0-9_.-]+", "-", str(value).lower()).strip("-.") or "unnamed")[:96]
+
+
+def _downsample_points(
+    points: np.ndarray, colors: np.ndarray | None, limit: int
+) -> tuple[np.ndarray, np.ndarray | None]:
+    count = int(points.shape[0])
+    if count <= limit:
+        return points, colors
+    stride = max(1, count // limit)
+    sampled = points[::stride]
+    sampled_colors = None if colors is None else colors[::stride]
+    return sampled, sampled_colors
+
+
+def _view_uv(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Isometric-style orthographic view: u right, v up, depth toward the camera."""
+    azim = np.deg2rad(-60.0)
+    elev = np.deg2rad(28.0)
+    x, y, z = points[:, 0], points[:, 1], points[:, 2]
+    u = np.cos(azim) * x + np.sin(azim) * y
+    v = (
+        -np.sin(azim) * np.sin(elev) * x
+        + np.cos(azim) * np.sin(elev) * y
+        + np.cos(elev) * z
+    )
+    depth = (
+        np.sin(azim) * np.cos(elev) * x
+        - np.cos(azim) * np.cos(elev) * y
+        + np.sin(elev) * z
+    )
+    return u, v, depth
+
+
+def _rgb8(colors: np.ndarray) -> np.ndarray:
+    values = np.asarray(colors)
+    if np.issubdtype(values.dtype, np.floating):
+        values = np.rint(values * 255.0)
+    return np.clip(values, 0, 255).astype(np.uint8)
 
 
 def redact(value: object) -> object:
@@ -269,16 +320,20 @@ class _Span:
         recorder: RunRecorder,
         *,
         capture_segmentation: bool,
+        capture_grasps: bool,
     ) -> None:
         self.path, self.serializer, self.state = path, serializer, state
         self.recorder = recorder
         self.capture_segmentation = capture_segmentation
+        self.capture_grasps = capture_grasps
 
     def output(self, value: object, *, ok: bool = True) -> object:
         with self.recorder.timing.measure("trace_write"):
             self.serializer.dump(self.path / "output.json", value)
         if self.capture_segmentation and isinstance(value, SegmentationSet):
             self.recorder.segmentation_overlay(value)
+        if self.capture_grasps and isinstance(value, GraspSet):
+            self.recorder.grasp_overlay(value)
         self.state["ok"] = ok
         return value
 
@@ -368,6 +423,9 @@ class RunRecorder:
         self.last_video_step: int | None = None
         self.depth_saved = False
         self.overlay_index = 0
+        self.grasp_overlay_index = 0
+        self.scene3d_overlay_index = 0
+        self.last_segmentations: tuple[Segmentation, ...] = ()
         self.event_index = self.call_index = self.keyframe_index = 0
         self.finalized = False
         self.identity = {
@@ -450,6 +508,7 @@ class RunRecorder:
                 state,
                 self,
                 capture_segmentation=category == "provider" and name.startswith("sam3."),
+                capture_grasps=category == "provider" and name.startswith("contact_graspnet."),
             )
         except BaseException as exc:
             self.serializer.dump(
@@ -573,6 +632,7 @@ class RunRecorder:
         )
         if camera is None or camera.rgb.shape[:2] != first.mask.shape:
             return
+        self.last_segmentations = tuple(segmentations)
         rgb = np.asarray(camera.rgb)
         if np.issubdtype(rgb.dtype, np.floating):
             rgb = np.rint(rgb * 255.0)
@@ -640,6 +700,261 @@ class RunRecorder:
                 "camera_frame": first.frame,
                 "image_shape": list(first.mask.shape),
                 "candidates": records,
+            },
+        )
+        self._write_scene3d(
+            first.camera_name,
+            camera,
+            segmentations=tuple(segmentations),
+            grasps=None,
+        )
+
+    def grasp_overlay(self, result: GraspSet) -> None:
+        """Project grasp poses onto the current agentview RGB."""
+        if not result.ok or not result.grasps or self.last_observation is None:
+            return
+        with self.timing.measure("overlay"):
+            self._grasp_overlay(result)
+
+    def _camera_for_grasp_frame(self, frame: str) -> tuple[str, CameraObservation] | None:
+        cameras = self.last_observation.cameras
+        for name in ("agentview", *cameras):
+            camera = cameras.get(name)
+            if camera is not None and camera.camera_pose.frame == frame:
+                return name, camera
+        return None
+
+    def _project_base_to_pixel(
+        self, point: np.ndarray, camera: CameraObservation
+    ) -> tuple[int, int] | None:
+        camera_from_base = invert_transform(camera.camera_pose.as_matrix())
+        x_cam, y_cam, z_cam, _w = camera_from_base @ np.array(
+            [float(point[0]), float(point[1]), float(point[2]), 1.0], dtype=np.float64
+        )
+        if z_cam <= 1e-6 or not np.isfinite([x_cam, y_cam, z_cam]).all():
+            return None
+        k = camera.intrinsics
+        u = k[0, 0] * x_cam / z_cam + k[0, 2]
+        v = k[1, 1] * y_cam / z_cam + k[1, 2]
+        if not np.isfinite([u, v]).all():
+            return None
+        return int(round(u)), int(round(v))
+
+    def _grasp_overlay(self, result: GraspSet) -> None:
+        matched = self._camera_for_grasp_frame(result.grasps[0].frame)
+        if matched is None:
+            return
+        camera_name, camera = matched
+        rgb = np.asarray(camera.rgb)
+        if np.issubdtype(rgb.dtype, np.floating):
+            rgb = np.rint(rgb * 255.0)
+        canvas = np.asarray(rgb, dtype=np.uint8).copy()
+        from PIL import Image, ImageDraw
+
+        image = Image.fromarray(canvas)
+        draw = ImageDraw.Draw(image)
+        axis_colors = ((255, 64, 64), (64, 255, 64), (64, 128, 255))
+        records = []
+        for index, grasp in enumerate(result.grasps[:8]):
+            origin = np.asarray(grasp.pose.position, dtype=np.float64)
+            rotation = np.asarray(grasp.pose.as_matrix()[:3, :3], dtype=np.float64)
+            length = 0.05
+            pixel = self._project_base_to_pixel(origin, camera)
+            if pixel is None:
+                records.append(
+                    {
+                        "index": index,
+                        "score": float(grasp.score),
+                        "width_m": float(grasp.width_m),
+                        "position": [round(float(v), 4) for v in origin],
+                        "pixel_uv": None,
+                    }
+                )
+                continue
+            for axis, color in enumerate(axis_colors):
+                tip = origin + length * rotation[:, axis]
+                tip_pixel = self._project_base_to_pixel(tip, camera)
+                if tip_pixel is not None:
+                    draw.line([pixel, tip_pixel], fill=color, width=2)
+            x, y = pixel
+            draw.ellipse(
+                (x - 4, y - 4, x + 4, y + 4),
+                fill=(255, 255, 255),
+                outline=(255, 220, 0),
+                width=1,
+            )
+            draw.text((x + 6, y - 6), f"#{index + 1} {grasp.score:.2f}", fill=(255, 255, 255))
+            records.append(
+                {
+                    "index": index,
+                    "score": float(grasp.score),
+                    "width_m": float(grasp.width_m),
+                    "position": [round(float(v), 4) for v in origin],
+                    "pixel_uv": [x, y],
+                }
+            )
+        self.grasp_overlay_index += 1
+        directory = self.root / "media/overlays"
+        directory.mkdir(parents=True, exist_ok=True)
+        stem = f"grasp-{self.grasp_overlay_index:06d}-{_component(camera_name)}"
+        if image.width > 960:
+            image.thumbnail((960, 960 * image.height // image.width))
+        image.save(directory / f"{stem}.png", optimize=True)
+        atomic_json(
+            directory / f"{stem}.json",
+            {
+                "camera_name": camera_name,
+                "grasp_frame": result.grasps[0].frame,
+                "candidates": records,
+            },
+        )
+        self._write_scene3d(
+            camera_name,
+            camera,
+            segmentations=self.last_segmentations,
+            grasps=result,
+        )
+
+    def _lift_mask(
+        self, camera: CameraObservation, segmentation: Segmentation
+    ) -> PointCloud | None:
+        try:
+            return mask_to_point_cloud(
+                camera, segmentation, target_frame=camera.camera_pose.frame
+            )
+        except ValueError:
+            return None
+
+    def _write_scene3d(
+        self,
+        camera_name: str,
+        camera: CameraObservation,
+        *,
+        segmentations: tuple[Segmentation, ...],
+        grasps: GraspSet | None,
+    ) -> None:
+        valid = np.isfinite(camera.depth_m) & (camera.depth_m > 0.0)
+        scene = None
+        if bool(np.any(valid)):
+            scene = self._lift_mask(
+                camera,
+                Segmentation(
+                    mask=valid,
+                    label="scene",
+                    score=1.0,
+                    camera_name=camera_name,
+                    frame=camera.frame,
+                ),
+            )
+        object_layers: list[tuple[np.ndarray, tuple[int, int, int]]] = []
+        for index, segmentation in enumerate(segmentations[:5]):
+            if segmentation.mask.shape != camera.depth_m.shape:
+                continue
+            if segmentation.frame != camera.frame:
+                continue
+            lifted = self._lift_mask(camera, segmentation)
+            if lifted is None:
+                continue
+            points, _colors = _downsample_points(
+                lifted.points, lifted.colors, _MAX_OBJECT_POINTS
+            )
+            object_layers.append((points, _OBJECT_COLORS[index % len(_OBJECT_COLORS)]))
+        grasp_origins: list[np.ndarray] = []
+        grasp_axes: list[tuple[np.ndarray, np.ndarray, tuple[int, int, int]]] = []
+        if grasps is not None and grasps.ok:
+            for grasp in grasps.grasps[:8]:
+                if grasp.frame != camera.camera_pose.frame:
+                    continue
+                origin = np.asarray(grasp.pose.position, dtype=np.float64)
+                rotation = np.asarray(grasp.pose.as_matrix()[:3, :3], dtype=np.float64)
+                grasp_origins.append(origin)
+                for axis, color in enumerate(((255, 64, 64), (64, 255, 64), (64, 128, 255))):
+                    grasp_axes.append((origin, origin + 0.05 * rotation[:, axis], color))
+        bound_points = []
+        if scene is not None:
+            scene_points, scene_colors = _downsample_points(
+                scene.points, scene.colors, _MAX_SCENE_POINTS
+            )
+            bound_points.append(scene_points)
+        else:
+            scene_points, scene_colors = None, None
+        for points, _color in object_layers:
+            bound_points.append(points)
+        if grasp_origins:
+            bound_points.append(np.stack(grasp_origins))
+            bound_points.append(np.stack([tip for _origin, tip, _color in grasp_axes]))
+        if not bound_points:
+            return
+        all_points = np.concatenate(bound_points, axis=0)
+        u_all, v_all, _depth_all = _view_uv(all_points)
+        span = max(float(np.ptp(u_all)), float(np.ptp(v_all)), 1e-3)
+        center_u = 0.5 * (float(np.min(u_all)) + float(np.max(u_all)))
+        center_v = 0.5 * (float(np.min(v_all)) + float(np.max(v_all)))
+        scale = (_SCENE3D_SIZE - 2 * _SCENE3D_MARGIN) / span
+
+        def to_pixel(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            u, v, depth = _view_uv(points)
+            x = np.rint((u - center_u) * scale + _SCENE3D_SIZE / 2.0).astype(int)
+            y = np.rint(_SCENE3D_SIZE / 2.0 - (v - center_v) * scale).astype(int)
+            return x, y, depth
+
+        canvas = np.full((_SCENE3D_SIZE, _SCENE3D_SIZE, 3), 28, dtype=np.uint8)
+
+        def splat(points: np.ndarray, colors: np.ndarray) -> None:
+            x, y, depth = to_pixel(points)
+            inside = (x >= 0) & (x < _SCENE3D_SIZE) & (y >= 0) & (y < _SCENE3D_SIZE)
+            if not bool(np.any(inside)):
+                return
+            order = np.argsort(depth[inside])
+            xs = x[inside][order]
+            ys = y[inside][order]
+            painted = colors[inside][order]
+            canvas[ys, xs] = painted
+
+        if scene_points is not None:
+            if scene_colors is None:
+                painted = np.full((scene_points.shape[0], 3), 120, dtype=np.uint8)
+            else:
+                painted = np.rint(_rgb8(scene_colors) * 0.55).astype(np.uint8)
+            splat(scene_points, painted)
+        for points, color in object_layers:
+            painted = np.broadcast_to(
+                np.asarray(color, dtype=np.uint8), (points.shape[0], 3)
+            ).copy()
+            splat(points, painted)
+
+        from PIL import Image, ImageDraw
+
+        image = Image.fromarray(canvas)
+        draw = ImageDraw.Draw(image)
+        for origin, tip, color in grasp_axes:
+            x0, y0, _d0 = to_pixel(origin.reshape(1, 3))
+            x1, y1, _d1 = to_pixel(tip.reshape(1, 3))
+            draw.line(
+                [(int(x0[0]), int(y0[0])), (int(x1[0]), int(y1[0]))],
+                fill=color,
+                width=2,
+            )
+        for origin in grasp_origins:
+            x, y, _depth = to_pixel(origin.reshape(1, 3))
+            px, py = int(x[0]), int(y[0])
+            draw.ellipse((px - 3, py - 3, px + 3, py + 3), fill=(255, 255, 255))
+        draw.text((8, 8), "scene + lifted mask + grasps (3D)", fill=(220, 220, 220))
+        self.scene3d_overlay_index += 1
+        directory = self.root / "media/overlays"
+        directory.mkdir(parents=True, exist_ok=True)
+        kind = "grasp" if grasps is not None else "segment"
+        stem = f"scene3d-{self.scene3d_overlay_index:06d}-{kind}-{_component(camera_name)}"
+        image.save(directory / f"{stem}.png", optimize=True)
+        atomic_json(
+            directory / f"{stem}.json",
+            {
+                "kind": kind,
+                "camera_name": camera_name,
+                "frame": camera.camera_pose.frame,
+                "n_scene_points": 0 if scene_points is None else int(scene_points.shape[0]),
+                "n_object_points": int(sum(layer[0].shape[0] for layer in object_layers)),
+                "n_grasps": len(grasp_origins),
             },
         )
 

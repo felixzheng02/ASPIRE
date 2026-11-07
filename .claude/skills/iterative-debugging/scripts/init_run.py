@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -72,6 +73,20 @@ def main() -> None:
         help="unseen-check seeds, measured once and never debugged against "
         "(default 66..70; use 126..130 for Robosuite)",
     )
+    parser.add_argument(
+        "--skills-dir",
+        type=Path,
+        default=None,
+        help="skill library directory recorded in campaign.json "
+        "(omit for the tabletop parent skills/)",
+    )
+    parser.add_argument(
+        "--evosearch",
+        action="store_true",
+        default=False,
+        help="enable Stage 1b evolutionary search after the freeze loop "
+        "(default off; recorded as campaign.json['evosearch'])",
+    )
     args = parser.parse_args()
     if any(seed < 1 for seed in args.dev_seeds) or len(set(args.dev_seeds)) != len(args.dev_seeds):
         raise SystemExit("--dev-seeds must contain unique positive integers")
@@ -102,17 +117,18 @@ def main() -> None:
         raise SystemExit(f"campaign root already exists: {run_root}")
     run_root.mkdir(parents=True)
     (run_root / "tasks.json").write_text(tasks_text)
-    (run_root / "campaign.json").write_text(
-        json.dumps(
-            {
-                "heldout_count": args.heldout_count,
-                "dev_seeds": args.dev_seeds,
-                "unseen_seeds": args.unseen_seeds,
-            },
-            indent=2,
-        )
-        + "\n"
-    )
+    evosearch = args.evosearch or os.environ.get(
+        "CAP_HARNESS_ROBOCASA_EVOSEARCH", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    payload = {
+        "heldout_count": args.heldout_count,
+        "dev_seeds": args.dev_seeds,
+        "unseen_seeds": args.unseen_seeds,
+        "evosearch": evosearch,
+    }
+    if args.skills_dir is not None:
+        payload["skills_dir"] = args.skills_dir.as_posix()
+    (run_root / "campaign.json").write_text(json.dumps(payload, indent=2) + "\n")
 
     temporary = LATEST_LINK.with_name("LATEST.tmp")
     temporary.unlink(missing_ok=True)

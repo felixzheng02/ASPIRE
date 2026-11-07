@@ -112,6 +112,39 @@ def verification_dir(
     return run_root / "verification" / name
 
 
+def resolve_skills_dir(skills_dir: Path | str | None = None) -> Path:
+    """Return an absolute skill-library path.
+
+    Relative paths are resolved against the repository root so a worker that
+    passes ``.claude/skills/iterative-debugging/robocasa/skills`` hashes the
+    same directory regardless of a stray ``cd``.
+    """
+    if skills_dir is None:
+        return SKILLS_DIR
+    path = Path(skills_dir)
+    return path if path.is_absolute() else (ROOT / path)
+
+
+def campaign_skills_dir(run_root: Path | None) -> Path:
+    """Skill library recorded on the campaign, else the tabletop parent ``skills/``.
+
+    ``campaign.json["skills_dir"]`` is optional: LIBERO/Robosuite campaigns omit
+    it and keep hashing ``iterative-debugging/skills/``.
+    """
+    raw = campaign_settings(run_root).get("skills_dir") if run_root is not None else None
+    if raw is None or str(raw).strip() == "":
+        return SKILLS_DIR
+    return resolve_skills_dir(raw)
+
+
+def skills_dir_label(skills_dir: Path) -> str:
+    """Repo-relative posix path for progress output, else the absolute path."""
+    try:
+        return skills_dir.relative_to(ROOT).as_posix()
+    except ValueError:
+        return skills_dir.as_posix()
+
+
 def skill_library_sha(skills_dir: Path | None = None) -> str:
     """Content hash of the shared skill library.
 
@@ -121,7 +154,7 @@ def skill_library_sha(skills_dir: Path | None = None) -> str:
     surviving text does not; the digest is over sorted paths, so it does not
     depend on directory iteration order.
     """
-    directory = skills_dir if skills_dir is not None else SKILLS_DIR
+    directory = resolve_skills_dir(skills_dir)
     digest = hashlib.sha256()
     if not directory.is_dir():
         return digest.hexdigest()[:16]
@@ -152,9 +185,18 @@ def _main() -> None:
         metavar="PATH",
         help="check a skill_report.json and exit nonzero if it is unusable",
     )
+    parser.add_argument(
+        "--skills-dir",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="skill library to hash or to check reports against "
+        "(default: iterative-debugging/skills/)",
+    )
     args = parser.parse_args()
+    library = resolve_skills_dir(args.skills_dir)
     if args.skill_library_sha:
-        print(skill_library_sha())
+        print(skill_library_sha(library))
         return
     if args.validate_skill_report is not None:
         path = args.validate_skill_report
@@ -164,7 +206,7 @@ def _main() -> None:
             report = json.loads(path.read_text())
         except ValueError as exc:
             raise SystemExit(f"{path}: not valid JSON -- {exc}") from exc
-        problems = validate_skill_report(report)
+        problems = validate_skill_report(report, skills_dir=library)
         for problem in problems:
             print(f"  {problem}")
         if problems:

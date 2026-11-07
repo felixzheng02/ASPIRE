@@ -37,4 +37,6 @@ than per attempt. Do not carry the tabletop seed partitions or the tabletop scor
 RoboCasa kitchen campaigns use `.claude/skills/iterative-debugging/robocasa/SKILL.md`. Same
 product as the tabletop loop (one frozen program, held-out replay), different embodiment:
 worker-owned simulator, shared SAM3 via `scripts/ensure_sam3.sh`, `run-batch --workers 1` only.
-Do not use the parent `--workers 4` path or LIBERO seed defaults on that benchmark.
+The sibling includes a local skill library and a verifier; evolutionary search is
+`init_run.py --evosearch`, default off. Do not use the parent `--workers 4` path or LIBERO
+seed defaults on that benchmark.

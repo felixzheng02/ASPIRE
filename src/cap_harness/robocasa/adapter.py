@@ -27,6 +27,7 @@ from typing import Any
 import numpy as np
 
 from cap_harness.contracts import (
+    ArmCommand,
     CameraObservation,
     ExecutionResult,
     Observation,
@@ -56,7 +57,7 @@ from cap_harness.robocasa.registry import (
 #: CapApi interpolates at this scale; two sparse waypoints 0.10 rad apart miss
 #: the 0.02 rad execute_trajectory tolerance (trap 17).
 TRAJECTORY_MAX_JOINT_STEP_RAD = 0.05
-#: Closed-loop budget for the last waypoint (``RobotClient.move_to_joints``).
+#: Extra ``step()`` ticks holding the last waypoint until joint error is inside tolerance.
 TRAJECTORY_GOAL_MAX_STEPS = 120
 #: cuRobo's panda model names. The public RobotState still reports joint_0..6.
 PANDA_JOINT_NAMES = tuple(f"panda_joint{index}" for index in range(1, 8))
@@ -469,6 +470,18 @@ class RobocasaAdapter:
             self._run_observer.after_step(action, result)
         return result
 
+    def _arm_action(self, joints: np.ndarray, gripper: float | None) -> RobotAction:
+        return RobotAction(
+            arms={
+                self.arms[0]: ArmCommand(
+                    mode="joint_position",
+                    target=np.asarray(joints, dtype=np.float64).reshape(-1)[:7],
+                    gripper_position=gripper,
+                    embodiment=self.embodiment,
+                )
+            }
+        )
+
     def execute_trajectory(
         self,
         trajectory: Trajectory,
@@ -478,7 +491,6 @@ class RobocasaAdapter:
     ) -> ExecutionResult:
         if not isinstance(trajectory, Trajectory):
             raise ValueError("trajectory must be a Trajectory")
-        client = self._require_client()
         arm = trajectory.arm
         if arm not in self.arms:
             return ExecutionResult(
@@ -488,6 +500,9 @@ class RobocasaAdapter:
                     code=ErrorCode.INVALID_REQUEST, message=f"unknown arm {arm!r}"
                 ),
             )
+        # Each tick must go through ``step()`` so the run recorder gets RGB.
+        # ``client.step`` / ``move_to_joints`` move the arm but leave the
+        # video at the reset frame (one 0.05 s mp4).
         waypoints = densify_joint_waypoints(
             np.asarray(trajectory.joint_positions, dtype=np.float64)
         )
@@ -500,39 +515,81 @@ class RobocasaAdapter:
         if raw_grips is not None and raw_grips.size and waypoints.size:
             grips = np.full(waypoints.shape[0], float(raw_grips[-1]))
         executed = 0
-        truncated_early = False
-        play = waypoints[:-1] if waypoints.shape[0] > 1 else waypoints[:0]
-        for index, waypoint in enumerate(play):
-            if grips is not None and index < grips.size:
-                client.set_gripper_target(float(grips[index]))
-            client.step(client.build_action(waypoint[:7]))
+        final_observation: Observation | None = None
+        for index, waypoint in enumerate(waypoints):
+            grip = None if grips is None else float(grips[min(index, grips.size - 1)])
+            result = self.step(self._arm_action(waypoint, grip))
             executed += 1
-            self._elapsed_steps += 1
-            if self._truncated():
-                truncated_early = True
-                break
-        if not truncated_early and waypoints.size:
-            if grips is not None:
-                client.set_gripper_target(float(grips[-1]))
-            start_steps = client.sim_step_count()
-            client.move_to_joints(
-                waypoints[-1][:7],
-                tolerance=float(tolerance),
-                max_steps=max(1, int(settle_steps)),
+            if result.observation is not None:
+                final_observation = result.observation
+            if not result.ok:
+                return ExecutionResult(
+                    ok=False,
+                    steps_executed=executed,
+                    final_observation=final_observation,
+                    error=result.error,
+                    truncated=result.truncated,
+                    terminated=result.terminated,
+                )
+            if result.terminated or result.truncated:
+                return ExecutionResult(
+                    ok=False,
+                    steps_executed=executed,
+                    final_observation=final_observation,
+                    truncated=result.truncated,
+                    terminated=result.terminated,
+                    error=ApiError(
+                        code=ErrorCode.EXECUTION_FAILED,
+                        message=(
+                            f"trajectory truncated at the {self.horizon}-tick horizon"
+                            if result.truncated
+                            else "episode ended before the trajectory finished"
+                        ),
+                    ),
+                )
+        goal = waypoints[-1][:7]
+        last_grip = None if grips is None else float(grips[-1])
+        error = float("inf")
+        for _ in range(max(1, int(settle_steps))):
+            state = (
+                final_observation.robot_state
+                if final_observation is not None
+                else self.get_robot_state()
             )
-            extra = max(0, client.sim_step_count() - start_steps)
-            executed += extra
-            self._elapsed_steps += extra
-        final = np.asarray(client.joint_pos(), dtype=np.float64).reshape(-1)[:7]
-        error = float(np.linalg.norm(final - waypoints[-1][:7])) if waypoints.size else 0.0
-        converged = error <= float(tolerance)
+            measured = np.asarray(state.joint_positions[arm], dtype=np.float64).reshape(-1)[:7]
+            error = float(np.linalg.norm(measured - goal))
+            if error <= float(tolerance):
+                break
+            result = self.step(self._arm_action(goal, last_grip))
+            executed += 1
+            if result.observation is not None:
+                final_observation = result.observation
+            if not result.ok or result.terminated or result.truncated:
+                truncated = bool(result.truncated)
+                return ExecutionResult(
+                    ok=False,
+                    steps_executed=executed,
+                    final_observation=final_observation,
+                    truncated=truncated,
+                    terminated=result.terminated,
+                    error=result.error
+                    or ApiError(
+                        code=ErrorCode.EXECUTION_FAILED,
+                        message=(
+                            f"trajectory truncated at the {self.horizon}-tick horizon"
+                            if truncated
+                            else "episode ended before the trajectory finished"
+                        ),
+                    ),
+                    final_errors={"joint_position": error},
+                )
         truncated = self._truncated()
-        self._last_reward = self._reward()
+        converged = error <= float(tolerance)
         ok = converged and not truncated
         return ExecutionResult(
             ok=ok,
             steps_executed=executed,
-            final_observation=self.get_observation() if ok else None,
+            final_observation=final_observation if ok else None,
             truncated=truncated,
             error=None
             if ok
@@ -556,19 +613,34 @@ class RobocasaAdapter:
                 steps_executed=0,
                 error=ApiError(code=ErrorCode.INVALID_REQUEST, message=f"unknown arm {arm!r}"),
             )
-        client = self._require_client()
-        start = client.sim_step_count()
-        # The driver's settling loop, not a single tick: a grip that is commanded but not
-        # settled reports success while the fingers are still moving.
-        client.set_gripper(float(position))
-        steps = max(0, client.sim_step_count() - start)
-        self._elapsed_steps += steps
+        # Same as execute_trajectory: the driver's own settle loop never
+        # notifies the run recorder, so gripper motion would be invisible.
+        settle = 30
+        client = self._client
+        if client is not None:
+            settle = int(getattr(getattr(client, "profile", None), "gripper_settle_steps", settle))
+        joints = self.get_robot_state().joint_positions[arm]
+        final_observation: Observation | None = None
+        executed = 0
+        for _ in range(max(1, settle)):
+            result = self.step(self._arm_action(joints, float(position)))
+            executed += 1
+            if result.observation is not None:
+                final_observation = result.observation
+            if not result.ok or result.terminated or result.truncated:
+                return ExecutionResult(
+                    ok=False,
+                    steps_executed=executed,
+                    final_observation=final_observation,
+                    truncated=result.truncated,
+                    terminated=result.terminated,
+                    error=result.error,
+                )
         measured = self._measured_gripper()
-        self._last_reward = self._reward()
         return ExecutionResult(
             ok=True,
-            steps_executed=steps,
-            final_observation=self.get_observation(),
+            steps_executed=executed,
+            final_observation=final_observation or self.get_observation(),
             final_errors={"gripper_position": abs(measured - float(position))},
         )
 

@@ -374,6 +374,7 @@ def test_init_run_seed_partitions(
         "heldout_count": heldout_count,
         "dev_seeds": dev_seeds,
         "unseen_seeds": unseen_seeds,
+        "evosearch": False,
     }
     campaign = load_script("campaign")
     assert campaign.heldout_seeds(root) == list(range(1, heldout_count + 1))

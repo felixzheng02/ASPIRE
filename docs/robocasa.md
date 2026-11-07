@@ -99,9 +99,21 @@ via `scripts/ensure_sam3.sh` / `scripts/ensure_pyroki.sh` / `scripts/ensure_gras
 `scripts/ensure_curobo.sh` and are never killed. Sweeps are
 `cap-harness run-batch --workers 1 --recycle-after 0 --init-mode saved`.
 
-The first campaign is OpenDrawer only. Seeds, recorded in `campaign.json`: development
-**101 102 103**, unseen-check **126**, held-out **1 2 3**. Widening later keeps the TRAIN ≥101 /
-TEST 1–100 cut described above.
+The RoboCasa-local skill library
+([`robocasa/skills/`](../.claude/skills/iterative-debugging/robocasa/skills/README.md)) and
+verifier are **on**. Workers consult the library and write `skill_report.json`. After Stage 2
+held-out (frozen program, do not retune), the coordinator stages proposals and runs the
+verifier on the **same** sim; only `verified` entries are promoted. Do not use parent
+`dispatch.py`. Evolutionary search is optional and **default off**: pass
+`init_run.py --evosearch` (or set `CAP_HARNESS_ROBOCASA_EVOSEARCH=1` at kickoff) to run
+Stage 1b with `evosearch_eval.py --parallel-per-gpu 1`. Init must pass
+`--skills-dir .claude/skills/iterative-debugging/robocasa/skills`.
+
+The campaign suite comes from `tasks.json` (`OpenDrawer` or `PickPlaceCounterToStove`). The
+per-episode instruction is `get_task_context().language`, not the suite name. Seeds, recorded
+in `campaign.json`: development **101 102 103**, unseen-check **126**, held-out **1 2 3**.
+Widening later keeps the TRAIN ≥101 / TEST 1–100 cut described above. The library is empty of
+verified entries until a campaign fills it.
 
 ## Registry
 

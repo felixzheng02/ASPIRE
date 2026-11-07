@@ -237,3 +237,12 @@ def test_trace_summarizes_arrays_provider_frame_and_failure_code() -> None:
     assert trace.provider == "contact_graspnet"
     assert trace.failure_code == ErrorCode.NO_GRASP.value
     assert trace.inputs_summary["positional"][1]["type"] == "list"
+
+
+def test_execute_program_filename_does_not_change_execution() -> None:
+    registry, _ = _registry()
+    result = ProgramExecutor(registry).execute_program(
+        "result = 7", filename="/tmp/connectivity_check.py"
+    )
+    assert result.ok
+    assert result.result == 7

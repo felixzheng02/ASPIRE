@@ -30,10 +30,12 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from campaign import (
+    campaign_skills_dir,
     heldout_seeds,
     read_json,
     resolve_run_root,
     skill_library_sha,
+    skills_dir_label,
     validate_skill_report,
     verification_dir,
 )
@@ -274,7 +276,9 @@ def main() -> None:
     heldout = heldout_seeds(run_root)
     HELDOUT_SEEDS = [str(seed) for seed in heldout]
     DONE_THRESHOLD = len(heldout)
-    current_library = skill_library_sha()
+    library_dir = campaign_skills_dir(run_root)
+    current_library = skill_library_sha(library_dir)
+    library_label = skills_dir_label(library_dir)
 
     lines = []
     lines.append("# Iterative Debugging Progress")
@@ -294,7 +298,7 @@ def main() -> None:
         " the fix from the skill alone, promotable | `refuted` = it could not, do not promote |"
         " `invalid`/`missing` = the report cannot be graded, and the task's findings are stranded"
     )
-    lines.append(f"**Skill library:** `{current_library}` (content hash of `skills/`)")
+    lines.append(f"**Skill library:** `{current_library}` (content hash of `{library_label}`)")
     lines.append("")
 
     pending_tasks = []

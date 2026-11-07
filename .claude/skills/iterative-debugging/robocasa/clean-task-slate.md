@@ -1,9 +1,10 @@
 # Clean Task Slate: RoboCasa
 
-Use this before rerunning OpenDrawer.
+Use this before rerunning a RoboCasa task.
 
-1. Confirm the campaign root, suite (`OpenDrawer`), and whether `$TASK_DIR` should be archived.
-   The task is self-contained in `$RUN_ROOT/robocasa/OpenDrawer/task_0/`. Moving that folder
+1. Confirm the campaign root, suite (`$SUITE` from `tasks.json`), and whether `$TASK_DIR`
+   should be archived. The task is self-contained in
+   `$RUN_ROOT/robocasa/$SUITE/task_$TASK_ID/`. Moving that folder
    aside is a complete clean slate for the task. To set it aside, `mv` it to an `archive/`
    directory; never `rm`.
 2. Stop the **simulator** by the PID in `$TASK_DIR/simulator.pid` only. Never `pkill`, never a
@@ -22,4 +23,7 @@ Use this before rerunning OpenDrawer.
 6. Do not read external baseline code or outputs. PyRoki on `:8116`, GraspNet on `:8115`,
    and cuRobo on `:8118` are start-if-idle via `ensure_pyroki.sh` / `ensure_graspnet.sh` /
    `ensure_curobo.sh`; never kill them.
-7. Workers write task artifacts and findings; this campaign has no shared skill library to edit.
+7. Workers write task artifacts, `findings.md`, and `skill_report.json`. The skill library
+   lives in `.claude/skills/iterative-debugging/robocasa/skills/` (the skill folder in the
+   repo), not in `$TASK_DIR`. This slate does not delete `skills/`. Only the coordinator
+   edits that library, and only after a verifier returns `verified`.

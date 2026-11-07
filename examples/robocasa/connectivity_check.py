@@ -1,19 +1,28 @@
-# Integration gate for the RoboCasa adapter. NOT a policy for the task.
-#
-# A real program takes this path -- observation, SAM, back-projection, gripper,
-# joint motion, execute_trajectory, go_home, cartesian IK, grasps, mobile base,
-# footprint occupancy, standoff geometry -- and this file
-# *measures* that each step did something. It does not try to open the drawer;
-# writing the task program is the agent's job. task_success will still be false.
+# PickPlaceCounterToStove on the public API: grasp the named food, then place it in the pan.
 #
 # Sandbox: import math only. ndarray METHODS (points.mean(axis=0), .min, .sum)
 # trigger a lazy numpy import and fail with "'mappingproxy' object has no
-# attribute '__import__'". Module-level numpy is fine; this file uses lists,
-# sum()/len(), and math instead.
+# attribute '__import__'".
+#
+# Instruction is "Pick the {food} from the plate and place it in the {pan}."
+# localize_object() returns SAM's first mask (often the counter). Pick the
+# highest-scoring compact mask for the named object instead. Prefer a top-down
+# GraspNet pose that cuRobo can reach, close, lift, then a hardcoded drop onto
+# the pan centroid.
+#
+# Task success is scored by the harness after return (object in pan, gripper far).
 import math
 
 report = {}
 failed = []
+
+LIFT_M = 0.12
+PREGRASP_M = 0.08
+PLACE_HOVER_M = 0.18
+PLACE_DROP_M = 0.06
+RETREAT_M = 0.16
+CONTACT = MotionStrategy()
+CUROBO = MotionStrategy(ik_solver="pyroki", trajectory_planner="curobo")
 
 
 def record(name, ok, detail):
@@ -22,18 +31,19 @@ def record(name, ok, detail):
         failed.append(name + ": " + str(detail))
 
 
+def note(name, ok, detail):
+    report[name] = {"ok": bool(ok), "detail": detail}
+
+
 def error_text(err):
     if err is None:
         return ""
     return str(err.message)
 
 
-def joints_of(state):
-    return [float(v) for v in state.joint_positions["primary"]]
-
-
-def names_of(state):
-    return [str(name) for name in state.joint_names["primary"]]
+def centroid_of(points):
+    n = len(points)
+    return [sum([float(p[i]) for p in points]) / n for i in range(3)]
 
 
 def dist(a, b):
@@ -44,443 +54,342 @@ def dist(a, b):
     return math.sqrt(total)
 
 
-def yaw_of(pose):
-    w, x, y, z = [float(v) for v in pose.quaternion_wxyz]
-    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+def as_xyz(value):
+    return [float(value[0]), float(value[1]), float(value[2])]
 
 
-def wrap_pi(angle):
-    while angle > math.pi:
-        angle = angle - 2.0 * math.pi
-    while angle < -math.pi:
-        angle = angle + 2.0 * math.pi
-    return angle
+def as_quat(value):
+    return (float(value[0]), float(value[1]), float(value[2]), float(value[3]))
 
 
-def centroid_of(points):
-    n = len(points)
-    return [sum([float(p[i]) for p in points]) / n for i in range(3)]
+def make_pose(position, quaternion_wxyz, frame):
+    return Pose(
+        position=(float(position[0]), float(position[1]), float(position[2])),
+        quaternion_wxyz=tuple(float(v) for v in quaternion_wxyz),
+        frame=frame,
+    )
+
+
+def quat_axis(q, column):
+    w, x, y, z = q
+    if column == 0:
+        return (1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y))
+    if column == 1:
+        return (2 * (x * y - w * z), 1 - 2 * (x * x + z * z), 2 * (y * z + w * x))
+    return (2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y))
+
+
+def offset_world(pose, dx, dy, dz):
+    p = as_xyz(pose.position)
+    return make_pose((p[0] + dx, p[1] + dy, p[2] + dz), as_quat(pose.quaternion_wxyz), pose.frame)
+
+
+def offset_local_z(pose, amount):
+    p = as_xyz(pose.position)
+    z = quat_axis(as_quat(pose.quaternion_wxyz), 2)
+    return make_pose(
+        (p[0] + z[0] * amount, p[1] + z[1] * amount, p[2] + z[2] * amount),
+        as_quat(pose.quaternion_wxyz),
+        pose.frame,
+    )
+
+
+def box_wh(seg):
+    box = seg.box_xyxy
+    return float(box[2]) - float(box[0]), float(box[3]) - float(box[1])
+
+
+def box_area(seg):
+    width, height = box_wh(seg)
+    return width * height
+
+
+def pick_mask(prompt):
+    found = segment_text("agentview", prompt)
+    if not found.ok:
+        return None, error_text(found.error)
+    pool = list(found.segmentations)
+    if len(pool) == 0:
+        return None, "no masks for " + prompt
+    chosen = pool[0]
+    best = float(chosen.score) / (1.0 + box_area(chosen))
+    for seg in pool[1:]:
+        score = float(seg.score) / (1.0 + box_area(seg))
+        if score > best:
+            chosen = seg
+            best = score
+    return chosen, None
+
+
+def parse_pick_place(text):
+    raw = str(text).strip()
+    lowered = raw.lower()
+    obj_name = "food"
+    cont_name = "pan"
+    start = lowered.find("pick the ")
+    mid = lowered.find(" from the ")
+    place = lowered.find(" place it in the ")
+    if start >= 0 and mid > start:
+        obj_name = raw[start + 9 : mid].strip()
+    if place >= 0:
+        rest = raw[place + 16 :].strip()
+        if rest.endswith("."):
+            rest = rest[:-1]
+        if len(rest) > 0:
+            cont_name = rest
+    return obj_name, cont_name
+
+
+def cloud_centroid(seg, frame):
+    cloud = mask_to_point_cloud(seg, "agentview", target_frame=frame)
+    if cloud is None or len(cloud.points) == 0:
+        return None
+    return centroid_of(cloud.points)
+
+
+def joints_list(state):
+    values = state.joint_positions["primary"]
+    return [float(values[i]) for i in range(7)]
+
+
+def go_contact(pose, seed):
+    ik = solve_ik(pose, seed_joints=seed)
+    if not ik.ok:
+        ik = solve_ik(pose)
+    if ik.ok:
+        plan = plan_motion(ik.joint_positions, strategy=CONTACT)
+        if plan.ok and plan.trajectory is not None:
+            moved = execute_trajectory(plan.trajectory)
+            if moved.ok:
+                return moved
+    return move_to_pose(pose, tolerance=0.04, max_steps=100, strategy=CONTACT)
+
+
+def grasp_pose_list(grasps):
+    poses = []
+    ranked = select_grasp(grasps, "top_down")
+    if ranked is not None:
+        poses.append(ranked.pose)
+    scored = select_grasp(grasps, "highest_score")
+    if scored is not None:
+        poses.append(scored.pose)
+    if grasps.ok and grasps.grasps is not None:
+        for candidate in grasps.grasps:
+            poses.append(candidate.pose)
+    return poses
+
+
+def first_curobo_grasp(poses, seed):
+    for pose in poses:
+        pre = offset_local_z(pose, -PREGRASP_M)
+        ik_pre = solve_ik(pre, seed_joints=seed)
+        ik = solve_ik(pose, seed_joints=seed)
+        if not ik.ok:
+            ik = solve_ik(pose)
+        if not ik.ok:
+            continue
+        goal = ik_pre.joint_positions if ik_pre.ok else ik.joint_positions
+        planned = plan_motion(goal, strategy=CUROBO)
+        if planned.ok and planned.trajectory is not None:
+            return pose, planned, "curobo"
+        planned = plan_motion(ik.joint_positions, strategy=CONTACT)
+        if planned.ok and planned.trajectory is not None:
+            return pose, planned, "interpolation"
+    return None, None, None
 
 
 # --------------------------------------------------------------------------- identity
 
 context = get_task_context()
 instruction = str(context.language)
+obj_name, cont_name = parse_pick_place(instruction)
 record(
     "instruction",
-    len(instruction.strip()) > 0,
-    instruction,
-)
-
-observation = get_observation()
-cameras = sorted(observation.cameras)
-record(
-    "cameras",
-    "agentview" in observation.cameras and "robot0_eye_in_hand" in observation.cameras,
-    cameras,
+    "pick" in instruction.lower() and "place" in instruction.lower(),
+    {"text": instruction, "object": obj_name, "container": cont_name},
 )
 
 state = get_robot_state()
-home_joints = joints_of(state)
-record("base_frame", state.base_frame == "robot0_link0", state.base_frame)
-record("n_joints", len(home_joints) == 7, len(home_joints))
+frame = state.base_frame
+record("base_frame", frame == "robot0_link0", frame)
+seed = joints_list(state)
 
-meta = robocasa.get_controller_metadata()
-record("mobile_base", bool(meta["mobile_base"]), meta["mobile_base"])
+opened = open_gripper()
+record("open_gripper", opened.ok, error_text(opened.error))
 
-# --------------------------------------------------------------------------- scene SAM
+# --------------------------------------------------------------------------- food (named object, not SAM's first mask)
 
-cabinet_cloud = None
-counter_cloud = None
-found = localize_object("cabinet", camera_name="agentview")
-cabinet_mask = None
-if found.ok:
-    cabinet_cloud = found.point_cloud
-    points = cabinet_cloud.points
-    n_points = int(len(points))
-    cloud_frame = cabinet_cloud.frame
-    centroid = centroid_of(points)
-    cabinet_mask = found.segmentation
+obj_set = segment_text("agentview", obj_name)
+obj_seg = None
+if obj_set.ok and obj_set.segmentations:
+    obj_seg = obj_set.segmentations[0]
+obj_xyz = None if obj_seg is None else cloud_centroid(obj_seg, frame)
+record(
+    "localize_object",
+    obj_seg is not None and obj_xyz is not None,
+    {
+        "prompt": obj_name,
+        "box": None if obj_seg is None else [round(float(v), 1) for v in obj_seg.box_xyxy],
+        "centroid": None if obj_xyz is None else [round(v, 3) for v in obj_xyz],
+    },
+)
+
+# --------------------------------------------------------------------------- GraspNet, then the first cuRobo-feasible pose
+
+grasps = None
+n_grasps = 0
+if obj_seg is not None:
+    grasps = generate_grasps("agentview", obj_seg, max_candidates=20)
+    n_grasps = 0 if (not grasps.ok or grasps.grasps is None) else len(grasps.grasps)
+record(
+    "generate_grasps",
+    grasps is not None and grasps.ok and n_grasps > 0,
+    {
+        "n": n_grasps,
+        "error": "" if grasps is None else error_text(grasps.error),
+    },
+)
+
+chosen_pose = None
+plan = None
+planner = None
+if grasps is not None and grasps.ok:
+    chosen_pose, plan, planner = first_curobo_grasp(grasp_pose_list(grasps), seed)
+
+record(
+    "select_grasp",
+    chosen_pose is not None,
+    {
+        "planner": planner,
+        "position": None if chosen_pose is None else [round(float(v), 3) for v in chosen_pose.position],
+    },
+)
+
+# --------------------------------------------------------------------------- plan + execute to a pregrasp, then the grasp pose
+
+if chosen_pose is None or plan is None or plan.trajectory is None:
+    record("plan_motion_grasp", False, "no reachable grasp pose")
+    note("execute_grasp_plan", False, "no plan")
+else:
     record(
-        "localize_cabinet",
-        n_points >= 20 and cloud_frame == state.base_frame,
+        "plan_motion_grasp",
+        True,
         {
-            "n_points": n_points,
-            "frame": cloud_frame,
-            "centroid": [round(v, 3) for v in centroid],
+            "planner": planner,
+            "n_waypoints": len(plan.trajectory.joint_positions),
+            "collision_aware": bool(plan.trajectory.collision_aware),
         },
     )
-    geometry = estimate_geometry(found.point_cloud)
-    extents = [float(v) for v in geometry.extents]
-    record(
-        "estimate_geometry",
-        extents[0] > 0.0 and extents[1] > 0.0 and extents[2] > 0.0,
-        {"extents": [round(v, 3) for v in extents], "frame": geometry.frame},
-    )
-    cropped = crop_point_cloud(
-        found.point_cloud,
-        [centroid[0] - 2.0, centroid[1] - 2.0, centroid[2] - 2.0],
-        [centroid[0] + 2.0, centroid[1] + 2.0, centroid[2] + 2.0],
-    )
-    record("crop_point_cloud", len(cropped.points) >= 20, int(len(cropped.points)))
-else:
-    record("localize_cabinet", False, error_text(found.error) or "localize_object failed")
-
-seen = segment_text("agentview", "counter")
-if seen.ok and seen.segmentations:
-    best = seen.segmentations[0]
-    # target_frame must be passed: the API default is the literal "robot_base",
-    # which matches no adapter's base frame. localize_object resolves it from
-    # robot state; this entry point does not.
-    cloud = mask_to_point_cloud(best, "agentview", state.base_frame)
-    counter_cloud = cloud
-    record(
-        "segment_counter",
-        len(cloud.points) >= 20 and cloud.frame == state.base_frame,
+    moved = execute_trajectory(plan.trajectory)
+    contact = go_contact(chosen_pose, joints_list(get_robot_state()))
+    ee = get_robot_state().end_effector_poses["primary"]
+    reach = dist(as_xyz(ee.position), as_xyz(chosen_pose.position))
+    note(
+        "execute_grasp_plan",
+        (moved.ok or contact.ok) or reach < 0.08,
         {
-            "label": best.label,
-            "score": round(float(best.score), 3),
-            "n_points": int(len(cloud.points)),
-            "frame": cloud.frame,
+            "plan_ok": moved.ok,
+            "contact_ok": contact.ok,
+            "reach_error_m": round(reach, 3),
+            "error": error_text(contact.error) or error_text(moved.error),
         },
     )
-else:
-    record("segment_counter", False, error_text(seen.error) or "empty mask")
-
-# --------------------------------------------------------------------------- footprint + standoff
-# base_pose_is_free is world (same frame as get_base_pose). Default SAM clouds
-# are robot0_link0; transform a centroid before the free check. Geometry
-# helpers inherit the cloud frame and only need finite (x, y, yaw).
-
-
-def qrot(q, v):
-    w, x, y, z = [float(a) for a in q]
-    vx, vy, vz = [float(a) for a in v]
-    tx = 2.0 * (y * vz - z * vy)
-    ty = 2.0 * (z * vx - x * vz)
-    tz = 2.0 * (x * vy - y * vx)
-    return [
-        vx + w * tx + (y * tz - z * ty),
-        vy + w * ty + (z * tx - x * tz),
-        vz + w * tz + (x * ty - y * tx),
-    ]
-
-
-spawn = robocasa.get_base_pose()
-sx = float(spawn.position[0])
-sy = float(spawn.position[1])
-spawn_yaw = yaw_of(spawn)
-spawn_free = robocasa.base_pose_is_free(sx, sy, spawn_yaw)
-record(
-    "spawn_free",
-    spawn_free is True,
-    {"x": round(sx, 3), "y": round(sy, 3), "yaw": round(spawn_yaw, 3), "free": spawn_free},
-)
-
-if counter_cloud is None:
-    record("counter_blocked", False, "no counter cloud")
-else:
-    c = centroid_of(counter_cloud.points)
-    rotated = qrot(spawn.quaternion_wxyz, c)
-    cx = sx + rotated[0]
-    cy = sy + rotated[1]
-    counter_free = robocasa.base_pose_is_free(cx, cy)
-    record(
-        "counter_blocked",
-        counter_free is False,
-        {"x": round(cx, 3), "y": round(cy, 3), "free": counter_free},
-    )
-
-if counter_cloud is None or cabinet_cloud is None:
-    record("plan_standoff_pose", False, "need counter and cabinet clouds")
-    record("plan_approach_pose", False, "need a cabinet cloud")
-else:
-    standoff = robocasa.plan_standoff_pose(counter_cloud, cabinet_cloud, 0.3)
-    record(
-        "plan_standoff_pose",
-        all(math.isfinite(float(v)) for v in standoff),
-        {"xyyaw": [round(float(v), 3) for v in standoff]},
-    )
-    approach = robocasa.plan_approach_pose(cabinet_cloud, 0.7)
-    record(
-        "plan_approach_pose",
-        all(math.isfinite(float(v)) for v in approach),
-        {"xyyaw": [round(float(v), 3) for v in approach]},
-    )
-
-# --------------------------------------------------------------------------- wrist SAM
-
-wrist = observation.cameras["robot0_eye_in_hand"]
-wrist_h = int(wrist.rgb.shape[0])
-wrist_w = int(wrist.rgb.shape[1])
-wrist_depth = float(wrist.depth_m[wrist_h // 2, wrist_w // 2])
-record(
-    "wrist_camera",
-    wrist_h > 0 and wrist_w > 0 and math.isfinite(wrist_depth) and wrist_depth >= 0.0,
-    {"shape": [wrist_h, wrist_w], "center_depth_m": round(wrist_depth, 3)},
-)
-
-wrist_prompt = None
-for query in ["counter", "cabinet", "robot"]:
-    probed = segment_text("robot0_eye_in_hand", query)
-    if probed.ok and probed.segmentations:
-        wrist_prompt = query
-        break
-record(
-    "wrist_segment_text",
-    wrist_prompt is not None,
-    wrist_prompt or error_text(probed.error) or "no scene prompt hit on the wrist camera",
-)
-
-clicked = segment_points("robot0_eye_in_hand", [[float(wrist_w) / 2.0, float(wrist_h) / 2.0]])
-point_pixels = 0
-if clicked.ok and clicked.segmentations:
-    mask = clicked.segmentations[0].mask.tolist()
-    point_pixels = int(sum(sum(row) for row in mask))
-record(
-    "segment_points",
-    clicked.ok and point_pixels > 0,
-    error_text(clicked.error) if not clicked.ok else {"pixels": point_pixels},
-)
-
-# --------------------------------------------------------------------------- gripper
 
 closed = close_gripper()
-grip_closed = float(get_robot_state().gripper_positions["primary"])
+grip = float(get_robot_state().gripper_positions["primary"])
 record(
     "close_gripper",
-    closed.ok and grip_closed < 0.2,
+    closed.ok and grip < 0.5,
     {
         "command_ok": closed.ok,
-        "measured": round(grip_closed, 3),
+        "measured": round(grip, 3),
         "error": error_text(closed.error),
     },
 )
 
-opened = open_gripper()
-grip_open = float(get_robot_state().gripper_positions["primary"])
-record(
-    "open_gripper",
-    opened.ok and grip_open > 0.8,
-    {
-        "command_ok": opened.ok,
-        "measured": round(grip_open, 3),
-        "error": error_text(opened.error),
-    },
-)
-
-# --------------------------------------------------------------------------- arm: move_to_joints then execute_trajectory then go_home
-
-before_joints = joints_of(get_robot_state())
-target_joints = list(before_joints)
-target_joints[1] = target_joints[1] + 0.15
-moved = move_to_joints(target_joints, tolerance=0.02, max_steps=120)
-after_joints = joints_of(get_robot_state())
-record(
-    "move_to_joints",
-    moved.ok and abs(after_joints[1] - target_joints[1]) <= 0.05,
-    {
-        "command_ok": moved.ok,
-        "joint1_before": round(before_joints[1], 3),
-        "joint1_after": round(after_joints[1], 3),
-        "joint1_target": round(target_joints[1], 3),
-        "error": error_text(moved.error),
-    },
-)
-
-traj_state = get_robot_state()
-traj_start = joints_of(traj_state)
-traj_goal = list(traj_start)
-traj_goal[2] = traj_goal[2] + 0.10
-# execute_trajectory applies one control tick per waypoint (it does not servo).
-# Interpolate so the last waypoint is reachable within the adapter's 0.02 rad tolerance.
-n_traj = 25
-waypoints = []
-for i in range(n_traj):
-    t = float(i + 1) / float(n_traj)
-    waypoint = []
-    for k in range(7):
-        waypoint.append(traj_start[k] + t * (traj_goal[k] - traj_start[k]))
-    waypoints.append(waypoint)
-for i in range(10):
-    waypoints.append(list(traj_goal))
-trajectory = Trajectory(
-    joint_positions=waypoints,
-    dt_s=0.05,
-    joint_names=names_of(traj_state),
-    planner="connectivity_check",
-    collision_aware=False,
-    expected_start=traj_state,
-    arm="primary",
-    embodiment="robocasa",
-)
-executed = execute_trajectory(trajectory)
-traj_after = joints_of(get_robot_state())
-record(
-    "execute_trajectory",
-    executed.ok and abs(traj_after[2] - traj_goal[2]) <= 0.05,
-    {
-        "command_ok": executed.ok,
-        "joint2_before": round(traj_start[2], 3),
-        "joint2_after": round(traj_after[2], 3),
-        "joint2_target": round(traj_goal[2], 3),
-        "error": error_text(executed.error),
-    },
-)
-
-homed = go_home()
-home_after = joints_of(get_robot_state())
-record(
-    "go_home",
-    homed.ok and dist(home_after, home_joints) <= 0.08,
-    {
-        "command_ok": homed.ok,
-        "joint_error": round(dist(home_after, home_joints), 3),
-        "error": error_text(homed.error),
-    },
-)
-
-# --------------------------------------------------------------------------- base: lateral + yaw. Forward is skipped: a blocked
-# drive_base can run up to 1200 ticks (~60 s) and spawn faces a counter.
-
-pose_before = robocasa.get_base_pose()
-xy_before = [float(pose_before.position[0]), float(pose_before.position[1])]
-lateral = robocasa.navigate_to_pose(0.0, 0.08, 0.0)
-pose_mid = robocasa.get_base_pose()
-xy_mid = [float(pose_mid.position[0]), float(pose_mid.position[1])]
-lateral_moved = dist(xy_mid, xy_before)
-record(
-    "navigate_lateral",
-    lateral.ok and lateral_moved > 0.03,
-    {
-        "command_ok": lateral.ok,
-        "moved_m": round(lateral_moved, 3),
-        "error": error_text(lateral.error),
-    },
-)
-
-yaw_before = yaw_of(pose_mid)
-yawed = robocasa.navigate_to_pose(0.0, 0.0, 0.2)
-yaw_after = yaw_of(robocasa.get_base_pose())
-yaw_delta = abs(wrap_pi(yaw_after - yaw_before))
-record(
-    "navigate_yaw",
-    yawed.ok and yaw_delta > 0.1,
-    {
-        "command_ok": yawed.ok,
-        "yaw_delta_rad": round(yaw_delta, 3),
-        "error": error_text(yawed.error),
-    },
-)
-
-# --------------------------------------------------------------------------- cartesian IK, GraspNet, and collision-aware plan_motion are live.
-# Mid-range gripper is still unwired: if set_gripper(0.5) starts succeeding,
-# that is a regression of *this* gate, not automatically a finished feature.
+# --------------------------------------------------------------------------- lift, then hardcoded place onto the pan
 
 ee = get_robot_state().end_effector_poses["primary"]
-ik = solve_ik(ee)
-record(
-    "solve_ik_ok",
-    ik.ok,
+lifted = go_contact(offset_world(ee, 0.0, 0.0, LIFT_M), joints_list(get_robot_state()))
+ee = get_robot_state().end_effector_poses["primary"]
+note(
+    "lift",
+    lifted.ok,
     {
-        "command_ok": ik.ok,
-        "n_joints": 0 if ik.joint_positions is None else len(ik.joint_positions),
-        "error": error_text(ik.error),
+        "command_ok": lifted.ok,
+        "z": round(float(ee.position[2]), 3),
+        "error": error_text(lifted.error),
     },
 )
 
-# Home EE is already near the Panda's ~0.85 m ceiling; lift fails IK. Lower it.
-lowered = {
-    "position": [float(ee.position[0]), float(ee.position[1]), float(ee.position[2]) - 0.04],
-    "quaternion_wxyz": [float(v) for v in ee.quaternion_wxyz],
-    "frame": ee.frame,
-}
-posed = move_to_pose(lowered, tolerance=0.03, max_steps=200)
-ee_after = get_robot_state().end_effector_poses["primary"]
-z_error = abs(float(ee_after.position[2]) - float(lowered["position"][2]))
+cont_seg, cont_err = pick_mask(cont_name)
+if cont_seg is None:
+    cont_seg, cont_err = pick_mask("pan")
+cont_xyz = None if cont_seg is None else cloud_centroid(cont_seg, frame)
 record(
-    "move_to_pose",
-    posed.ok and z_error <= 0.04,
+    "localize_container",
+    cont_seg is not None and cont_xyz is not None,
     {
-        "command_ok": posed.ok,
-        "z_before": round(float(ee.position[2]), 3),
-        "z_after": round(float(ee_after.position[2]), 3),
-        "z_target": round(float(lowered["position"][2]), 3),
-        "z_error": round(z_error, 3),
-        "error": error_text(posed.error),
+        "prompt": cont_name,
+        "error": cont_err,
+        "centroid": None if cont_xyz is None else [round(v, 3) for v in cont_xyz],
     },
 )
 
-current = joints_of(get_robot_state())
-joint_goal = list(current)
-joint_goal[2] = current[2] + 0.06
-interpolated = plan_motion(joint_goal)
-n_interp = 0 if interpolated.trajectory is None else len(interpolated.trajectory.joint_positions)
-record(
-    "plan_motion_interpolation",
-    interpolated.ok and n_interp >= 2,
-    {
-        "command_ok": interpolated.ok,
-        "n_waypoints": n_interp,
-        "error": error_text(interpolated.error),
-    },
-)
-curobo_plan = plan_motion(
-    joint_goal,
-    strategy=MotionStrategy(ik_solver="pyroki", trajectory_planner="curobo"),
-)
-curobo_code = "" if curobo_plan.error is None else str(curobo_plan.error.code)
-curobo_aware = None
-if curobo_plan.trajectory is not None:
-    curobo_aware = bool(curobo_plan.trajectory.collision_aware)
-record(
-    "plan_motion_curobo",
-    curobo_plan.ok or curobo_code == "planning_failed",
-    {
-        "command_ok": curobo_plan.ok,
-        "code": curobo_code,
-        "collision_aware": curobo_aware,
-        "error": error_text(curobo_plan.error),
-    },
-)
-
-if cabinet_mask is None:
-    record("generate_grasps_ok", False, "no cabinet mask to pass to generate_grasps")
-    record("select_grasp", False, "no grasps")
+placed_ok = False
+if cont_xyz is not None:
+    ee = get_robot_state().end_effector_poses["primary"]
+    hover = make_pose((cont_xyz[0], cont_xyz[1], cont_xyz[2] + PLACE_HOVER_M), as_quat(ee.quaternion_wxyz), frame)
+    hover_move = go_contact(hover, joints_list(get_robot_state()))
+    ee = get_robot_state().end_effector_poses["primary"]
+    drop = make_pose((cont_xyz[0], cont_xyz[1], cont_xyz[2] + PLACE_DROP_M), as_quat(ee.quaternion_wxyz), frame)
+    drop_move = go_contact(drop, joints_list(get_robot_state()))
+    placed_ok = hover_move.ok or drop_move.ok
+    note(
+        "place",
+        placed_ok,
+        {
+            "hover_ok": hover_move.ok,
+            "drop_ok": drop_move.ok,
+            "target": [round(v, 3) for v in cont_xyz],
+            "error": error_text(drop_move.error) or error_text(hover_move.error),
+        },
+    )
 else:
-    grasps = generate_grasps("agentview", cabinet_mask)
-    n_grasps = 0 if (not grasps.ok or grasps.grasps is None) else len(grasps.grasps)
-    grasp_frame = ""
-    if n_grasps > 0:
-        grasp_frame = grasps.grasps[0].pose.frame
-    record(
-        "generate_grasps_ok",
-        grasps.ok and n_grasps > 0 and grasp_frame == state.base_frame,
+    note("place", False, "no pan centroid")
+
+released = open_gripper()
+note("release", released.ok, error_text(released.error))
+
+ee = get_robot_state().end_effector_poses["primary"]
+retreat = go_contact(offset_world(ee, 0.0, 0.0, RETREAT_M), joints_list(get_robot_state()))
+note("retreat", retreat.ok, error_text(retreat.error))
+
+# --------------------------------------------------------------------------- public witness: food cloud moved toward the pan
+
+after_seg, after_err = pick_mask(obj_name)
+after_xyz = None if after_seg is None else cloud_centroid(after_seg, frame)
+if obj_xyz is None or after_xyz is None:
+    note("object_moved", False, "missing before/after object cloud")
+elif cont_xyz is None:
+    note(
+        "object_moved",
+        dist(obj_xyz, after_xyz) > 0.04,
+        {"shift_m": round(dist(obj_xyz, after_xyz), 3)},
+    )
+else:
+    before = dist(obj_xyz, cont_xyz)
+    after = dist(after_xyz, cont_xyz)
+    note(
+        "object_moved",
+        after + 0.04 < before,
         {
-            "command_ok": grasps.ok,
-            "n": n_grasps,
-            "frame": grasp_frame,
-            "error": error_text(grasps.error),
+            "before_to_pan_m": round(before, 3),
+            "after_to_pan_m": round(after, 3),
+            "object_before": [round(v, 3) for v in obj_xyz],
+            "object_after": [round(v, 3) for v in after_xyz],
         },
     )
-    chosen = select_grasp(grasps, "highest_score") if grasps.ok else None
-    record(
-        "select_grasp",
-        chosen is not None and chosen.pose.frame == state.base_frame,
-        {
-            "frame": "" if chosen is None else chosen.pose.frame,
-            "score": None if chosen is None else round(float(chosen.score), 3),
-        },
-    )
-
-mid_grip = set_gripper(0.5)
-record(
-    "set_gripper_mid_unsupported",
-    not mid_grip.ok,
-    error_text(mid_grip.error) or "set_gripper(0.5) unexpectedly succeeded",
-)
-
-# --------------------------------------------------------------------------- gate
 
 for key in sorted(report):
     print(key + ": " + str(report[key]))

@@ -20,6 +20,8 @@ from cap_harness.artifacts import (
 from cap_harness.contracts import (
     ArmCommand,
     CameraObservation,
+    GraspCandidate,
+    GraspSet,
     Observation,
     PointCloud,
     Pose,
@@ -277,16 +279,91 @@ def test_segmentation_trace_keeps_boxes_and_annotated_overlay_without_masks(tmp_
     assert len(output["segmentations"]) == 5
     assert output["segmentations"][0]["box_xyxy"] == [1.0, 2.0, 12.0, 13.0]
     assert "mask" not in output["segmentations"][0]
-    assert len(list((recorder.root / "media/overlays").glob("*.png"))) == 1
+    assert len(list((recorder.root / "media/overlays").glob("sam3-*.png"))) == 1
     overlay_metadata = json.loads(
-        next((recorder.root / "media/overlays").glob("*.json")).read_text()
+        next((recorder.root / "media/overlays").glob("sam3-*.json")).read_text()
     )
+    scene3d = json.loads(
+        next((recorder.root / "media/overlays").glob("scene3d-*-segment-*.json")).read_text()
+    )
+    assert scene3d["n_object_points"] > 0
     assert [item["label"] for item in overlay_metadata["candidates"]] == [
         f"candidate-{index}" for index in range(5)
     ]
     assert overlay_metadata["candidates"][0]["score"] == 0.9
     assert overlay_metadata["candidates"][0]["mask_pixels"] == 16
     assert not (recorder.root / "payloads").exists()
+
+
+def test_grasp_overlay_projects_tcp_into_image(tmp_path) -> None:
+    recorder = RunRecorder(
+        output_root=tmp_path,
+        benchmark="libero-pro",
+        suite="suite",
+        task_id=0,
+        task_name="task",
+        seed=1,
+        max_steps=1,
+        capture_videos=False,
+    )
+    identity = Pose(np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0]), "robot_base")
+    source = _observation()
+    agent = source.cameras["agentview"]
+    observation = Observation(
+        cameras={
+            "agentview": CameraObservation(
+                rgb=np.zeros((16, 16, 3), dtype=np.uint8),
+                depth_m=agent.depth_m,
+                intrinsics=np.array(
+                    [[80.0, 0.0, 8.0], [0.0, 80.0, 8.0], [0.0, 0.0, 1.0]],
+                    dtype=np.float64,
+                ),
+                frame=agent.frame,
+                camera_pose=identity,
+                timestamp_s=agent.timestamp_s,
+            ),
+            "robot0_eye_in_hand": source.cameras["robot0_eye_in_hand"],
+        },
+        robot_state=source.robot_state,
+        task_context=source.task_context,
+        timestamp_s=source.timestamp_s,
+    )
+    recorder.on_reset(observation, {})
+    grasp = GraspCandidate(
+        pose=Pose(np.array([0.0, 0.0, 1.0]), np.array([1.0, 0.0, 0.0, 0.0]), "robot_base"),
+        score=0.91,
+        width_m=0.04,
+    )
+    with recorder.span(
+        "contact_graspnet.generate_grasps",
+        category="provider",
+        inputs={},
+    ) as span:
+        span.output(GraspSet(ok=True, grasps=[grasp]))
+    recorder.finalize(
+        program_ok=True,
+        task_success=False,
+        termination_reason="program_completed",
+        program_result=None,
+    )
+
+    overlay = next((recorder.root / "media/overlays").glob("grasp-*.png"))
+    metadata = json.loads(next((recorder.root / "media/overlays").glob("grasp-*.json")).read_text())
+    assert metadata["camera_name"] == "agentview"
+    assert metadata["candidates"][0]["pixel_uv"] == [8, 8]
+    assert metadata["candidates"][0]["score"] == 0.91
+    pixels = np.asarray(imageio.imread(overlay))
+    assert int(pixels[8, 8].sum()) > 0
+    scene3d = json.loads(
+        next((recorder.root / "media/overlays").glob("scene3d-*-grasp-*.json")).read_text()
+    )
+    assert scene3d["n_grasps"] == 1
+    assert scene3d["n_scene_points"] > 0
+    assert int(
+        np.asarray(
+            imageio.imread(next((recorder.root / "media/overlays").glob("scene3d-*.png")))
+        ).sum()
+    ) > 0
 
 
 def test_timing_buckets_are_disjoint_and_nesting_never_double_counts() -> None:
