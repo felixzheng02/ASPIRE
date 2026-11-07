@@ -47,9 +47,8 @@ Every invocation creates a new directory and never overwrites an earlier run.
   BEHAVIOR-1K, so 10 fps), and `media/video-index.json` records the effective fps.
 - `media/keyframes/`: lossless RGB immediately before and after public motion API calls, plus one
   depth NPY attached to the first such keyframe in the run.
-- `media/overlays/`: SAM masks over RGB (`sam3-*.png`), grasp poses over RGB (`grasp-*.png`),
-  and an isometric 3D view (`scene3d-*.png`) of the depth-lifted scene, the SAM mask as a
-  point cloud, and grasp frames. Raw masks and XYZ arrays are not retained.
+- `media/overlays/`: SAM masks over RGB (`sam3-*.png`) and grasp poses over RGB (`grasp-*.png`).
+  Raw masks and XYZ arrays are not retained.
 
 `run.json` records the backend names configured for the program; it does not assert service health.
 Program and provider spans record the
@@ -62,7 +61,6 @@ metadata rather than duplicate RGB or depth arrays. SAM3 retains metadata, score
 coordinates for its top five results, plus an RGB overlay for the top result; raw masks are not
 persisted. Contact-GraspNet collections retain five candidates. Point-cloud artifacts retain only
 frame, point count, and color-presence metadata; XYZ and RGB point arrays are not persisted.
-The 3D overlay is a PNG rendering of those clouds and poses, not a stored point cloud.
 Reward, benchmark success, and protocol predicates never appear in generated-program results, API
 traces, or per-step records. The runtime writes only final aggregate outcomes and the separate
 summarized evaluator evidence.

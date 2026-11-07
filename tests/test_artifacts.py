@@ -283,10 +283,7 @@ def test_segmentation_trace_keeps_boxes_and_annotated_overlay_without_masks(tmp_
     overlay_metadata = json.loads(
         next((recorder.root / "media/overlays").glob("sam3-*.json")).read_text()
     )
-    scene3d = json.loads(
-        next((recorder.root / "media/overlays").glob("scene3d-*-segment-*.json")).read_text()
-    )
-    assert scene3d["n_object_points"] > 0
+    assert not list((recorder.root / "media/overlays").glob("scene3d-*"))
     assert [item["label"] for item in overlay_metadata["candidates"]] == [
         f"candidate-{index}" for index in range(5)
     ]
@@ -354,16 +351,7 @@ def test_grasp_overlay_projects_tcp_into_image(tmp_path) -> None:
     assert metadata["candidates"][0]["score"] == 0.91
     pixels = np.asarray(imageio.imread(overlay))
     assert int(pixels[8, 8].sum()) > 0
-    scene3d = json.loads(
-        next((recorder.root / "media/overlays").glob("scene3d-*-grasp-*.json")).read_text()
-    )
-    assert scene3d["n_grasps"] == 1
-    assert scene3d["n_scene_points"] > 0
-    assert int(
-        np.asarray(
-            imageio.imread(next((recorder.root / "media/overlays").glob("scene3d-*.png")))
-        ).sum()
-    ) > 0
+    assert not list((recorder.root / "media/overlays").glob("scene3d-*"))
 
 
 def test_timing_buckets_are_disjoint_and_nesting_never_double_counts() -> None:
