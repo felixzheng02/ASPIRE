@@ -181,6 +181,55 @@ def invert_transform(transform: object) -> np.ndarray:
     return inverse
 
 
+#: Panda embodiments whose public EEF is 10 cm along +Z from ``panda_hand``.
+PANDA_EMBODIMENTS = frozenset({"libero", "robocasa", "robosuite"})
+PANDA_EEF_TO_HAND_OFFSET_M = np.array([0.0, 0.0, -0.1], dtype=np.float64)
+# gripper0_right_eef in RoboCasa's panda_gripper.xml sits on right_gripper, whose
+# body quat is Rz(-90°). LIBERO/robosuite EEF frames are already panda_hand-aligned,
+# so only robocasa right-multiplies this local-Z +90° to recover panda_hand.
+_ROBOCASA_HAND_FROM_EEF_ROTATION = np.array(
+    [
+        [0.0, -1.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ],
+    dtype=np.float64,
+)
+_ROBOCASA_EEF_FROM_HAND_ROTATION = _ROBOCASA_HAND_FROM_EEF_ROTATION.T
+
+
+def panda_hand_from_eef(pose: Pose, embodiment: str) -> Pose:
+    """Map a public EEF pose to the ``panda_hand`` link PyRoki/cuRobo solve.
+
+    Identity for non-Panda embodiments. Local +Z is shared, so the translation
+    is always ``R @ [0, 0, -0.1]``; robocasa also applies ``Rz(+90°)``.
+    """
+    if embodiment not in PANDA_EMBODIMENTS:
+        return pose
+    rotation = quaternion_wxyz_to_matrix(pose.quaternion_wxyz)
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, 3] = (
+        np.asarray(pose.position, dtype=np.float64) + rotation @ PANDA_EEF_TO_HAND_OFFSET_M
+    )
+    transform[:3, :3] = (
+        rotation @ _ROBOCASA_HAND_FROM_EEF_ROTATION if embodiment == "robocasa" else rotation
+    )
+    return matrix_to_pose(transform, frame=pose.frame)
+
+
+def eef_from_panda_hand(pose: Pose, embodiment: str) -> Pose:
+    """Inverse of ``panda_hand_from_eef``. Identity for non-Panda embodiments."""
+    if embodiment not in PANDA_EMBODIMENTS:
+        return pose
+    rotation = quaternion_wxyz_to_matrix(pose.quaternion_wxyz)
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, 3] = np.asarray(pose.position, dtype=np.float64) + rotation[:, 2] * 0.1
+    transform[:3, :3] = (
+        rotation @ _ROBOCASA_EEF_FROM_HAND_ROTATION if embodiment == "robocasa" else rotation
+    )
+    return matrix_to_pose(transform, frame=pose.frame)
+
+
 def transform_points(points: object, transform: object) -> np.ndarray:
     """Apply one validated homogeneous transform to finite XYZ points."""
     xyz = _finite_array(points, shape=(None, 3), name="points")
@@ -409,7 +458,10 @@ quaternion_to_matrix = quaternion_wxyz_to_matrix
 
 
 __all__ = [
+    "PANDA_EEF_TO_HAND_OFFSET_M",
+    "PANDA_EMBODIMENTS",
     "crop_point_cloud",
+    "eef_from_panda_hand",
     "estimate_geometry",
     "estimate_obb",
     "estimate_oriented_bounding_box",
@@ -418,6 +470,7 @@ __all__ = [
     "matrix_to_pose",
     "matrix_to_quaternion",
     "matrix_to_quaternion_wxyz",
+    "panda_hand_from_eef",
     "pose_from_mapping",
     "pose_to_matrix",
     "quaternion_to_matrix",

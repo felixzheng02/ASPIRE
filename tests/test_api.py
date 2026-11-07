@@ -33,6 +33,7 @@ from cap_harness.contracts import (
     Trajectory,
 )
 from cap_harness.errors import ApiError, ErrorCode
+from cap_harness.geometry import quaternion_wxyz_to_matrix
 
 
 def _pose() -> Pose:
@@ -908,6 +909,59 @@ def test_generate_grasps_projects_mask_into_robot_base_frame() -> None:
     assert provider.max_candidates == 5
     assert len(provider.scene_point_cloud.points) >= len(provider.point_cloud.points)
     assert result.grasps[0].frame == "base"
+
+
+def _state_for(embodiment: str) -> RobotState:
+    return RobotState(
+        joint_positions=np.zeros(7),
+        joint_velocities=np.zeros(7),
+        end_effector_poses=_pose(),
+        gripper_positions=0.4,
+        base_frame="base",
+        embodiment=embodiment,
+    )
+
+
+@pytest.mark.parametrize(
+    ("embodiment", "expect_shift", "expect_rz"),
+    [
+        ("libero", True, False),
+        ("robosuite", True, False),
+        ("robocasa", True, True),
+        ("behavior", False, False),
+    ],
+)
+def test_generate_grasps_publishes_public_eef(
+    embodiment: str, expect_shift: bool, expect_rz: bool
+) -> None:
+    provider = FakeGraspProvider()
+    adapter = FakeAdapter()
+    adapter.state = _state_for(embodiment)
+    api = CapApi(  # type: ignore[arg-type]
+        adapter,
+        grasp_providers={"contact-graspnet": provider},
+    )
+
+    result = api.generate_grasps("agentview", np.ones((2, 2), dtype=bool))
+
+    assert result.ok
+    pose = result.grasps[0].pose
+    rotation = quaternion_wxyz_to_matrix(pose.quaternion_wxyz)
+    if expect_shift:
+        np.testing.assert_allclose(pose.position, [0.0, 0.0, 0.1], atol=1e-12)
+        assert result.diagnostics["provider_target_link"] == "panda_hand"
+        assert result.diagnostics["public_target_link"] == "eef"
+    else:
+        np.testing.assert_allclose(pose.position, [0.0, 0.0, 0.0], atol=1e-12)
+        assert "public_target_link" not in result.diagnostics
+    if expect_rz:
+        np.testing.assert_allclose(
+            rotation,
+            np.array([[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]),
+            atol=1e-12,
+        )
+    else:
+        np.testing.assert_allclose(rotation, np.eye(3), atol=1e-12)
 
 
 def test_move_to_joints_reissues_target_until_observed_state_converges() -> None:

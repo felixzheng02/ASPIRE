@@ -14,9 +14,11 @@ from cap_harness.contracts import (
 )
 from cap_harness.geometry import (
     crop_point_cloud,
+    eef_from_panda_hand,
     estimate_oriented_bounding_box,
     mask_to_point_cloud,
     matrix_to_quaternion_wxyz,
+    panda_hand_from_eef,
     pose_from_mapping,
     quaternion_wxyz_to_matrix,
     rpy_deg_to_quaternion_wxyz,
@@ -52,6 +54,42 @@ def test_rpy_degrees_follow_fixed_axis_xyz_convention(angles):
 def test_rpy_conversion_rejects_malformed_and_nonfinite_angles(angles):
     with pytest.raises(ValueError, match="rpy_deg"):
         rpy_deg_to_quaternion_wxyz(angles)
+
+
+def _sample_eef_pose() -> Pose:
+    rotation = Rotation.from_euler("xyz", [20.0, -35.0, 50.0], degrees=True).as_matrix()
+    return Pose(
+        position=np.array([0.4, -0.15, 0.32]),
+        quaternion_wxyz=matrix_to_quaternion_wxyz(rotation),
+        frame="robot0_link0",
+    )
+
+
+@pytest.mark.parametrize("embodiment", ["libero", "robosuite", "robocasa"])
+def test_panda_eef_hand_roundtrip(embodiment: str) -> None:
+    pose = _sample_eef_pose()
+    hand = panda_hand_from_eef(pose, embodiment)
+    back = eef_from_panda_hand(hand, embodiment)
+    np.testing.assert_allclose(back.position, pose.position, atol=1e-12)
+    np.testing.assert_allclose(
+        quaternion_wxyz_to_matrix(back.quaternion_wxyz),
+        quaternion_wxyz_to_matrix(pose.quaternion_wxyz),
+        atol=1e-12,
+    )
+    assert np.linalg.norm(hand.position - pose.position) == pytest.approx(0.1)
+    hand_rotation = quaternion_wxyz_to_matrix(hand.quaternion_wxyz)
+    eef_rotation = quaternion_wxyz_to_matrix(pose.quaternion_wxyz)
+    np.testing.assert_allclose(hand_rotation[:, 2], eef_rotation[:, 2], atol=1e-12)
+    if embodiment == "robocasa":
+        assert not np.allclose(hand_rotation, eef_rotation)
+    else:
+        np.testing.assert_allclose(hand_rotation, eef_rotation, atol=1e-12)
+
+
+def test_panda_maps_are_identity_outside_panda_embodiments() -> None:
+    pose = _sample_eef_pose()
+    assert panda_hand_from_eef(pose, "behavior") is pose
+    assert eef_from_panda_hand(pose, "behavior") is pose
 
 
 def test_wxyz_matrix_round_trip() -> None:

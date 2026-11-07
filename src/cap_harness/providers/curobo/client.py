@@ -21,7 +21,7 @@ from cap_harness.contracts import (
     Trajectory,
 )
 from cap_harness.errors import ApiError, ErrorCode
-from cap_harness.geometry import matrix_to_quaternion_wxyz, quaternion_wxyz_to_matrix
+from cap_harness.geometry import panda_hand_from_eef
 
 from ..http import HttpProviderClient, ProviderHttpError
 from ..wire import decode_numpy, encode_numpy
@@ -58,17 +58,6 @@ def _typed_service_failure(exc: ProviderHttpError, code: ErrorCode) -> ApiError:
     return ApiError(code=code, message=message, details=details, recoverable=error.recoverable)
 
 
-PANDA_EEF_TO_HAND_OFFSET_M = np.array([0.0, 0.0, -0.1], dtype=np.float64)
-# Same gripper0_right_eef Rz(-90°) as the PyRoki client. LIBERO/robosuite EEF
-# frames are already panda_hand-aligned, so only robocasa rotates.
-_ROBOCASA_HAND_FROM_EEF_ROTATION = np.array(
-    [
-        [0.0, -1.0, 0.0],
-        [1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0],
-    ],
-    dtype=np.float64,
-)
 # cuRobo times trajectories to the real Panda's joint-speed limits; the sim's
 # plan-tracking controller cannot follow that timing. Stretch plans to this
 # fraction of full speed before resampling onto the control grid (skillgen's
@@ -425,19 +414,11 @@ class CuRoboProvider:
     @staticmethod
     def _encode_target(target: Pose | np.ndarray, embodiment: str) -> dict[str, object]:
         if isinstance(target, Pose):
-            rotation = quaternion_wxyz_to_matrix(target.quaternion_wxyz)
-            hand_position = target.position
-            hand_quaternion = target.quaternion_wxyz
-            if embodiment in ("libero", "robocasa", "robosuite"):
-                hand_position = target.position + (rotation @ PANDA_EEF_TO_HAND_OFFSET_M)
-            if embodiment == "robocasa":
-                hand_quaternion = matrix_to_quaternion_wxyz(
-                    rotation @ _ROBOCASA_HAND_FROM_EEF_ROTATION
-                )
+            hand = panda_hand_from_eef(target, embodiment)
             return {
                 "type": "pose",
-                "position": hand_position.tolist(),
-                "quaternion_wxyz": np.asarray(hand_quaternion, dtype=np.float64).tolist(),
+                "position": np.asarray(hand.position, dtype=np.float64).tolist(),
+                "quaternion_wxyz": np.asarray(hand.quaternion_wxyz, dtype=np.float64).tolist(),
                 "frame": target.frame,
             }
         joints = np.asarray(target, dtype=np.float64)

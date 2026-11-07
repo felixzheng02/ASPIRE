@@ -10,7 +10,8 @@ Purpose: `generate_grasps` / `select_grasp` on a SAM mask, with clouds in `robot
 ## Frame rules
 
 - GraspNet returns poses in `robot0_link0`. Keep them there for `solve_ik` / `move_to_pose` /
-  `plan_motion`.
+  `plan_motion`. The pose is the public EEF (`gripper0_right_eef`), not `panda_hand` — pass
+  `grasp.pose` through with no extra 10 cm / 90° map.
 - Confirm the SAM overlay in `media/overlays/` before trusting the mask you passed in.
 - Do not mix a grasp pose with a **world** footprint query without a transform.
 

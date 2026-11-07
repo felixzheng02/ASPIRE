@@ -9,38 +9,22 @@ import requests
 
 from cap_harness.contracts import JOINT_DIMENSION, IKResult, Pose, RobotState
 from cap_harness.errors import ApiError, ErrorCode
-from cap_harness.geometry import matrix_to_quaternion_wxyz, quaternion_wxyz_to_matrix
+from cap_harness.geometry import PANDA_EMBODIMENTS, panda_hand_from_eef
 
 from ..http import HttpProviderClient, ProviderHttpError
 from .wire import IK_PATH
 
 DEFAULT_PYROKI_URL = "http://127.0.0.1:8116"
 PYROKI_CONFIGURATION_DIMENSION = JOINT_DIMENSION + 1
-PANDA_EEF_TO_HAND_OFFSET_M = np.array([0.0, 0.0, -0.1], dtype=np.float64)
-# gripper0_right_eef in RoboCasa's panda_gripper.xml sits on right_gripper, whose
-# body quat is Rz(-90°). LIBERO's robot0_eef is already panda_hand-aligned, so
-# only robocasa right-multiplies this local-Z +90° to recover panda_hand.
-_ROBOCASA_HAND_FROM_EEF_ROTATION = np.array(
-    [
-        [0.0, -1.0, 0.0],
-        [1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0],
-    ],
-    dtype=np.float64,
-)
 MAX_POSITION_ERROR_M = 0.02
 MAX_ORIENTATION_ERROR_RAD = 0.15
-SUPPORTED_EMBODIMENTS = frozenset({"libero", "robocasa", "robosuite"})
+SUPPORTED_EMBODIMENTS = PANDA_EMBODIMENTS
 
 
 def _panda_hand_target(target_pose: Pose, embodiment: str) -> np.ndarray:
     """Map a public EEF pose to the panda_hand wxyz_xyz PyRoki solves."""
-    rotation = quaternion_wxyz_to_matrix(target_pose.quaternion_wxyz)
-    hand_position = target_pose.position + (rotation @ PANDA_EEF_TO_HAND_OFFSET_M)
-    hand_rotation = rotation
-    if embodiment == "robocasa":
-        hand_rotation = rotation @ _ROBOCASA_HAND_FROM_EEF_ROTATION
-    return np.concatenate((matrix_to_quaternion_wxyz(hand_rotation), hand_position))
+    hand = panda_hand_from_eef(target_pose, embodiment)
+    return np.concatenate((hand.quaternion_wxyz, hand.position))
 
 
 class PyRokiProvider:

@@ -39,6 +39,12 @@ from cap_harness.registry import ToolRegistry
 
 from .errors import ApiError, ErrorCode
 from .geometry import (
+    PANDA_EMBODIMENTS,
+    eef_from_panda_hand,
+    pose_from_mapping,
+    select_top_down_grasp,
+)
+from .geometry import (
     crop_point_cloud as crop_observed_point_cloud,
 )
 from .geometry import (
@@ -46,10 +52,6 @@ from .geometry import (
 )
 from .geometry import (
     mask_to_point_cloud as project_mask_to_point_cloud,
-)
-from .geometry import (
-    pose_from_mapping,
-    select_top_down_grasp,
 )
 from .protocols import (
     EnvironmentAdapter,
@@ -361,10 +363,33 @@ class CapApi:
         # Caller-chosen, because a caller that filters candidates itself -- by
         # approach direction, say -- needs more of them than one that takes the
         # first. Five was fine as a fixed ceiling only while nobody filtered.
-        return provider.generate_grasps(
+        result = provider.generate_grasps(
             point_cloud,
             scene_point_cloud=scene_point_cloud,
             max_candidates=max_candidates,
+        )
+        return self._public_eef_grasps(result, observation.robot_state.embodiment)
+
+    def _public_eef_grasps(self, result: GraspSet, embodiment: str) -> GraspSet:
+        """Lift provider panda_hand poses to the public EEF ``move_to_pose`` consumes.
+
+        Contact-GraspNet (and the IK services) speak ``panda_hand``. The public
+        pose is the embodiment EEF, so a candidate can be passed through. Non-Panda
+        embodiments are left unchanged.
+        """
+        if not result.ok or embodiment not in PANDA_EMBODIMENTS:
+            return result
+        return GraspSet(
+            ok=True,
+            grasps=tuple(
+                replace(candidate, pose=eef_from_panda_hand(candidate.pose, embodiment))
+                for candidate in result.grasps
+            ),
+            diagnostics={
+                **dict(result.diagnostics),
+                "provider_target_link": "panda_hand",
+                "public_target_link": "eef",
+            },
         )
 
     def _resolve_arm(self, arm: str) -> str:
