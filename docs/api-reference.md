@@ -29,7 +29,7 @@ advance environment control time.
 | `shared_atomic` | `get_task_context()` | `TaskContext` | No | Read the authoritative task identity and language. |
 | `shared_atomic` | `get_observation(camera_names=None)` | `Observation` | No | Read calibrated public cameras and robot state, optionally filtered by camera name. |
 | `shared_atomic` | `get_robot_state()` | `RobotState` | No | Read joint, gripper, end-effector, frame, and timestamp state. |
-| `shared_atomic` | `segment_text(camera_name, text)` | `SegmentationSet` | No | Segment objects in one current camera image using a text prompt. |
+| `shared_atomic` | `segment_text(camera_name, text)` | `SegmentationSet` | No | Segment objects in one current camera image using a text prompt. **`ok=True` is not a presence test** -- see [Segmentation scores](#segmentation-scores-are-not-a-presence-test). |
 | `shared_atomic` | `segment_points(camera_name, points_px)` | `SegmentationSet` | No | Segment from an `N x 2` list of image-space point prompts. |
 | `shared_atomic` | `mask_to_point_cloud(mask, camera_name, target_frame="robot_base")` | `PointCloud` | No | Project a public depth mask into a named frame. |
 | `shared_atomic` | `crop_point_cloud(point_cloud, lower_xyz, upper_xyz)` | `PointCloud` | No | Keep points inside inclusive framed XYZ bounds, preserving aligned colors. |
@@ -50,6 +50,60 @@ advance environment control time.
 | `shared_high_level` | `open_gripper(*, arm="primary")` | `ExecutionResult` | Many ticks | Set the normalized gripper target to `1`. |
 | `shared_high_level` | `close_gripper(*, arm="primary")` | `ExecutionResult` | Many ticks | Close with adapter contact-aware completion when available. |
 | `shared_high_level` | `go_home(*, arm="primary")` | `ExecutionResult` | Many ticks | Servo to the arm home captured or configured by the harness. |
+
+### Segmentation scores are not a presence test
+
+`segment_text` returns `ok=True` and up to five ranked masks for **any** noun, including
+objects that are not in the frame. The SAM3 service runs the model at a `0.0` detection
+threshold rather than SAM3's own `0.5`, so nothing is ever filtered out and `results` is
+never empty. A program that reads `ok` as "the object is there" will back-project a
+confident-looking mask of the wrong object.
+
+`Segmentation.score` is the number to read. It is SAM3's
+`sigmoid(pred_logits) * sigmoid(presence_logit_dec)` -- a per-mask match confidence times
+the model's own answer to "is this concept in this image at all". It is **not** a
+mask-quality or predicted-IoU score, so a crisp, well-formed mask of the wrong object
+scores *low*, not high.
+
+Measured on RoboCasa `PickPlaceCounterToStove`, seeds 101/102/103, `agentview` and
+`robot0_eye_in_hand`, 73 labelled prompts:
+
+| cut on `score` | present kept | absent rejected | accuracy |
+| --- | --- | --- | --- |
+| `0.0` (the service default) | 29/29 | 0/44 | 39.7% |
+| `0.5` (SAM3's own default) | 27/29 | 42/44 | 94.5% |
+| `0.55` (sweep argmax) | 27/29 | 43/44 | 95.9% |
+
+So a threshold is worth a great deal, and is still not sound. Both residual error classes
+are semantic, not numeric:
+
+- **A close noun lands on the wrong object at a high score.** On seed 101 `agentview`
+  there is no sink; `"sink"` scores **0.723** and returns the plate, at the same box to
+  within a pixel as `"plate"` (0.828) and `"pan"` (0.035). The present `"counter"` scores
+  0.750 and `"stove"` 0.738, so the 0.027 of headroom above the false sink is not a margin
+  anything should be built on.
+- **A present object scores low under the wrong word.** On seed 102 a zucchini *is* on the
+  counter: `"squash"` scores 0.169 and `"zucchini"` 0.127, while `"green vegetable"` on the
+  same pixels scores 0.872 -- and the absent `"fish"` scores 0.549 in that same frame.
+
+Two things a program can do:
+
+1. **Read the score**, and compare it against `SUGGESTED_PRESENCE_THRESHOLD` (0.5) instead
+   of trusting `ok`. `SegmentationSet.diagnostics` carries `top_score`,
+   `best_candidate_score` (the model's best candidate *before* any filtering) and
+   `service_threshold`, so the trace records the call either way.
+2. **Cross-check the box.** Two different nouns that return the same box returned the same
+   object, and at most one of them is right. This catches the `sink`/`plate` case, which no
+   threshold does.
+
+Enforcement is opt-in and off by default, because `ok=False` would be a new outcome for
+existing callers: `examples/robocasa/connectivity_check.py` and the tool-check catalog both
+segment scene nouns and read `ok`, and the catalog's wrist-camera prompts legitimately score
+below 0.5 (`"cabinet"` 0.049, `"counter"` 0.398 on `robot0_eye_in_hand`, where neither is
+really visible). Construct `Sam3Provider(min_score=0.5)` to turn `segment_text` into a
+detector, or start the service with `--confidence-threshold 0.5` to filter for every client
+including CaP-X. A single call can also override it with a `confidence_threshold` field on
+`POST /segment`.
 
 ### Gripper targets
 

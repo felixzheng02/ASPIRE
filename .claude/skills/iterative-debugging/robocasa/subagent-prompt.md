@@ -192,10 +192,30 @@ process up across every `cap-harness` invocation — adapter close must not shut
 ## Perception
 
 This is image SAM3. Prompt the nouns in `get_task_context().language`. `cabinet` and `counter`
-are kitchen fallbacks when a noun misses; they are not the goal. Check `.ok` and mask size;
-empty is a prompt miss, not a reason to give up on language. Confirm overlays in
+are kitchen fallbacks when a noun misses; they are not the goal. Confirm overlays in
 `media/overlays/` before trusting a centroid. `localize_object` returns SAM's first mask —
 often the counter — so pick the mask that matches the instruction noun, not the first hit.
+
+**`.ok` does not mean the object is in the frame.** The service runs SAM3 with its detection
+threshold at `0.0`, so `segment_text` answers *every* noun with five ranked masks and
+`ok=True`. Measured on `PickPlaceCounterToStove` seed 101 `agentview`, which contains no
+sink: `segment_text("agentview", "sink")` returns the **plate** at score **0.723** — the same
+box, to within a pixel, that `"plate"` (0.828) and `"pan"` (0.035) return. Back-project that
+and you reach for the wrong object with nothing in the result saying so.
+
+Read `segmentations[0].score`, not `.ok`:
+
+- It is SAM3's concept-presence confidence, not mask quality, so a crisp mask of the wrong
+  thing scores *low*. Over 73 labelled prompts (seeds 101/102/103, both cameras) a **0.5**
+  cut separates present from absent **94.5%** of the time, against 39.7% for trusting `.ok`.
+- Treat `score < 0.5` as "probably not in this frame": re-prompt rather than reach.
+  `diagnostics["best_candidate_score"]` records what the model actually believed.
+- 0.5 is a filter, not a proof. A close noun can beat it (`"sink"` 0.723 above the present
+  `"stove"` 0.738), and a present object can fall under it when you use the wrong word (a
+  zucchini scores 0.127 as `"zucchini"` but 0.872 as `"green vegetable"`). If a prompt
+  scores low, **try another word for the same object before concluding it is absent.**
+- The cheapest check SAM cannot fool: **compare boxes across prompts.** Two nouns returning
+  the same box returned the same object, and at most one of them is right.
 
 ---
 

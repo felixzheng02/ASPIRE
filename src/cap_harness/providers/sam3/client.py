@@ -15,10 +15,30 @@ import requests
 from cap_harness.contracts import CameraObservation, Segmentation, SegmentationSet
 from cap_harness.errors import ApiError, ErrorCode
 from cap_harness.providers.http import HttpProviderClient, ProviderHttpError
-from cap_harness.providers.sam3.wire import SEGMENT_PATH, SEGMENT_POINT_PATH
+from cap_harness.providers.sam3.wire import (
+    MAX_SEGMENTATIONS,
+    SAM3_DEFAULT_CONFIDENCE_THRESHOLD,
+    SEGMENT_PATH,
+    SEGMENT_POINT_PATH,
+    rank_and_filter,
+)
 
 DEFAULT_SAM3_URL = "http://127.0.0.1:8114"
-MAX_SEGMENTATIONS = 5
+
+#: The cut to compare ``Segmentation.score`` against when a caller wants a yes/no.
+#:
+#: ``score`` is a concept-presence confidence, not mask quality (see ``wire.py``), so it
+#: does carry a present/absent signal -- but an imperfect one. Measured on RoboCasa
+#: ``PickPlaceCounterToStove`` (seeds 101/102/103, ``agentview`` and
+#: ``robot0_eye_in_hand``, 73 labelled prompts) a sweep put the accuracy peak at 0.55
+#: (95.9%); 0.5 is SAM3's own default and scores 94.5%, within noise of the peak, so
+#: this tracks SAM3 rather than a number fitted to one kitchen.
+#:
+#: It is a filter, not a presence test, and the residual errors are semantic rather than
+#: numeric: "sink" scores 0.72 on a kitchen with no sink (it returns the plate, the same
+#: box "plate" returns), while a zucchini that *is* present scores 0.17 when prompted as
+#: "squash" and 0.87 as "green vegetable". Nothing here fixes either case.
+SUGGESTED_PRESENCE_THRESHOLD = SAM3_DEFAULT_CONFIDENCE_THRESHOLD
 
 
 def _png_chunk(kind: bytes, payload: bytes) -> bytes:
@@ -43,6 +63,19 @@ def _encode_rgb_png(image: np.ndarray) -> str:
         + _png_chunk(b"IEND", b"")
     )
     return base64.b64encode(png).decode("ascii")
+
+
+def _optional_float(value: object, name: str) -> float | None:
+    """Read an additive numeric response field, tolerating a service that omits it."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        # Preserve the invalid-data ValueError contract.
+        raise ValueError(f"response field {name!r} must be a number")
+    result = float(value)
+    if not np.isfinite(result):
+        raise ValueError(f"response field {name!r} must be finite")
+    return result
 
 
 def _decode_raw_array(value: object, *, dtype: np.dtype[Any], shape: tuple[int, ...]) -> np.ndarray:
@@ -76,7 +109,17 @@ class Sam3Provider:
         max_retries: int = 2,
         retry_backoff_s: float = 0.1,
         session: requests.Session | None = None,
+        min_score: float = 0.0,
     ) -> None:
+        #: Client-side floor on ``Segmentation.score``. Defaults to 0.0, which keeps the
+        #: long-standing contract that a scene noun yields masks and ``ok=True``. Raising
+        #: it turns ``segment_text`` into a detector: prompts whose best candidate falls
+        #: below it come back ``ok=False`` with ``NO_SEGMENTATION``. See
+        #: ``SUGGESTED_PRESENCE_THRESHOLD`` for the measured value, and note that callers
+        #: such as ``examples/robocasa/connectivity_check.py`` currently assume 0.0.
+        self._min_score = float(min_score)
+        if not 0.0 <= self._min_score <= 1.0:
+            raise ValueError("min_score must be in [0, 1]")
         self._http = HttpProviderClient(
             base_url,
             timeout_s=timeout_s,
@@ -97,6 +140,18 @@ class Sam3Provider:
         observation: CameraObservation,
         query: str,
     ) -> SegmentationSet:
+        """Segment ``query`` in one camera image.
+
+        ``ok=True`` is **not** evidence that ``query`` is in the frame. The service runs
+        SAM3 at a 0.0 detection threshold, so it answers every noun with its five
+        best-ranked regions; prompt a kitchen with no sink for "sink" and it returns the
+        plate, at score 0.72. Read ``Segmentation.score`` -- it is a concept-presence
+        confidence, not a mask-quality score (see ``wire.py``) -- and compare it against
+        ``SUGGESTED_PRESENCE_THRESHOLD`` rather than trusting ``ok``.
+
+        ``diagnostics`` carries ``top_score``, ``best_candidate_score`` and
+        ``service_threshold`` so a run's trace records the judgement call either way.
+        """
         if not isinstance(observation, CameraObservation):
             return self._failure(ErrorCode.INVALID_REQUEST, "observation must be CameraObservation")
         if not isinstance(query, str) or not query.strip():
@@ -111,6 +166,10 @@ class Sam3Provider:
             if not isinstance(raw_results, list):
                 # Preserve the invalid-data ValueError contract.
                 raise ValueError("response field 'results' must be a list")
+            # Both fields are additive; a service predating them reports nothing here and
+            # best_candidate_score is recovered from the results below.
+            service_threshold = _optional_float(response.get("threshold"), "threshold")
+            best_candidate = _optional_float(response.get("best_score"), "best_score")
 
             segmentations: list[Segmentation] = []
             for item in raw_results:
@@ -147,19 +206,38 @@ class Sam3Provider:
                 details={"provider": "sam3", "error": str(exc)},
             )
 
-        if not segmentations:
+        kept, observed_best = rank_and_filter(
+            segmentations, lambda item: item.score, self._min_score
+        )
+        # The service reports the score it saw before its own filtering; without that
+        # field the best we can know is the best survivor.
+        if best_candidate is None:
+            best_candidate = observed_best
+
+        diagnostics: dict[str, object] = {
+            "provider": "sam3",
+            "query": query,
+            # The model's top candidate before any filtering -- the number that says
+            # whether SAM3 believed the concept was in frame.
+            "best_candidate_score": best_candidate,
+            "min_score": self._min_score,
+            "score_meaning": (
+                "sam3 concept-presence confidence; a filter, not a presence test "
+                "(semantically close nouns score high on the wrong object)"
+            ),
+        }
+        if service_threshold is not None:
+            diagnostics["service_threshold"] = service_threshold
+
+        if not kept:
             return self._failure(
                 ErrorCode.NO_SEGMENTATION,
-                f"SAM3 found no segmentation for {query!r}",
-                details={"provider": "sam3", "query": query},
+                f"SAM3 found no segmentation for {query!r} scoring at or above "
+                f"{self._min_score:.2f} (best candidate scored {best_candidate:.3f})",
+                details=diagnostics,
             )
-        segmentations.sort(key=lambda item: item.score, reverse=True)
-        segmentations = segmentations[:MAX_SEGMENTATIONS]
-        return SegmentationSet(
-            ok=True,
-            segmentations=segmentations,
-            diagnostics={"provider": "sam3", "query": query},
-        )
+        diagnostics["top_score"] = kept[0].score
+        return SegmentationSet(ok=True, segmentations=kept, diagnostics=diagnostics)
 
     def segment_points(
         self,
@@ -273,4 +351,11 @@ class Sam3Provider:
 SAM3Provider = Sam3Provider
 Sam3Client = Sam3Provider
 
-__all__ = ["DEFAULT_SAM3_URL", "SAM3Provider", "Sam3Client", "Sam3Provider"]
+__all__ = [
+    "DEFAULT_SAM3_URL",
+    "MAX_SEGMENTATIONS",
+    "SUGGESTED_PRESENCE_THRESHOLD",
+    "SAM3Provider",
+    "Sam3Client",
+    "Sam3Provider",
+]

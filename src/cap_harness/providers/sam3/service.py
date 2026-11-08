@@ -21,7 +21,14 @@ import uvicorn
 
 from cap_harness.providers.service_runtime import install_service_runtime
 
-from .wire import SEGMENT_PATH, SEGMENT_POINT_PATH
+from .wire import (
+    DEFAULT_CONFIDENCE_THRESHOLD,
+    MAX_SEGMENTATIONS,
+    SAM3_DEFAULT_CONFIDENCE_THRESHOLD,
+    SEGMENT_PATH,
+    SEGMENT_POINT_PATH,
+    rank_and_filter,
+)
 
 LOGGER = logging.getLogger(__name__)
 app = FastAPI(title="cap-harness SAM3 provider")
@@ -32,12 +39,15 @@ _MODEL: Any | None = None
 _PROCESSOR: Any | None = None
 _DEVICE = "cuda"
 _GPU_SEMAPHORE = asyncio.Semaphore(1)
-_MAX_SEGMENTATIONS = 5
+_MAX_SEGMENTATIONS = MAX_SEGMENTATIONS
+_CONFIDENCE_THRESHOLD = DEFAULT_CONFIDENCE_THRESHOLD
 
 
 class SegmentRequest(BaseModel):
     image_base64: str
     text_prompt: str
+    # Per-request override of the service default. Omitted by every existing client.
+    confidence_threshold: float | None = None
 
 
 class PointPromptRequest(BaseModel):
@@ -55,6 +65,11 @@ class MaskData(BaseModel):
 
 class SegmentResponse(BaseModel):
     results: list[MaskData]
+    #: The threshold ``results`` was filtered at. Additive: older clients ignore it.
+    threshold: float = DEFAULT_CONFIDENCE_THRESHOLD
+    #: Highest score SAM3 produced for this prompt *before* filtering, so a caller can
+    #: tell "the model saw nothing" (best_score ~ 0.0) from "the threshold rejected it".
+    best_score: float = 0.0
 
 
 class PointPromptResponse(BaseModel):
@@ -117,7 +132,7 @@ def _encode_raw(array: np.ndarray) -> str:
     return base64.b64encode(np.ascontiguousarray(array).tobytes()).decode("ascii")
 
 
-def _segment_text(image: Image.Image, prompt: str) -> SegmentResponse:
+def _segment_text(image: Image.Image, prompt: str, threshold: float) -> SegmentResponse:
     device_type = "cuda" if "cuda" in _DEVICE else "cpu"
     with torch.autocast(device_type, dtype=torch.bfloat16):
         state = _PROCESSOR.set_image(image)
@@ -127,7 +142,7 @@ def _segment_text(image: Image.Image, prompt: str) -> SegmentResponse:
     boxes = output.get("boxes")
     scores = output.get("scores")
     if masks is None or boxes is None or scores is None:
-        return SegmentResponse(results=[])
+        return SegmentResponse(results=[], threshold=threshold, best_score=0.0)
 
     mask_array = _to_numpy(masks)
     if mask_array.ndim == 4 and mask_array.shape[1] == 1:
@@ -144,8 +159,8 @@ def _segment_text(image: Image.Image, prompt: str) -> SegmentResponse:
         )
         for index in range(len(score_array))
     ]
-    results.sort(key=lambda item: item.score, reverse=True)
-    return SegmentResponse(results=results[:_MAX_SEGMENTATIONS])
+    kept, best_score = rank_and_filter(results, lambda item: item.score, threshold)
+    return SegmentResponse(results=kept, threshold=threshold, best_score=best_score)
 
 
 def _segment_point(image: Image.Image, point: tuple[float, float]) -> PointPromptResponse:
@@ -181,9 +196,16 @@ def _segment_point(image: Image.Image, point: tuple[float, float]) -> PointPromp
 async def segment(request: SegmentRequest) -> SegmentResponse:
     if _PROCESSOR is None:
         raise HTTPException(status_code=503, detail="Model not initialized")
+    threshold = (
+        _CONFIDENCE_THRESHOLD
+        if request.confidence_threshold is None
+        else float(request.confidence_threshold)
+    )
+    if not 0.0 <= threshold <= 1.0:
+        raise HTTPException(status_code=400, detail="confidence_threshold must be in [0, 1]")
     try:
         return await _run_serialized(
-            _segment_text, _decode_image(request.image_base64), request.text_prompt
+            _segment_text, _decode_image(request.image_base64), request.text_prompt, threshold
         )
     except HTTPException:
         raise
@@ -213,10 +235,24 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8114)
+    parser.add_argument(
+        "--confidence-threshold",
+        type=float,
+        default=DEFAULT_CONFIDENCE_THRESHOLD,
+        help=(
+            "Score below which a candidate is dropped from /segment results. "
+            f"The service default is {DEFAULT_CONFIDENCE_THRESHOLD} (return every candidate, "
+            f"so results is never empty); SAM3's own default is "
+            f"{SAM3_DEFAULT_CONFIDENCE_THRESHOLD}. A request may override it per call."
+        ),
+    )
     args = parser.parse_args()
+    if not 0.0 <= args.confidence_threshold <= 1.0:
+        parser.error("--confidence-threshold must be in [0, 1]")
 
-    global _DEVICE, _MODEL, _PROCESSOR
+    global _DEVICE, _MODEL, _PROCESSOR, _CONFIDENCE_THRESHOLD
     _DEVICE = args.device
+    _CONFIDENCE_THRESHOLD = float(args.confidence_threshold)
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -224,6 +260,9 @@ def main() -> None:
             torch.cuda.set_device(int(args.device.split(":")[-1]) if ":" in args.device else 0)
     LOGGER.info("Loading SAM3 model on %s", args.device)
     _MODEL = build_sam3_image_model(enable_inst_interactivity=True).to(args.device)
+    # The processor stays at 0.0 whatever --confidence-threshold says: this service does
+    # its own filtering in _segment_text so that `best_score` can report the model's true
+    # top candidate even when the threshold rejects every one of them.
     _PROCESSOR = Sam3Processor(_MODEL, device=args.device, confidence_threshold=0.0)
     uvicorn.run(app, host=args.host, port=args.port)
 
