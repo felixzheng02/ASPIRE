@@ -7,6 +7,7 @@ import asyncio
 import base64
 import contextlib
 import functools
+import hashlib
 import io
 import logging
 import os
@@ -17,6 +18,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 import numpy as np
 from pydantic import BaseModel
+import torch
 import uvicorn
 import yaml
 
@@ -148,7 +150,37 @@ def _predict(
     return np.asarray([]), np.asarray([]), np.asarray([])
 
 
+def _request_seed(request: PlanPointCloudsRequest) -> int:
+    """Derive a deterministic RNG seed from the request payload.
+
+    Contact-GraspNet samples in two unseeded places: PointNet++ picks a *random*
+    farthest-point start (``Pointnet_Pointnet2_pytorch/models/pointnet2_utils.py``,
+    ``farthest_point_sample``) so each forward pass scores a different 2048-point
+    subset, and ``regularize_pc_point_count`` subsamples with ``np.random``.
+    Unseeded, byte-identical clouds returned anywhere from 0 to 8 candidates.
+
+    Seeding from the payload -- rather than from a constant -- keeps the response a
+    pure function of the request while still letting different scenes sample
+    independently, and keeps consecutive requests uncoupled.
+    """
+    digest = hashlib.sha256()
+    digest.update(request.pc_full_base64.encode("ascii"))
+    digest.update(request.pc_segment_base64.encode("ascii"))
+    digest.update(
+        f"{request.segmap_id}:{request.local_regions}:{request.filter_grasps}:"
+        f"{request.forward_passes}:{request.max_retries}".encode("ascii")
+    )
+    return int.from_bytes(digest.digest()[:4], "big")
+
+
 def _plan(request: PlanPointCloudsRequest) -> PlanResponse:
+    # Safe to seed the global RNGs here: _run_serialized holds _GPU_SEMAPHORE
+    # (capacity 1) around the whole executor call, so no two _plan bodies ever
+    # interleave. Both RNGs matter -- torch drives the farthest-point start,
+    # numpy the point-count regularisation.
+    seed = _request_seed(request)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
     full = np.asarray(_decode_numpy(request.pc_full_base64), dtype=np.float32)
     segment = np.asarray(_decode_numpy(request.pc_segment_base64), dtype=np.float32)
     if full.ndim != 2 or full.shape[1] != 3 or not len(full):
@@ -208,7 +240,16 @@ def main() -> None:
     )
     with contextlib.suppress(FileExistsError):
         checkpoint_io.load("model.pt")
-    LOGGER.info("Contact-GraspNet loaded on %s", args.device)
+    # GraspEstimator never leaves train mode, so the three dropout layers
+    # (p=0.3/0.3/0.5) and all 41 BatchNorms were live at inference. Dropout
+    # removed ~85-97% of the above-threshold contact confidences and randomised
+    # which survived, which is why identical clouds returned 0-8 candidates and
+    # usually NO_GRASP. The checkpoint's running statistics are trained
+    # (num_batches_tracked=13105), so eval() is the intended inference path.
+    # Must come before any forward pass: train-mode passes mutate the running
+    # statistics, and eval() afterwards reads the polluted ones.
+    _ESTIMATOR.model.eval()
+    LOGGER.info("Contact-GraspNet loaded on %s (eval mode)", args.device)
     uvicorn.run(app, host=args.host, port=args.port)
 
 
