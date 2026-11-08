@@ -62,6 +62,73 @@ TRAJECTORY_MAX_JOINT_STEP_RAD = 0.05
 TRAJECTORY_GOAL_MAX_STEPS = 120
 #: cuRobo's panda model names. The public RobotState still reports joint_0..6.
 PANDA_JOINT_NAMES = tuple(f"panda_joint{index}" for index in range(1, 8))
+#: MuJoCo's solver lets a joint settle a hair past a limit, so an exact containment test on a
+#: measured configuration would fire on physics rather than on a bad limit array. This slack is
+#: wide enough never to trip on drift and far narrower than the errors worth catching (the
+#: original bug published a zero-width range and a 0.5 rad violation).
+JOINT_LIMIT_SLACK_RAD = 0.05
+
+
+def validate_joint_limits(
+    limits: object,
+    *,
+    arm_dof: int,
+    measured: np.ndarray | None = None,
+    slack_rad: float = JOINT_LIMIT_SLACK_RAD,
+) -> dict[str, list[float] | list[str]]:
+    """Return the simulator's ``joint_limits`` only if they can describe this arm.
+
+    The simulator is the only producer of this array and it lives outside any repository, so
+    this is the one reviewable place a regression can be caught. It has happened: the simulator
+    published ``model.jnt_range[:7]``, the first seven joints of the whole kitchen model, which
+    on a PandaOmron are three mobile-base joints (zero-width, MuJoCo's unlimited convention),
+    the torso, and then Panda joints 1-3. Four of the seven measured joints sat outside their
+    own published range, and a program clamping its targets to it would have driven the first
+    four joints to zero.
+
+    Raises ``ValueError`` rather than dropping the key: a program reading no limits writes a
+    different (and safer) policy than one reading wrong limits.
+    """
+    if not isinstance(limits, Mapping):
+        raise ValueError(f"joint_limits must be a mapping, got {type(limits).__name__}")
+    try:
+        low = np.asarray(limits["low"], dtype=np.float64).reshape(-1)
+        high = np.asarray(limits["high"], dtype=np.float64).reshape(-1)
+    except KeyError as exc:
+        raise ValueError(f"joint_limits is missing {exc.args[0]!r}") from exc
+    if low.size != arm_dof or high.size != arm_dof:
+        raise ValueError(
+            f"joint_limits describes {low.size}/{high.size} joints, the arm has {arm_dof}"
+        )
+    if not (np.all(np.isfinite(low)) and np.all(np.isfinite(high))):
+        raise ValueError("joint_limits contains non-finite bounds")
+    names = [str(n) for n in limits.get("names", ())] or [
+        f"joint{index}" for index in range(1, arm_dof + 1)
+    ]
+    if len(names) != arm_dof:
+        raise ValueError(f"joint_limits names {len(names)} joints, the arm has {arm_dof}")
+    empty = [names[i] for i in np.flatnonzero(high - low <= 0.0)]
+    if empty:
+        raise ValueError(f"joint_limits has an empty range for {empty}")
+    if measured is not None:
+        values = np.asarray(measured, dtype=np.float64).reshape(-1)
+        if values.size == arm_dof:
+            outside = np.flatnonzero((values < low - slack_rad) | (values > high + slack_rad))
+            if outside.size:
+                detail = ", ".join(
+                    f"{names[i]}={values[i]:.4f} not in [{low[i]:.4f}, {high[i]:.4f}]"
+                    for i in outside
+                )
+                raise ValueError(
+                    f"joint_limits does not contain the measured configuration: {detail}"
+                )
+    out: dict[str, list[float] | list[str]] = {
+        "low": [float(x) for x in low],
+        "high": [float(x) for x in high],
+    }
+    if limits.get("names"):
+        out["names"] = names
+    return out
 
 
 def densify_joint_waypoints(
@@ -703,6 +770,25 @@ class RobocasaAdapter:
     def get_task_metadata(self) -> Mapping[str, object]:
         return MappingProxyType(self.metadata.to_manifest_record())
 
+    def _published_joint_limits(self, spec: Mapping[str, Any]) -> Mapping[str, object]:
+        """The simulator's arm joint limits, checked against the measured configuration."""
+        measured: np.ndarray | None = None
+        try:
+            measured = np.asarray(
+                self._require_client().last["joint_pos"], dtype=np.float64
+            ).reshape(-1)
+        except (ApiError, KeyError, TypeError, ValueError):
+            # Metadata is legal to ask for before the first observation lands; the structural
+            # checks still run, only the containment check is skipped.
+            measured = None
+        return MappingProxyType(
+            validate_joint_limits(
+                spec.get("joint_limits"),
+                arm_dof=int(spec.get("arm_dof", len(PANDA_JOINT_NAMES))),
+                measured=measured,
+            )
+        )
+
     def get_controller_metadata(self) -> Mapping[str, object]:
         spec = self._require_client().spec
         return MappingProxyType(
@@ -723,7 +809,7 @@ class RobocasaAdapter:
                 # A mobile manipulator: the shared tool set cannot move the base, so the
                 # program has to use the robocasa.* extensions to get within reach.
                 "mobile_base": True,
-                "joint_limits": spec.get("joint_limits"),
+                "joint_limits": self._published_joint_limits(spec),
             }
         )
 

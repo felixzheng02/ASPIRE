@@ -17,10 +17,12 @@ from cap_harness.contracts import (
     Trajectory,
 )
 from cap_harness.robocasa.adapter import (
+    JOINT_LIMIT_SLACK_RAD,
     PANDA_JOINT_NAMES,
     TRAJECTORY_MAX_JOINT_STEP_RAD,
     RobocasaAdapter,
     densify_joint_waypoints,
+    validate_joint_limits,
 )
 from cap_harness.robocasa.geometry import plan_approach_pose, plan_standoff_pose
 
@@ -294,3 +296,91 @@ def test_close_gripper_settles_through_step() -> None:
 #: What the simulator published before the fix: ``model.jnt_range[:7]``, i.e. the first seven
 #: joints of the whole kitchen model -- three mobile-base joints (zero-width, MuJoCo's
 #: unlimited convention), the torso, then Panda joints 1-3.
+_SLICED_LIMITS = {
+    "low": [0.0, 0.0, 0.0, 0.0, -2.8973, -1.7628, -2.8973],
+    "high": [0.0, 0.0, 0.0, 0.34, 2.8973, 1.7628, 2.8973],
+}
+#: The arm's own limits, resolved from its named joints.
+_PANDA_LIMITS = {
+    "low": [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973],
+    "high": [2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973],
+    "names": [f"robot0_joint{index}" for index in range(1, 8)],
+}
+#: Measured on PickPlaceCounterToStove, seed 101.
+_MEASURED_JOINTS = np.array([0.0023, -0.2233, -0.0054, -0.5032, 0.0088, 0.3746, 0.1989])
+
+
+def test_validate_joint_limits_accepts_the_arms_own_limits() -> None:
+    out = validate_joint_limits(_PANDA_LIMITS, arm_dof=7, measured=_MEASURED_JOINTS)
+    assert out["low"] == _PANDA_LIMITS["low"]
+    assert out["high"] == _PANDA_LIMITS["high"]
+    assert out["names"] == _PANDA_LIMITS["names"]
+
+
+def test_validate_joint_limits_rejects_the_leading_model_slice() -> None:
+    """The original bug: four of seven measured joints outside their published range."""
+    with pytest.raises(ValueError, match="empty range"):
+        validate_joint_limits(_SLICED_LIMITS, arm_dof=7, measured=_MEASURED_JOINTS)
+
+
+def test_validate_joint_limits_rejects_a_range_missing_the_measurement() -> None:
+    shifted = {
+        "low": _PANDA_LIMITS["low"][3:] + _PANDA_LIMITS["low"][:3],
+        "high": _PANDA_LIMITS["high"][3:] + _PANDA_LIMITS["high"][:3],
+        "names": _PANDA_LIMITS["names"],
+    }
+    with pytest.raises(ValueError, match="measured configuration"):
+        validate_joint_limits(shifted, arm_dof=7, measured=_MEASURED_JOINTS)
+
+
+def test_validate_joint_limits_tolerates_solver_drift_past_a_limit() -> None:
+    measured = np.array(_PANDA_LIMITS["high"], dtype=np.float64)
+    measured[0] += 0.5 * JOINT_LIMIT_SLACK_RAD
+    assert validate_joint_limits(_PANDA_LIMITS, arm_dof=7, measured=measured)
+
+
+def test_validate_joint_limits_rejects_wrong_shapes_and_types() -> None:
+    with pytest.raises(ValueError, match="mapping"):
+        validate_joint_limits(None, arm_dof=7)
+    with pytest.raises(ValueError, match="missing 'high'"):
+        validate_joint_limits({"low": _PANDA_LIMITS["low"]}, arm_dof=7)
+    with pytest.raises(ValueError, match="describes"):
+        validate_joint_limits({"low": [0.0], "high": [1.0]}, arm_dof=7)
+    with pytest.raises(ValueError, match="non-finite"):
+        validate_joint_limits({"low": [-math.inf] * 7, "high": _PANDA_LIMITS["high"]}, arm_dof=7)
+
+
+def _adapter_with_spec(limits: dict) -> RobocasaAdapter:
+    adapter = RobocasaAdapter()
+    adapter._client = SimpleNamespace(
+        spec={"action_dim": 13, "arm_dof": 7, "joint_limits": limits},
+        last={"joint_pos": _MEASURED_JOINTS},
+    )
+    adapter._closed = False
+    return adapter
+
+
+def test_adapter_publishes_checked_arm_limits() -> None:
+    adapter = _adapter_with_spec(_PANDA_LIMITS)
+    limits = adapter._published_joint_limits(adapter._client.spec)
+    assert limits["names"] == _PANDA_LIMITS["names"]
+    assert all(limits["low"][i] <= _MEASURED_JOINTS[i] <= limits["high"][i] for i in range(7))
+
+
+def test_adapter_refuses_limits_that_exclude_the_arm() -> None:
+    """get_controller_metadata() must not hand a program the old sliced array."""
+    adapter = _adapter_with_spec(_SLICED_LIMITS)
+    with pytest.raises(ValueError, match="joint_limits"):
+        adapter._published_joint_limits(adapter._client.spec)
+
+
+def test_adapter_checks_structure_before_the_first_observation() -> None:
+    """Metadata is legal to ask for before any observation; only containment is skipped."""
+    adapter = _adapter_with_spec(_PANDA_LIMITS)
+    adapter._client = SimpleNamespace(spec=adapter._client.spec, last=None)
+    limits = adapter._published_joint_limits(adapter._client.spec)
+    assert limits["low"] == _PANDA_LIMITS["low"]
+    adapter = _adapter_with_spec(_SLICED_LIMITS)
+    adapter._client = SimpleNamespace(spec=adapter._client.spec, last=None)
+    with pytest.raises(ValueError, match="empty range"):
+        adapter._published_joint_limits(adapter._client.spec)
