@@ -13,6 +13,7 @@ from cap_harness.contracts import (
     Pose,
     RobotState,
     StepResult,
+    SynchronizedTrajectory,
     Trajectory,
 )
 from cap_harness.robocasa.adapter import (
@@ -188,6 +189,94 @@ def test_execute_trajectory_plays_waypoints_through_step() -> None:
     np.testing.assert_allclose(calls[-1].arms["primary"].target, dense[-1])
 
 
+def _sync_trajectory(points: np.ndarray, arm: str = "primary") -> SynchronizedTrajectory:
+    """What ``CapApi.move_synchronized`` hands the adapter after planning."""
+    start = _state(points[0]) if arm == "primary" else _state_for_arm(points[0], arm)
+    return SynchronizedTrajectory(
+        joint_positions={arm: np.asarray(points, dtype=np.float64)},
+        dt_s=0.05,
+        joint_names={arm: tuple(start.joint_names[arm])},
+        planner="test",
+        collision_aware=False,
+        expected_start=start,
+        embodiment="robocasa",
+    )
+
+
+def _state_for_arm(joints: np.ndarray, arm: str) -> RobotState:
+    target = np.asarray(joints, dtype=np.float64).reshape(7)
+    return RobotState(
+        joint_positions={arm: target},
+        joint_velocities={arm: np.zeros(7)},
+        end_effector_poses={arm: _pose()},
+        gripper_positions={arm: 1.0},
+        base_frame="robot0_link0",
+        embodiment="robocasa",
+    )
+
+
+def test_execute_trajectory_accepts_a_single_arm_synchronized_trajectory() -> None:
+    """``move_synchronized`` plans a SynchronizedTrajectory and executes it unchanged.
+
+    Rejecting the type here made the tool structurally impossible on this one-arm
+    embodiment even though ``plan_synchronized_motion`` succeeded.
+    """
+    adapter, calls = _adapter_with_recording_step()
+    points = np.vstack([np.zeros(7), np.array([0.10, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])])
+    dense = densify_joint_waypoints(points)
+    result = adapter.execute_trajectory(_sync_trajectory(points), settle_steps=4)
+    assert result.ok
+    assert len(calls) == dense.shape[0]
+    assert result.steps_executed == dense.shape[0]
+    np.testing.assert_allclose(calls[-1].arms["primary"].target, dense[-1])
+
+
+def test_execute_trajectory_matches_the_single_arm_path_waypoint_for_waypoint() -> None:
+    points = np.vstack([np.zeros(7), np.array([0.0, 0.08, 0.0, 0.0, 0.0, 0.0, 0.0])])
+    plain_adapter, plain_calls = _adapter_with_recording_step()
+    plain_adapter.execute_trajectory(_trajectory(points), settle_steps=4)
+    sync_adapter, sync_calls = _adapter_with_recording_step()
+    sync_adapter.execute_trajectory(_sync_trajectory(points), settle_steps=4)
+    assert len(sync_calls) == len(plain_calls)
+    for sync_call, plain_call in zip(sync_calls, plain_calls, strict=True):
+        np.testing.assert_allclose(
+            sync_call.arms["primary"].target, plain_call.arms["primary"].target
+        )
+
+
+def test_execute_trajectory_carries_synchronized_gripper_positions() -> None:
+    adapter, calls = _adapter_with_recording_step()
+    points = np.vstack([np.zeros(7), np.array([0.06, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])])
+    trajectory = _sync_trajectory(points)
+    trajectory = SynchronizedTrajectory(
+        joint_positions=trajectory.joint_positions,
+        dt_s=trajectory.dt_s,
+        joint_names=trajectory.joint_names,
+        planner=trajectory.planner,
+        collision_aware=trajectory.collision_aware,
+        expected_start=trajectory.expected_start,
+        gripper_positions={"primary": np.array([1.0, 0.0])},
+        embodiment="robocasa",
+    )
+    result = adapter.execute_trajectory(trajectory, settle_steps=4)
+    assert result.ok
+    # The single-arm path holds the final commanded width for every densified tick.
+    assert all(call.arms["primary"].gripper_position == 0.0 for call in calls)
+
+
+def test_execute_trajectory_rejects_a_synchronized_trajectory_for_another_arm() -> None:
+    adapter, _ = _adapter_with_recording_step()
+    points = np.vstack([np.zeros(7), np.full(7, 0.02)])
+    with pytest.raises(ValueError, match="must name exactly the arms"):
+        adapter.execute_trajectory(_sync_trajectory(points, arm="left"))
+
+
+def test_execute_trajectory_still_rejects_other_types() -> None:
+    adapter, _ = _adapter_with_recording_step()
+    with pytest.raises(ValueError, match="Trajectory or SynchronizedTrajectory"):
+        adapter.execute_trajectory(object())  # type: ignore[arg-type]
+
+
 def test_close_gripper_settles_through_step() -> None:
     adapter, calls = _adapter_with_recording_step()
     adapter._client = SimpleNamespace(profile=SimpleNamespace(gripper_settle_steps=4))
@@ -198,3 +287,10 @@ def test_close_gripper_settles_through_step() -> None:
     assert result.ok
     assert len(calls) == 4
     assert all(call.arms["primary"].gripper_position == 0.0 for call in calls)
+
+
+# --------------------------------------------------------------- joint limits
+
+#: What the simulator published before the fix: ``model.jnt_range[:7]``, i.e. the first seven
+#: joints of the whole kitchen model -- three mobile-base joints (zero-width, MuJoCo's
+#: unlimited convention), the torso, then Panda joints 1-3.

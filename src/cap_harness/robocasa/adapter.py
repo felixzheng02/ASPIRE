@@ -36,6 +36,7 @@ from cap_harness.contracts import (
     RobotPlanningContext,
     RobotState,
     StepResult,
+    SynchronizedTrajectory,
     TaskContext,
     Trajectory,
 )
@@ -484,14 +485,36 @@ class RobocasaAdapter:
 
     def execute_trajectory(
         self,
-        trajectory: Trajectory,
+        trajectory: Trajectory | SynchronizedTrajectory,
         *,
         tolerance: float = 0.02,
         settle_steps: int = TRAJECTORY_GOAL_MAX_STEPS,
     ) -> ExecutionResult:
-        if not isinstance(trajectory, Trajectory):
-            raise ValueError("trajectory must be a Trajectory")
-        arm = trajectory.arm
+        # ``EnvironmentAdapter`` (protocols.py) declares both trajectory types, and
+        # ``CapApi.move_synchronized`` hands the ``SynchronizedTrajectory`` it just planned
+        # straight to the adapter. Accepting only ``Trajectory`` here made that whole tool
+        # structurally impossible on this embodiment -- its planning half
+        # (``plan_synchronized_motion``) succeeds, then execution raised
+        # "trajectory must be a Trajectory", surfaced as INVALID_REQUEST. PandaOmron has one
+        # arm, so a synchronized trajectory naming exactly that arm *is* a single-arm
+        # trajectory; robosuite/adapter.py and behavior/adapter.py take the same branch.
+        if not isinstance(trajectory, Trajectory | SynchronizedTrajectory):
+            # Preserve the invalid-data ValueError contract.
+            raise ValueError("trajectory must be a Trajectory or SynchronizedTrajectory")
+        if isinstance(trajectory, SynchronizedTrajectory):
+            if set(trajectory.joint_positions) != set(self.arms):
+                raise ValueError(
+                    f"synchronized trajectory must name exactly the arms {list(self.arms)}"
+                )
+            arm = self.arms[0]
+            joint_positions = trajectory.joint_positions[arm]
+            gripper_positions = (
+                None if trajectory.gripper_positions is None else trajectory.gripper_positions[arm]
+            )
+        else:
+            arm = trajectory.arm
+            joint_positions = trajectory.joint_positions
+            gripper_positions = trajectory.gripper_positions
         if arm not in self.arms:
             return ExecutionResult(
                 ok=False,
@@ -503,13 +526,11 @@ class RobocasaAdapter:
         # Each tick must go through ``step()`` so the run recorder gets RGB.
         # ``client.step`` / ``move_to_joints`` move the arm but leave the
         # video at the reset frame (one 0.05 s mp4).
-        waypoints = densify_joint_waypoints(
-            np.asarray(trajectory.joint_positions, dtype=np.float64)
-        )
+        waypoints = densify_joint_waypoints(np.asarray(joint_positions, dtype=np.float64))
         raw_grips = (
             None
-            if trajectory.gripper_positions is None
-            else np.asarray(trajectory.gripper_positions, dtype=np.float64).reshape(-1)
+            if gripper_positions is None
+            else np.asarray(gripper_positions, dtype=np.float64).reshape(-1)
         )
         grips = None
         if raw_grips is not None and raw_grips.size and waypoints.size:
