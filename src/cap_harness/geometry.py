@@ -404,6 +404,37 @@ def estimate_oriented_bounding_box(point_cloud: PointCloud) -> ObjectGeometry:
     )
 
 
+def grasp_standoff_pose(
+    pose: Pose,
+    standoff_m: float,
+    *,
+    approach_axis: int = 2,
+) -> Pose:
+    """Retreat a grasp pose along its own negative approach axis.
+
+    The pre-grasp pose a program actually moves to first. Orientation is kept, so
+    only the translation changes: ``position - R[:, approach_axis] * standoff_m``,
+    the same local-axis idiom as ``panda_hand_from_eef``. ``approach_axis`` names
+    the positive gripper column that points at the object, matching
+    ``select_top_down_grasp``'s convention.
+    """
+    if not isinstance(pose, Pose):
+        # Preserve the invalid-data ValueError contract.
+        raise ValueError("pose must be a Pose")
+    if approach_axis not in (0, 1, 2):
+        raise ValueError("approach_axis must be 0, 1, or 2")
+    distance = float(standoff_m)
+    if not np.isfinite(distance) or distance < 0.0:
+        raise ValueError("standoff_m must be finite and non-negative")
+    rotation = quaternion_wxyz_to_matrix(pose.quaternion_wxyz)
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = rotation
+    transform[:3, 3] = (
+        np.asarray(pose.position, dtype=np.float64) - rotation[:, approach_axis] * distance
+    )
+    return matrix_to_pose(transform, frame=pose.frame)
+
+
 def select_top_down_grasp(
     grasps: GraspSet | Sequence[GraspCandidate],
     *,
@@ -465,6 +496,7 @@ __all__ = [
     "estimate_geometry",
     "estimate_obb",
     "estimate_oriented_bounding_box",
+    "grasp_standoff_pose",
     "invert_transform",
     "mask_to_point_cloud",
     "matrix_to_pose",

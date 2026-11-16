@@ -964,6 +964,176 @@ def test_generate_grasps_publishes_public_eef(
         np.testing.assert_allclose(rotation, np.eye(3), atol=1e-12)
 
 
+class SelectiveFakeIK:
+    """Solves every pose except the ones a predicate rejects.
+
+    A rejection uses ``IK_FAILED``, which is what the PyRoki provider returns
+    when a solution exceeds its public residual limits -- a verdict about that
+    pose, not a broken probe.
+    """
+
+    def __init__(self, unsolvable=lambda pose: False) -> None:
+        self._unsolvable = unsolvable
+        self.targets: list[Pose] = []
+
+    def solve_ik(
+        self,
+        target_pose: Pose,
+        robot_state: RobotState,
+        *,
+        arm: str = "primary",
+        seed_joints: np.ndarray | None = None,
+    ) -> IKResult:
+        del robot_state, seed_joints
+        self.targets.append(target_pose)
+        if self._unsolvable(target_pose):
+            return IKResult(
+                ok=False,
+                arm=arm,
+                error=ApiError(
+                    code=ErrorCode.IK_FAILED,
+                    message="solution exceeds the public pose residual limits",
+                ),
+            )
+        return IKResult(ok=True, joint_positions=np.zeros(7), arm=arm)
+
+
+def _grasp(score: float, height: float, *, approach_distance_m: float = 0.0) -> GraspCandidate:
+    """A top-down candidate at ``height``, so its standoff sits above it."""
+    return GraspCandidate(
+        pose=Pose(
+            position=(0.3, 0.0, height),
+            quaternion_wxyz=(0.0, 1.0, 0.0, 0.0),  # Rx(180 deg): approach is -Z
+            frame="base",
+        ),
+        score=score,
+        width_m=0.04,
+        approach_distance_m=approach_distance_m,
+    )
+
+
+def _heights(poses: list[Pose]) -> list[float]:
+    return [round(float(pose.position[2]), 6) for pose in poses]
+
+
+def _reachability_api(ik: object | None) -> CapApi:
+    return CapApi(  # type: ignore[arg-type]
+        FakeAdapter(),
+        ik_providers=None if ik is None else {"pyroki": ik},
+    )
+
+
+def test_all_reachable_returns_every_solvable_candidate_ranked() -> None:
+    ik = SelectiveFakeIK()
+    api = _reachability_api(ik)
+    unordered = GraspSet(ok=True, grasps=(_grasp(0.2, 0.5), _grasp(0.9, 0.6), _grasp(0.5, 0.7)))
+
+    feasible = api.select_grasp(unordered, "all_reachable")
+
+    assert isinstance(feasible, GraspSet)
+    assert feasible.ok
+    assert [candidate.score for candidate in feasible.grasps] == [0.9, 0.5, 0.2]
+    assert feasible.diagnostics["candidates"] == 3
+    assert feasible.diagnostics["reachable"] == 3
+    assert feasible.diagnostics["ik_probes"] == 6
+    # Standoff first, then the grasp pose, for each candidate, best score first.
+    assert _heights(ik.targets) == [0.7, 0.6, 0.8, 0.7, 0.6, 0.5]
+
+
+def test_all_reachable_drops_a_candidate_only_its_standoff_blocks() -> None:
+    """The standoff is checked as well as the grasp, because it blocks on its own.
+
+    Measured on RoboCasa seeds 101-150: 139 of 885 candidates had a solvable
+    grasp pose and an unsolvable standoff. Here the dropped candidate's *grasp*
+    pose is solvable, so a grasp-only check would have returned it.
+    """
+    ik = SelectiveFakeIK(unsolvable=lambda pose: abs(float(pose.position[2]) - 0.6) < 1e-9)
+    api = _reachability_api(ik)
+    blocked, reachable = _grasp(0.9, 0.5), _grasp(0.4, 0.2)
+
+    feasible = api.select_grasp(GraspSet(ok=True, grasps=(blocked, reachable)), "all_reachable")
+
+    assert feasible.ok
+    assert feasible.grasps == (reachable,)
+    assert feasible.diagnostics["standoff_blocked"] == 1
+    assert feasible.diagnostics["grasp_blocked"] == 0
+    # The blocked candidate cost one probe, not two: its grasp pose was never asked.
+    assert _heights(ik.targets) == [0.6, 0.3, 0.2]
+
+
+def test_all_reachable_honours_a_provider_declared_approach_distance() -> None:
+    ik = SelectiveFakeIK()
+    api = _reachability_api(ik)
+    candidate = _grasp(0.9, 0.5, approach_distance_m=0.25)
+
+    api.select_grasp(GraspSet(ok=True, grasps=(candidate,)), "all_reachable")
+
+    assert _heights(ik.targets)[0] == pytest.approx(0.75)
+
+
+def test_all_reachable_says_why_nothing_is_reachable() -> None:
+    ik = SelectiveFakeIK(unsolvable=lambda pose: abs(float(pose.position[2]) - 0.3) > 1e-9)
+    api = _reachability_api(ik)
+
+    feasible = api.select_grasp(
+        GraspSet(ok=True, grasps=(_grasp(0.9, 0.5), _grasp(0.4, 0.2))), "all_reachable"
+    )
+
+    assert not feasible.ok
+    assert feasible.grasps == ()
+    assert feasible.error.code == ErrorCode.IK_UNREACHABLE
+    assert feasible.error.details["candidates"] == 2
+    assert feasible.error.details["standoff_blocked"] == 1
+    assert feasible.error.details["grasp_blocked"] == 1
+    assert "2 candidates tested" in feasible.error.message
+    # Every candidate was tried before giving up.
+    assert feasible.error.details["ik_probes"] == 3
+
+
+def test_all_reachable_distinguishes_an_unprobeable_scene_from_an_unreachable_one() -> None:
+    """No IK backend is a broken setup, not a scene the arm cannot reach."""
+    api = _reachability_api(None)
+
+    feasible = api.select_grasp(GraspSet(ok=True, grasps=(_grasp(0.9, 0.5),)), "all_reachable")
+
+    assert not feasible.ok
+    assert feasible.error.code == ErrorCode.UNSUPPORTED
+    assert "could not be probed" in feasible.error.message
+    assert feasible.error.details["ik_probes"] == 1
+
+
+def test_all_reachable_passes_a_failed_grasp_set_through_unprobed() -> None:
+    ik = SelectiveFakeIK()
+    api = _reachability_api(ik)
+    failed = GraspSet(ok=False, error=ApiError(code=ErrorCode.NO_GRASP, message="no candidates"))
+
+    feasible = api.select_grasp(failed, "all_reachable")
+
+    assert feasible is failed
+    assert ik.targets == []
+
+
+def test_ranking_strategies_never_ask_the_ik_backend() -> None:
+    """The regression guard for LIBERO, BEHAVIOR and Robosuite: no behaviour change."""
+    ik = SelectiveFakeIK(unsolvable=lambda pose: True)
+    api = _reachability_api(ik)
+    grasps = GraspSet(ok=True, grasps=(_grasp(0.2, 0.5), _grasp(0.9, 0.6)))
+
+    for strategy in ("top_down", "highest_score"):
+        selected = api.select_grasp(grasps, strategy)
+        assert isinstance(selected, GraspCandidate)
+        assert selected.score == 0.9
+    assert ik.targets == []
+    failed = GraspSet(ok=False, error=ApiError(code=ErrorCode.NO_GRASP, message="none"))
+    assert api.select_grasp(failed, "top_down") is None
+
+
+def test_select_grasp_rejects_an_unknown_strategy() -> None:
+    api = _reachability_api(SelectiveFakeIK())
+    with pytest.raises(ValueError, match="all_reachable"):
+        api.select_grasp(GraspSet(ok=True, grasps=(_grasp(0.9, 0.5),)), "nearest")
+
+
 def test_move_to_joints_reissues_target_until_observed_state_converges() -> None:
     class LaggingAdapter(FakeAdapter):
         def step(self, action: object) -> StepResult:

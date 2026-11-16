@@ -43,7 +43,7 @@ advance environment control time.
 | `shared_atomic` | `set_gripper(position, *, arm="primary")` | `ExecutionResult` | Many ticks | Drive one normalized gripper target, where `0` is closed and `1` is open. On LIBERO, Robosuite and RoboCasa only `0.0` and `1.0` are accepted -- see below. |
 | `shared_atomic` | `set_grippers(positions)` | `ExecutionResult` | One tick | Command every arm's normalized gripper target in the same control tick. |
 | `shared_high_level` | `localize_object(query, *, camera_name=None, target_frame=None)` | `LocalizationResult` | No | Compose text segmentation, RGB-D projection, and geometry estimation; `camera_name` defaults to the benchmark's wide camera (`agentview`, or `head` on BEHAVIOR-1K) and `target_frame` to the robot base frame. |
-| `shared_high_level` | `select_grasp(grasps, strategy="top_down")` | `GraspCandidate | None` | No | Select `top_down` or `highest_score` from a successful grasp set. |
+| `shared_high_level` | `select_grasp(grasps, strategy="top_down")` | `GraspCandidate | None | GraspSet` | No | Select `top_down` or `highest_score` from a successful grasp set, or `all_reachable` for every IK-solvable candidate as a ranked `GraspSet` -- see [Reachable grasp selection](#reachable-grasp-selection). |
 | `shared_high_level` | `move_to_joints(target, tolerance=0.01, max_steps=120, *, arm="primary")` | `ExecutionResult` | Many ticks | Servo repeatedly to an absolute joint target until the measured state converges. |
 | `shared_high_level` | `move_to_pose(target_pose, tolerance=0.01, max_steps=120, *, arm="primary", strategy=None)` | `ExecutionResult` | Many ticks | Plan, execute, and verify one framed end-effector pose. `max_steps` caps the **planned** waypoint count as well as execution: a plan longer than it fails with `planned trajectory exceeds max_steps` and `steps_executed` 0, without moving the arm. On BEHAVIOR-1K a normal cuRobo reach exceeds the default of 120. |
 | `shared_high_level` | `move_synchronized(targets, tolerance=0.01, max_steps=120, strategy=None)` | `ExecutionResult` | Many ticks | Plan, execute, and verify synchronized targets for all arms. |
@@ -120,6 +120,41 @@ Measured on `libero_10_swap/task_7`: `set_gripper(0.669)` and `set_gripper(0.933
 Prefer `open_gripper()` and `close_gripper()`. A jaw cannot be pre-narrowed to reduce swing on
 approach; control clearance with approach geometry instead. YAM commands a real position target and
 accepts intermediate values normally.
+
+### Reachable grasp selection
+
+`select_grasp(grasps, "all_reachable")` returns a `GraspSet` rather than one candidate: every
+candidate whose 10 cm standoff **and** grasp pose the default IK backend can solve, best
+score first. A candidate whose provider reports its own `approach_distance_m` is probed at
+that distance instead. `top_down` and `highest_score` are unchanged -- pure ranking, no IK,
+one candidate or `None`.
+
+It is opt-in because it is neither free nor permanent.
+
+- **Not free.** It asks the IK backend about each candidate, so a 20-candidate set costs 20-40
+  solver round trips. No simulator ticks are spent, and a candidate stops at its first
+  blocking pose.
+- **Not permanent.** IK is seeded from the arm's *current* configuration, so an attempt that
+  moves the arm invalidates the answer. Call it again instead of reusing an old result.
+
+It is also necessary, not sufficient. The probe is scene-free IK: cuRobo's
+scene-aware planner has been measured refusing 0 of 6 standoff configurations
+that its own scene-free IK accepts 6 of 6, so a candidate passing this filter
+means the arm has a solution for that pose, not that the motion will execute.
+Plan it with `plan_motion` and a collision-aware strategy to find out.
+
+An empty answer is typed, never silent:
+
+- `ok=False` with `ik_unreachable` -- candidates existed and none solved, with
+  `standoff_blocked` / `grasp_blocked` counts in `details`. This is the signal to reposition
+  the base, not to retry from here.
+- `ok=False` with any other code -- for example `unsupported` when no IK backend is
+  configured. The probe could not run, so it says nothing about reachability.
+
+Measured on RoboCasa `PickPlaceCounterToStove`, seeds 101-150: 51% of attempted candidates
+were IK-unreachable when selecting by score alone, and 4% when filtering by IK first. 139 of
+885 candidates had a solvable grasp pose and an unsolvable standoff, which is why both are
+checked.
 
 ### Homing
 

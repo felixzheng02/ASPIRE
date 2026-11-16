@@ -41,6 +41,7 @@ from .errors import ApiError, ErrorCode
 from .geometry import (
     PANDA_EMBODIMENTS,
     eef_from_panda_hand,
+    grasp_standoff_pose,
     pose_from_mapping,
     select_top_down_grasp,
 )
@@ -80,6 +81,20 @@ TRAJECTORY_START_TOLERANCE_RAD = 0.02
 #: independently along the trajectory's own gripper column. This bound only
 #: catches a gripper that has changed enough to alter the collision geometry.
 TRAJECTORY_START_GRIPPER_TOLERANCE = 0.25
+
+#: Pre-grasp retreat used by the ``all_reachable`` selection strategy, in metres.
+#: A grasp is only attemptable if the arm can reach its standoff *and* the grasp
+#: itself: measured on RoboCasa ``PickPlaceCounterToStove`` seeds 101-150, 139 of
+#: 885 Contact-GraspNet candidates had a solvable grasp pose and an unsolvable
+#: 10 cm standoff, which made the standoff the single largest individual blocker.
+#: A provider that reports its own ``approach_distance_m`` overrides this.
+GRASP_STANDOFF_M = 0.10
+
+#: Probe outcomes that describe *this pose* rather than a broken probe. Any other
+#: error code (no IK backend, service down, frame mismatch) says nothing about
+#: reachability, so the scan stops and reports it unchanged instead of filing
+#: every candidate as unreachable.
+_IK_POSE_VERDICT_CODES = frozenset({ErrorCode.IK_FAILED, ErrorCode.IK_UNREACHABLE})
 
 
 class CapApi:
@@ -1226,14 +1241,120 @@ class CapApi:
         self,
         grasps: GraspSet,
         strategy: str = "top_down",
-    ) -> GraspCandidate | None:
+    ) -> GraspCandidate | GraspSet | None:
+        """Pick grasps out of a generated set.
+
+        ``top_down`` and ``highest_score`` are pure ranking and return one
+        ``GraspCandidate`` or ``None``. ``all_reachable`` is opt-in, asks IK about
+        every candidate, and returns a ``GraspSet`` instead -- see
+        ``_reachable_grasps``.
+        """
+        if strategy == "all_reachable":
+            # Deliberately before the `ok` guard below: a failed set must come
+            # back as a failed set, not as None, for this strategy.
+            return self._reachable_grasps(grasps)
         if not grasps.ok:
             return None
         if strategy == "top_down":
             return select_top_down_grasp(grasps)
         if strategy == "highest_score":
             return max(grasps.grasps, key=lambda candidate: candidate.score, default=None)
-        raise ValueError("strategy must be 'top_down' or 'highest_score'")
+        raise ValueError("strategy must be 'top_down', 'highest_score' or 'all_reachable'")
+
+    def _reachable_grasps(self, grasps: GraspSet) -> GraspSet:
+        """Every candidate whose standoff and grasp pose both solve, best score first.
+
+        Opt-in because it is not free and not permanent. Not free: unlike the
+        ranking strategies this asks the IK backend about each candidate, so a
+        20-candidate set costs 20-40 solver round trips (no simulator ticks, and
+        the per-candidate probe stops at the first blocking pose). Not permanent:
+        IK is seeded from the arm's *current* configuration, so an attempt that
+        moves the arm invalidates the answer -- call this again rather than
+        reusing an old result.
+
+        Returns a ``GraspSet`` rather than one candidate because a generated
+        program cannot build a ``GraspSet`` and so could never ask for the
+        next-best reachable grasp, and because its ``error``/``diagnostics``
+        already say why an empty answer is empty.
+        """
+        if not grasps.ok:
+            return grasps
+        ranked = sorted(grasps.grasps, key=lambda candidate: -candidate.score)
+        reachable: list[GraspCandidate] = []
+        standoff_blocked = 0
+        grasp_blocked = 0
+        probes = 0
+        for candidate in ranked:
+            standoff = grasp_standoff_pose(
+                candidate.pose, candidate.approach_distance_m or GRASP_STANDOFF_M
+            )
+            # Each probe is staged, so the per-candidate verdict and its residuals
+            # land in the run trace next to the selection that used them.
+            standoff_solution = self._stage("solve_ik", self.solve_ik, standoff)
+            probes += 1
+            if not standoff_solution.ok:
+                if not self._is_pose_verdict(standoff_solution):
+                    return self._unprobeable_grasps(standoff_solution, probes)
+                standoff_blocked += 1
+                continue
+            grasp_solution = self._stage("solve_ik", self.solve_ik, candidate.pose)
+            probes += 1
+            if not grasp_solution.ok:
+                if not self._is_pose_verdict(grasp_solution):
+                    return self._unprobeable_grasps(grasp_solution, probes)
+                grasp_blocked += 1
+                continue
+            reachable.append(candidate)
+        counts = {
+            "strategy": "all_reachable",
+            "candidates": len(ranked),
+            "reachable": len(reachable),
+            "standoff_blocked": standoff_blocked,
+            "grasp_blocked": grasp_blocked,
+            "ik_probes": probes,
+            "standoff_m": GRASP_STANDOFF_M,
+        }
+        if not reachable:
+            return GraspSet(
+                ok=False,
+                error=ApiError(
+                    code=ErrorCode.IK_UNREACHABLE,
+                    message=(
+                        f"no reachable grasp: {len(ranked)} candidates tested, "
+                        f"{standoff_blocked} blocked at the standoff and "
+                        f"{grasp_blocked} at the grasp pose, from the arm's current "
+                        "configuration"
+                    ),
+                    details=counts,
+                ),
+                diagnostics=counts,
+            )
+        return GraspSet(ok=True, grasps=tuple(reachable), diagnostics=counts)
+
+    @staticmethod
+    def _is_pose_verdict(solution: IKResult) -> bool:
+        """Did the probe judge the pose, or fail to judge it at all?"""
+        error = solution.error
+        return error is not None and error.code in _IK_POSE_VERDICT_CODES
+
+    @staticmethod
+    def _unprobeable_grasps(solution: IKResult, probes: int) -> GraspSet:
+        """Pass a broken probe through unchanged -- it is not an unreachable scene.
+
+        A missing IK backend, a dead solver service or a grasp frame that is not
+        the robot base frame would otherwise be reported as "nothing is
+        reachable", and an agent would move the base instead of fixing the setup.
+        """
+        error = solution.error
+        assert error is not None  # a failed IKResult always carries one
+        return GraspSet(
+            ok=False,
+            error=ApiError(
+                code=error.code,
+                message=f"grasp reachability could not be probed: {error.message}",
+                details={**dict(error.details), "ik_probes": probes},
+            ),
+        )
 
     def move_to_joints(
         self,
