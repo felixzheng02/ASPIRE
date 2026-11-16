@@ -1611,6 +1611,7 @@ class CapApi:
             ("plan_standoff_pose", "geometry"),
             ("plan_approach_pose", "geometry"),
             ("base_pose_is_free", "geometry"),
+            ("plan_base_offset", "planning"),
         )
         for extension_name, capability in extensions:
             function = getattr(self._adapter, extension_name, None)
