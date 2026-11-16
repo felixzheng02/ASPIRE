@@ -1,0 +1,111 @@
+<p><b>What this is.</b> Every one of the 31 public tools the ASPIRE agent is handed for the
+<code>robocasa</code> embodiment, called through the same namespace a generated program gets
+(<code>CapApi.register_tools(ToolRegistry(public_extension_allowlist=ROBOCASA_PUBLIC_TOOL_NAMES))</code>),
+with its input and output drawn so the answer can be judged by eye. One task
+(<code>PickPlaceCounterToStove</code>), one seed (101), instruction <i>"Pick the fish from the
+plate and place it in the pan."</i> Nothing was fixed; problems are reported where they were
+found.</p>
+
+<p><b>Reading this page.</b> Each tool below has a table of the calls made (input, result,
+whether it behaved) followed by the figures. "Behaved" means the call did what the API
+reference says it does &mdash; a correctly refused bad input counts as behaving. Rotating GIFs
+are 3D views; the videos are the simulator's own cameras during each motion.</p>
+
+<p><b>Cross-check through the real sandbox.</b> <code>api_tool_check.py</code> (the catalog
+written as a generated program) was also run under <code>cap-harness run</code> on the same
+task and seed: <code>program_ok=True</code>, <code>termination_reason=program_completed</code>,
+269 ticks, and all 31 tools reachable from inside <code>runtime.py</code>'s sandbox
+(<code>out/sandbox/</code>). Note that that script marks a tool "ok" when the call <i>returns</i>
+&mdash; it reports <code>move_synchronized</code> and <code>plan_synchronized_motion</code> as
+ok by design ("a typed failure is still a successful probe of this tool"). It proves
+reachability; the figures below are what test behaviour.</p>
+
+<h3>The short version</h3>
+
+<p><b>Perception, kinematics and motion control are sound.</b> The calibration round trip is
+exact to 1e-13 px; two cameras with different intrinsics and extrinsics place the same object
+within 1&ndash;5 mm of each other in <code>robot0_link0</code>; the reported end-effector origin
+projects exactly between the two fingertips visible in the wrist camera. IK solutions, when
+driven, land 3.7&ndash;5.9 mm and under 0.6&deg; from the pose they were solved for.
+<code>move_to_pose</code> holds under 6 mm on every axis tested, <code>move_to_joints</code> and
+<code>go_home</code> converge to under 0.01 rad, all five <code>plan_motion</code> strategies
+return paths, and the grippers, the step loop and the error paths behave as documented.</p>
+
+<p><b>Grasping does not work end to end</b>, and three smaller things are wrong.</p>
+
+<h3>Problems found</h3>
+
+<ol>
+<li><b><code>generate_grasps</code> is non-deterministic and often empty.</b> Asking three times
+in a row for the same mask of the same frame, with <code>max_candidates</code> 1, 8 and 30,
+returned <code>0 / 1 / 0</code> candidates on the fish, <code>1 / 8 / 1</code> on the plate seen
+as "pan", and <code>1 / 0 / 0</code> on the plate. A separate retry loop on an identical fish
+mask returned <code>0, 0, 0, 2</code> on four consecutive calls. So the cap is honoured but the
+pool behind it is random between 0 and 8 for unchanged input, and the most common answer for a
+small object is <code>NO_GRASP</code>. Scores, when candidates exist, are 0.16&ndash;0.22. A
+program cannot rely on this call returning anything, and retrying is not obviously wrong.</li>
+
+<li><b>The grasp pipeline reaches the candidate but picks nothing up.</b> Driven end to end, the
+arm reached the best candidate to within 8.6 mm, the jaw then closed to 0.011 &mdash; near-zero,
+which on this binary gripper means it met no object &mdash; and a 12 cm lift left the fish's
+centroid where it was (+0.000 m). The frame handling is right (see next item); the candidate
+itself straddles the edge of the fish. See <i>generate_grasps &rarr; "Driving the best
+candidate"</i>.</li>
+
+<li><b>A grasp pose is not a <code>move_to_pose</code> target, and nothing says so.</b> The
+returned pose sits exactly 0.1034 m behind its own reported <code>contact_point</code> along its
+local +Z: it is a gripper <i>base</i> (<code>panda_hand</code>) pose, while
+<code>solve_ik</code> and <code>move_to_pose</code> take a <code>gripper0_right_eef</code> pose
+and internally subtract another 0.1 m. Passing a candidate straight through therefore puts the
+hand 10 cm short of the object. Both readings are reachable, so <code>solve_ik</code> returns
+<code>ok</code> for either and nothing flags the mistake. Correcting it
+(<code>eef = pose + 0.1 &middot; z</code>, rotation &times; Rz(&minus;90&deg;)) put the hand
+within 9 mm of the candidate &mdash; the overlay figure shows the two coinciding. Also note
+<code>width_m = 0.08</code> and <code>approach_distance_m = 0.0</code> are provider constants,
+not predictions.</li>
+
+<li><b><code>move_synchronized</code> can never succeed on this embodiment.</b>
+<code>plan_synchronized_motion</code> happily returns a <code>SynchronizedTrajectory</code>, but
+<code>RobocasaAdapter.execute_trajectory</code> accepts only a <code>Trajectory</code>, so the
+call comes back <code>INVALID_REQUEST: invalid trajectory: trajectory must be a
+Trajectory</code>. The planning half of the pair works and the execution half cannot.</li>
+
+<li><b><code>robocasa.get_controller_metadata()["joint_limits"]</code> does not describe the arm.</b>
+It publishes <code>low = [0, 0, 0, 0, -2.8973, -1.7628, -2.8973]</code>,
+<code>high = [0, 0, 0, 0.34, 2.8973, 1.7628, 2.8973]</code>. Four of the seven <i>measured</i>
+joint positions fall outside their own published range &mdash; joint 3 reads &minus;0.503 against
+a published <code>[0.0, 0.34]</code>. The simulator builds this from
+<code>model.jnt_range[:7]</code>, the first seven joints of the whole MuJoCo model, which on
+PandaOmron are base/torso joints followed by arm joints 1&ndash;3; the real limits of arm joints
+4&ndash;7 are never published. A program that clamped its targets to these numbers would drive
+the first four joints to zero.</li>
+
+<li><b><code>segment_text</code> has no presence test.</b> Asking <code>agentview</code> for
+<code>"sink"</code> &mdash; nothing of the sort is in frame &mdash; returns the plate at score
+<b>0.72</b> with <code>ok=True</code>. <code>"pan"</code> (there is one, but on the far side of
+the stove and out of this camera's view) returns the same plate box at 0.035. The call always
+returns up to five ranked masks and never an empty result, so a score is the only signal, and a
+high score is not evidence the thing exists.</li>
+
+<li><b>The arm cannot be raised from its spawn pose.</b> Holding orientation,
+<code>solve_ik</code> solves for +1 and +2 cm of &plus;z and fails from 3 cm upward (it reaches
+12 cm forward). That is a workspace edge, not a defect, but it is sharp, undocumented, and the
+<code>IK_FAILED</code> error carries an empty <code>details</code>, so the residual that caused
+the rejection is not visible to the caller.</li>
+
+<li><b>Smaller notes.</b> <code>select_grasp(..., "top_down")</code> returned <code>None</code>
+for every candidate on this scene (they all approach from the side), so a program that only uses
+that strategy gets nothing. <code>mask_to_point_cloud</code>'s documented default
+<code>target_frame="robot_base"</code> always raises here, since this adapter's base frame is
+<code>robot0_link0</code>. <code>robocasa.plan_approach_pose(distance_m=0.7)</code> returns
+<code>(0, 0, yaw)</code> when the object is nearer than <code>distance_m</code> &mdash; a silent
+no-op &mdash; and the yaw it suggests makes the spawn footprint report blocked. One
+<code>navigate_to_pose</code> yaw command achieved 0.279 of 0.30 rad but also drifted the base
+3 cm and was reported as not converged.</li>
+</ol>
+
+<p><b>Confirmed working as documented:</b> forward base motion from spawn is blocked by the
+counter and reports it (5.5 cm of 30 cm); <code>set_gripper(0.5)</code> is refused before a tick
+is spent; <code>step</code> strips the reward; a stale trajectory is refused with
+<code>STALE_PLAN</code>; <code>robocasa.base_pose_is_free</code> agrees with the counter point
+cloud pushed into world through <code>robocasa.get_base_pose</code> on 100% of sampled points.</p>

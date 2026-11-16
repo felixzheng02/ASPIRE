@@ -1,0 +1,5503 @@
+<!doctype html><html><head><meta charset='utf-8'>
+<title>RoboCasa CaP API tool check</title>
+<style>
+ body{font:14px/1.55 -apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#f6f7f9;color:#1b1f23}
+ .wrap{max-width:1180px;margin:0 auto;padding:24px}
+ h1{font-size:26px;margin:0 0 4px} h2{margin:34px 0 6px;font-size:20px;border-top:2px solid #d9dde2;padding-top:14px}
+ h3{margin:18px 0 6px;font-size:15px;color:#3b434b}
+ code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+ pre{background:#0f1419;color:#e6edf3;padding:10px 12px;border-radius:6px;overflow-x:auto;font-size:11.5px;line-height:1.45}
+ table{border-collapse:collapse;width:100%;margin:8px 0;background:#fff}
+ th,td{border:1px solid #dfe3e8;padding:5px 8px;text-align:left;vertical-align:top;font-size:12.5px}
+ th{background:#eef1f4}
+ .ok{color:#116329;font-weight:600}.bad{color:#a40e26;font-weight:600}
+ .badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;font-weight:600;margin-left:8px}
+ .b-ok{background:#d6f5de;color:#116329}.b-part{background:#fdf2c9;color:#7a5c00}.b-bad{background:#ffe0e4;color:#a40e26}
+ figure{margin:14px 0;background:#fff;border:1px solid #e3e7ea;border-radius:8px;padding:10px}
+ figure img,figure video{max-width:100%;border-radius:4px;display:block}
+ figcaption{font-size:12px;color:#5a636c;margin-top:6px}
+ .vid{display:inline-block;width:320px;margin:6px 10px 6px 0;vertical-align:top}
+ .vid video{width:320px}
+ .vid .t{font-size:11.5px;color:#5a636c}
+ nav a{display:inline-block;margin:2px 10px 2px 0;font-size:12.5px}
+ .sum{background:#fff;border:1px solid #e3e7ea;border-radius:8px;padding:14px 18px}
+</style></head><body><div class='wrap'>
+<h1>RoboCasa CaP API tool check</h1>
+<div class='sum'><p><b>What this is.</b> Every one of the 31 public tools the ASPIRE agent is handed for the
+<code>robocasa</code> embodiment, called through the same namespace a generated program gets
+(<code>CapApi.register_tools(ToolRegistry(public_extension_allowlist=ROBOCASA_PUBLIC_TOOL_NAMES))</code>),
+with its input and output drawn so the answer can be judged by eye. One task
+(<code>PickPlaceCounterToStove</code>), one seed (101), instruction <i>"Pick the fish from the
+plate and place it in the pan."</i> Nothing was fixed; problems are reported where they were
+found.</p>
+
+<p><b>Reading this page.</b> Each tool below has a table of the calls made (input, result,
+whether it behaved) followed by the figures. "Behaved" means the call did what the API
+reference says it does &mdash; a correctly refused bad input counts as behaving. Rotating GIFs
+are 3D views; the videos are the simulator's own cameras during each motion.</p>
+
+<p><b>Cross-check through the real sandbox.</b> <code>api_tool_check.py</code> (the catalog
+written as a generated program) was also run under <code>cap-harness run</code> on the same
+task and seed: <code>program_ok=True</code>, <code>termination_reason=program_completed</code>,
+269 ticks, and all 31 tools reachable from inside <code>runtime.py</code>'s sandbox
+(<code>out/sandbox/</code>). Note that that script marks a tool "ok" when the call <i>returns</i>
+&mdash; it reports <code>move_synchronized</code> and <code>plan_synchronized_motion</code> as
+ok by design ("a typed failure is still a successful probe of this tool"). It proves
+reachability; the figures below are what test behaviour.</p>
+
+<h3>The short version</h3>
+
+<p><b>Perception, kinematics and motion control are sound.</b> The calibration round trip is
+exact to 1e-13 px; two cameras with different intrinsics and extrinsics place the same object
+within 1&ndash;5 mm of each other in <code>robot0_link0</code>; the reported end-effector origin
+projects exactly between the two fingertips visible in the wrist camera. IK solutions, when
+driven, land 3.7&ndash;5.9 mm and under 0.6&deg; from the pose they were solved for.
+<code>move_to_pose</code> holds under 6 mm on every axis tested, <code>move_to_joints</code> and
+<code>go_home</code> converge to under 0.01 rad, all five <code>plan_motion</code> strategies
+return paths, and the grippers, the step loop and the error paths behave as documented.</p>
+
+<p><b>Grasping does not work end to end</b>, and three smaller things are wrong.</p>
+
+<h3>Problems found</h3>
+
+<ol>
+<li><b><code>generate_grasps</code> is non-deterministic and often empty.</b> Asking three times
+in a row for the same mask of the same frame, with <code>max_candidates</code> 1, 8 and 30,
+returned <code>0 / 1 / 0</code> candidates on the fish, <code>1 / 8 / 1</code> on the plate seen
+as "pan", and <code>1 / 0 / 0</code> on the plate. A separate retry loop on an identical fish
+mask returned <code>0, 0, 0, 2</code> on four consecutive calls. So the cap is honoured but the
+pool behind it is random between 0 and 8 for unchanged input, and the most common answer for a
+small object is <code>NO_GRASP</code>. Scores, when candidates exist, are 0.16&ndash;0.22. A
+program cannot rely on this call returning anything, and retrying is not obviously wrong.</li>
+
+<li><b>The grasp pipeline reaches the candidate but picks nothing up.</b> Driven end to end, the
+arm reached the best candidate to within 8.6 mm, the jaw then closed to 0.011 &mdash; near-zero,
+which on this binary gripper means it met no object &mdash; and a 12 cm lift left the fish's
+centroid where it was (+0.000 m). The frame handling is right (see next item); the candidate
+itself straddles the edge of the fish. See <i>generate_grasps &rarr; "Driving the best
+candidate"</i>.</li>
+
+<li><b>A grasp pose is not a <code>move_to_pose</code> target, and nothing says so.</b> The
+returned pose sits exactly 0.1034 m behind its own reported <code>contact_point</code> along its
+local +Z: it is a gripper <i>base</i> (<code>panda_hand</code>) pose, while
+<code>solve_ik</code> and <code>move_to_pose</code> take a <code>gripper0_right_eef</code> pose
+and internally subtract another 0.1 m. Passing a candidate straight through therefore puts the
+hand 10 cm short of the object. Both readings are reachable, so <code>solve_ik</code> returns
+<code>ok</code> for either and nothing flags the mistake. Correcting it
+(<code>eef = pose + 0.1 &middot; z</code>, rotation &times; Rz(&minus;90&deg;)) put the hand
+within 9 mm of the candidate &mdash; the overlay figure shows the two coinciding. Also note
+<code>width_m = 0.08</code> and <code>approach_distance_m = 0.0</code> are provider constants,
+not predictions.</li>
+
+<li><b><code>move_synchronized</code> can never succeed on this embodiment.</b>
+<code>plan_synchronized_motion</code> happily returns a <code>SynchronizedTrajectory</code>, but
+<code>RobocasaAdapter.execute_trajectory</code> accepts only a <code>Trajectory</code>, so the
+call comes back <code>INVALID_REQUEST: invalid trajectory: trajectory must be a
+Trajectory</code>. The planning half of the pair works and the execution half cannot.</li>
+
+<li><b><code>robocasa.get_controller_metadata()["joint_limits"]</code> does not describe the arm.</b>
+It publishes <code>low = [0, 0, 0, 0, -2.8973, -1.7628, -2.8973]</code>,
+<code>high = [0, 0, 0, 0.34, 2.8973, 1.7628, 2.8973]</code>. Four of the seven <i>measured</i>
+joint positions fall outside their own published range &mdash; joint 3 reads &minus;0.503 against
+a published <code>[0.0, 0.34]</code>. The simulator builds this from
+<code>model.jnt_range[:7]</code>, the first seven joints of the whole MuJoCo model, which on
+PandaOmron are base/torso joints followed by arm joints 1&ndash;3; the real limits of arm joints
+4&ndash;7 are never published. A program that clamped its targets to these numbers would drive
+the first four joints to zero.</li>
+
+<li><b><code>segment_text</code> has no presence test.</b> Asking <code>agentview</code> for
+<code>"sink"</code> &mdash; nothing of the sort is in frame &mdash; returns the plate at score
+<b>0.72</b> with <code>ok=True</code>. <code>"pan"</code> (there is one, but on the far side of
+the stove and out of this camera's view) returns the same plate box at 0.035. The call always
+returns up to five ranked masks and never an empty result, so a score is the only signal, and a
+high score is not evidence the thing exists.</li>
+
+<li><b>The arm cannot be raised from its spawn pose.</b> Holding orientation,
+<code>solve_ik</code> solves for +1 and +2 cm of &plus;z and fails from 3 cm upward (it reaches
+12 cm forward). That is a workspace edge, not a defect, but it is sharp, undocumented, and the
+<code>IK_FAILED</code> error carries an empty <code>details</code>, so the residual that caused
+the rejection is not visible to the caller.</li>
+
+<li><b>Smaller notes.</b> <code>select_grasp(..., "top_down")</code> returned <code>None</code>
+for every candidate on this scene (they all approach from the side), so a program that only uses
+that strategy gets nothing. <code>mask_to_point_cloud</code>'s documented default
+<code>target_frame="robot_base"</code> always raises here, since this adapter's base frame is
+<code>robot0_link0</code>. <code>robocasa.plan_approach_pose(distance_m=0.7)</code> returns
+<code>(0, 0, yaw)</code> when the object is nearer than <code>distance_m</code> &mdash; a silent
+no-op &mdash; and the yaw it suggests makes the spawn footprint report blocked. One
+<code>navigate_to_pose</code> yaw command achieved 0.279 of 0.30 rad but also drifted the base
+3 cm and was reported as not converged.</li>
+</ol>
+
+<p><b>Confirmed working as documented:</b> forward base motion from spawn is blocked by the
+counter and reports it (5.5 cm of 30 cm); <code>set_gripper(0.5)</code> is refused before a tick
+is spent; <code>step</code> strips the reward; a stale trajectory is refused with
+<code>STALE_PLAN</code>; <code>robocasa.base_pose_is_free</code> agrees with the counter point
+cloud pushed into world through <code>robocasa.get_base_pose</code> on 100% of sampled points.</p>
+</div>
+<h2 id='toc'>Tools</h2><nav>
+<a href='#get_task_context'>get_task_context</a>
+<a href='#get_observation'>get_observation</a>
+<a href='#get_robot_state'>get_robot_state</a>
+<a href='#segment_text'>segment_text</a>
+<a href='#segment_points'>segment_points</a>
+<a href='#mask_to_point_cloud'>mask_to_point_cloud</a>
+<a href='#crop_point_cloud'>crop_point_cloud</a>
+<a href='#estimate_geometry'>estimate_geometry</a>
+<a href='#localize_object'>localize_object</a>
+<a href='#generate_grasps'>generate_grasps</a>
+<a href='#select_grasp'>select_grasp</a>
+<a href='#solve_ik'>solve_ik</a>
+<a href='#plan_motion'>plan_motion</a>
+<a href='#plan_synchronized_motion'>plan_synchronized_motion</a>
+<a href='#step'>step</a>
+<a href='#execute_trajectory'>execute_trajectory</a>
+<a href='#move_to_joints'>move_to_joints</a>
+<a href='#move_to_pose'>move_to_pose</a>
+<a href='#move_synchronized'>move_synchronized</a>
+<a href='#open_gripper'>open_gripper</a>
+<a href='#close_gripper'>close_gripper</a>
+<a href='#set_gripper'>set_gripper</a>
+<a href='#set_grippers'>set_grippers</a>
+<a href='#go_home'>go_home</a>
+<a href='#robocasa.get_task_metadata'>robocasa.get_task_metadata</a>
+<a href='#robocasa.get_controller_metadata'>robocasa.get_controller_metadata</a>
+<a href='#robocasa.get_base_pose'>robocasa.get_base_pose</a>
+<a href='#robocasa.navigate_to_pose'>robocasa.navigate_to_pose</a>
+<a href='#robocasa.base_pose_is_free'>robocasa.base_pose_is_free</a>
+<a href='#robocasa.plan_standoff_pose'>robocasa.plan_standoff_pose</a>
+<a href='#robocasa.plan_approach_pose'>robocasa.plan_approach_pose</a>
+</nav>
+<h2 id='get_task_context'><code>get_task_context</code><span class='badge b-ok'>1/1 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>get_task_context</b><br><span style='color:#8a9199'>stage identity</span></td><td><pre>{}</pre></td><td>instruction: &#x27;Pick the fish from the plate and place it in the pan.&#x27;<pre>{
+ &quot;suite&quot;: &quot;PickPlaceCounterToStove&quot;,
+ &quot;task_id&quot;: 0,
+ &quot;task_name&quot;: &quot;PickPlaceCounterToStove&quot;,
+ &quot;family&quot;: &quot;robocasa&quot;,
+ &quot;language&quot;: &quot;Pick the fish from the plate and place it in the pan.&quot;,
+ &quot;metadata&quot;: {
+  &quot;task_ref&quot;: &quot;PickPlaceCounterToStove:0&quot;
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+</table>
+<h2 id='get_observation'><code>get_observation</code><span class='badge b-ok'>1/1 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>get_observation</b><br><span style='color:#8a9199'>stage identity</span></td><td><pre>{
+ &quot;camera_names&quot;: null,
+ &quot;then&quot;: &quot;&#x27;agentview&#x27;&quot;
+}</pre></td><td>both cameras, RGB + metric depth + K + extrinsics<pre>{
+ &quot;camera_names&quot;: [
+  &quot;agentview&quot;,
+  &quot;robot0_eye_in_hand&quot;
+ ],
+ &quot;filtered_to&quot;: [
+  &quot;agentview&quot;
+ ],
+ &quot;timestamp_s&quot;: 0.0,
+ &quot;cameras&quot;: {
+  &quot;agentview&quot;: {
+   &quot;rgb_shape&quot;: [
+    512,
+    512,
+    3
+   ],
+   &quot;rgb_dtype&quot;: &quot;uint8&quot;,
+   &quot;depth_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;depth_min_m&quot;: 0.4592,
+   &quot;depth_max_m&quot;: 1.7884,
+   &quot;depth_finite_fraction&quot;: 1.0,
+   &quot;intrinsics&quot;: [
+    [
+     443.405,
+     0.0,
+     256.0
+    ],
+    [
+     0.0,
+     443.405,
+     256.0
+    ],
+    [
+     0.0,
+     0.0,
+     1.0
+    ]
+   ],
+   &quot;camera_pose&quot;: {
+    &quot;position_m&quot;: [
+     -0.5,
+     0.35,
+     1.05
+    ],
+    &quot;quaternion_wxyz&quot;: [
+     0.29935,
+     -0.55624,
+     0.67751,
+     -0.37679
+    ],
+    &quot;yaw_rad&quot;: -1.77419,
+    &quot;frame&quot;: &quot;robot0_link0&quot;
+   },
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;
+  },
+  &quot;robot0_eye_in_hand&quot;: {
+   &quot;rgb_shape&quot;: [
+    512,
+    512,
+    3
+   ],
+   &quot;rgb_dtype&quot;: &quot;uint8&quot;,
+   &quot;depth_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;depth_min_m&quot;: 0.0418,
+   &quot;depth_max_m&quot;: 1.6567,
+   &quot;depth_finite_fraction&quot;: 1.0,
+   &quot;intrinsics&quot;: [
+    [
+     333.626,
+     0.0,
+     256.0
+    ],
+    [
+     0.0,
+     333.626,
+     256.0
+    ],
+    [
+     0.0,
+     0.0,
+     1.0
+    ]
+   ],
+   &quot;camera_pose&quot;: {
+    &quot;position_m&quot;: [
+     0.17622,
+     0.02781,
+     0.95761
+    ],
+    &quot;quaternion_wxyz&quot;: [
+     0.02407,
+     -0.88167,
+     0.46948,
+     -0.04081
+    ],
+    &quot;yaw_rad&quot;: -0.98059,
+    &quot;frame&quot;: &quot;robot0_link0&quot;
+   },
+   &quot;frame&quot;: &quot;camera/robot0_eye_in_hand&quot;
+  }
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+</table>
+<figure><h3>Both cameras: RGB and metric depth</h3><img src='figures/identity/cameras.png' loading='lazy'><figcaption>512x512 RGB plus a float depth map in metres for each camera, with intrinsics and a camera pose expressed in robot0_link0.</figcaption></figure>
+<figure><h3>The whole scene as a point cloud in robot0_link0</h3><img src='figures/identity/scene_cloud.gif' loading='lazy'><figcaption>Every valid depth pixel of the scene camera, coloured by its own RGB. The red/green/blue triad at the origin is robot0_link0 (x/y/z).</figcaption></figure>
+<h2 id='get_robot_state'><code>get_robot_state</code><span class='badge b-ok'>2/2 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>get_robot_state</b><br><span style='color:#8a9199'>stage identity</span></td><td><pre>{}</pre></td><td>7 joints, base_frame=robot0_link0<pre>{
+ &quot;embodiment&quot;: &quot;robocasa&quot;,
+ &quot;base_frame&quot;: &quot;robot0_link0&quot;,
+ &quot;arms&quot;: [
+  &quot;primary&quot;
+ ],
+ &quot;joint_names&quot;: [
+  &quot;joint_0&quot;,
+  &quot;joint_1&quot;,
+  &quot;joint_2&quot;,
+  &quot;joint_3&quot;,
+  &quot;joint_4&quot;,
+  &quot;joint_5&quot;,
+  &quot;joint_6&quot;
+ ],
+ &quot;joint_positions_rad&quot;: [
+  0.00225,
+  -0.22333,
+  -0.00542,
+  -0.5032,
+  0.00881,
+  0.37459,
+  0.19894
+ ],
+ &quot;joint_velocities&quot;: [
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0
+ ],
+ &quot;gripper_position&quot;: 0.5138,
+ &quot;ee_pose&quot;: {
+  &quot;position_m&quot;: [
+   0.1441,
+   0.00031,
+   0.85701
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.04081,
+   0.46948,
+   0.88167,
+   0.02407
+  ],
+  &quot;yaw_rad&quot;: 2.161,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;timestamp_s&quot;: 0.0
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>get_robot_state cross-check against the wrist camera mounting</b><br><span style='color:#8a9199'>stage identity</span></td><td><pre>{
+ &quot;compare&quot;: &quot;end_effector_poses[&#x27;primary&#x27;] vs the wrist camera_pose&quot;
+}</pre></td><td>the end-effector origin sits 109 mm from the wrist camera and projects into the wrist image at (256, 428) px, 0.097 m in front of it<pre>{
+ &quot;eef_position_m&quot;: [
+  0.1441,
+  0.0003,
+  0.857
+ ],
+ &quot;wrist_camera_position_m&quot;: [
+  0.1762,
+  0.0278,
+  0.9576
+ ],
+ &quot;separation_m&quot;: 0.1091,
+ &quot;eef_projects_into_wrist_image_at_px&quot;: [
+  256.0,
+  428.0
+ ],
+ &quot;eef_depth_in_wrist_camera_m&quot;: 0.097
+}</pre></td><td class='ok'>yes</td></tr>
+</table>
+<figure><h3>The reported end-effector pose, drawn on the picture</h3><img src='figures/identity/robot_state_ee.png' loading='lazy'><figcaption>In the wrist view the reported origin lands between the two visible fingertips, which is where a Panda&#x27;s gripper0_right_eef frame is defined. In the wrong frame (robot0_base, the documented decoy) it would be ~14 m away and project nowhere.</figcaption></figure>
+<h2 id='segment_text'><code>segment_text</code><span class='badge b-ok'>12/12 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>segment_text(&#x27;agentview&#x27;, &#x27;fish&#x27;)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;camera_name&quot;: &quot;agentview&quot;,
+ &quot;text&quot;: &quot;fish&quot;
+}</pre></td><td>5 mask(s), top score 0.9453<pre>{
+ &quot;ok&quot;: true,
+ &quot;n&quot;: 5,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;segmentations&quot;: [
+  {
+   &quot;label&quot;: &quot;fish&quot;,
+   &quot;score&quot;: 0.9453,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    122.6,
+    331.0,
+    148.9,
+    379.1
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 588,
+   &quot;mask_fraction&quot;: 0.00224
+  },
+  {
+   &quot;label&quot;: &quot;fish&quot;,
+   &quot;score&quot;: 0.1074,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    122.8,
+    330.9,
+    148.7,
+    379.1
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 585,
+   &quot;mask_fraction&quot;: 0.00223
+  },
+  {
+   &quot;label&quot;: &quot;fish&quot;,
+   &quot;score&quot;: 0.1016,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    309.8,
+    485.4,
+    329.2,
+    512.7
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 300,
+   &quot;mask_fraction&quot;: 0.00114
+  },
+  {
+   &quot;label&quot;: &quot;fish&quot;,
+   &quot;score&quot;: 0.0752,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    390.3,
+    493.9,
+    398.0,
+    503.7
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 49,
+   &quot;mask_fraction&quot;: 0.00019
+  },
+  {
+   &quot;label&quot;: &quot;fish&quot;,
+   &quot;score&quot;: 0.0588,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    311.9,
+    482.0,
+    395.8,
+    511.4
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 536,
+   &quot;mask_fraction&quot;: 0.00204
+  }
+ ],
+ &quot;diagnostics&quot;: {
+  &quot;prov
+  ... (truncated; full value in out/raw/*/records.json)</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>segment_text(&#x27;agentview&#x27;, &#x27;plate&#x27;)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;camera_name&quot;: &quot;agentview&quot;,
+ &quot;text&quot;: &quot;plate&quot;
+}</pre></td><td>5 mask(s), top score 0.8281<pre>{
+ &quot;ok&quot;: true,
+ &quot;n&quot;: 5,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;segmentations&quot;: [
+  {
+   &quot;label&quot;: &quot;plate&quot;,
+   &quot;score&quot;: 0.8281,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    84.6,
+    323.7,
+    181.1,
+    391.8
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 4449,
+   &quot;mask_fraction&quot;: 0.01697
+  },
+  {
+   &quot;label&quot;: &quot;plate&quot;,
+   &quot;score&quot;: 0.291,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    309.0,
+    486.2,
+    406.5,
+    512.4
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 597,
+   &quot;mask_fraction&quot;: 0.00228
+  },
+  {
+   &quot;label&quot;: &quot;plate&quot;,
+   &quot;score&quot;: 0.1357,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    390.6,
+    494.2,
+    406.5,
+    512.9
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 159,
+   &quot;mask_fraction&quot;: 0.00061
+  },
+  {
+   &quot;label&quot;: &quot;plate&quot;,
+   &quot;score&quot;: 0.1309,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    309.2,
+    485.5,
+    328.3,
+    512.1
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 259,
+   &quot;mask_fraction&quot;: 0.00099
+  },
+  {
+   &quot;label&quot;: &quot;plate&quot;,
+   &quot;score&quot;: 0.0942,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    85.0,
+    323.6,
+    181.1,
+    391.8
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 4434,
+   &quot;mask_fraction&quot;: 0.01691
+  }
+ ],
+ &quot;diagnostics&quot;: {
+  
+  ... (truncated; full value in out/raw/*/records.json)</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>segment_text(&#x27;agentview&#x27;, &#x27;pan&#x27;)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;camera_name&quot;: &quot;agentview&quot;,
+ &quot;text&quot;: &quot;pan&quot;
+}</pre></td><td>5 mask(s), top score 0.0347<pre>{
+ &quot;ok&quot;: true,
+ &quot;n&quot;: 5,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;segmentations&quot;: [
+  {
+   &quot;label&quot;: &quot;pan&quot;,
+   &quot;score&quot;: 0.0347,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    84.6,
+    323.3,
+    181.3,
+    392.0
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 4434,
+   &quot;mask_fraction&quot;: 0.01691
+  },
+  {
+   &quot;label&quot;: &quot;pan&quot;,
+   &quot;score&quot;: 0.02,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    325.2,
+    237.7,
+    372.2,
+    275.1
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 600,
+   &quot;mask_fraction&quot;: 0.00229
+  },
+  {
+   &quot;label&quot;: &quot;pan&quot;,
+   &quot;score&quot;: 0.0166,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    -1.7,
+    53.5,
+    70.0,
+    60.9
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 365,
+   &quot;mask_fraction&quot;: 0.00139
+  },
+  {
+   &quot;label&quot;: &quot;pan&quot;,
+   &quot;score&quot;: 0.0127,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    325.7,
+    237.4,
+    386.0,
+    322.9
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 3358,
+   &quot;mask_fraction&quot;: 0.01281
+  },
+  {
+   &quot;label&quot;: &quot;pan&quot;,
+   &quot;score&quot;: 0.0117,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    310.3,
+    484.5,
+    406.1,
+    512.9
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 592,
+   &quot;mask_fraction&quot;: 0.00226
+  }
+ ],
+ &quot;diagnostics&quot;: {
+  &quot;provider&quot;: &quot;s
+  ... (truncated; full value in out/raw/*/records.json)</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>segment_text(&#x27;agentview&#x27;, &#x27;counter&#x27;)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;camera_name&quot;: &quot;agentview&quot;,
+ &quot;text&quot;: &quot;counter&quot;
+}</pre></td><td>5 mask(s), top score 0.75<pre>{
+ &quot;ok&quot;: true,
+ &quot;n&quot;: 5,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;segmentations&quot;: [
+  {
+   &quot;label&quot;: &quot;counter&quot;,
+   &quot;score&quot;: 0.75,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    0.6,
+    221.7,
+    511.0,
+    444.9
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 28310,
+   &quot;mask_fraction&quot;: 0.10799
+  },
+  {
+   &quot;label&quot;: &quot;counter&quot;,
+   &quot;score&quot;: 0.3887,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    -0.3,
+    254.7,
+    200.6,
+    444.4
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 23522,
+   &quot;mask_fraction&quot;: 0.08973
+  },
+  {
+   &quot;label&quot;: &quot;counter&quot;,
+   &quot;score&quot;: 0.334,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    391.0,
+    221.3,
+    512.9,
+    364.2
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 4968,
+   &quot;mask_fraction&quot;: 0.01895
+  },
+  {
+   &quot;label&quot;: &quot;counter&quot;,
+   &quot;score&quot;: 0.1279,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    448.7,
+    221.4,
+    512.4,
+    361.6
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 4819,
+   &quot;mask_fraction&quot;: 0.01838
+  },
+  {
+   &quot;label&quot;: &quot;counter&quot;,
+   &quot;score&quot;: 0.1084,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    -1.2,
+    7.7,
+    104.8,
+    145.2
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 12365,
+   &quot;mask_fraction&quot;: 0.04717
+  }
+ ],
+ &quot;diagnost
+  ... (truncated; full value in out/raw/*/records.json)</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>segment_text(&#x27;agentview&#x27;, &#x27;cabinet&#x27;)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;camera_name&quot;: &quot;agentview&quot;,
+ &quot;text&quot;: &quot;cabinet&quot;
+}</pre></td><td>5 mask(s), top score 0.8945<pre>{
+ &quot;ok&quot;: true,
+ &quot;n&quot;: 5,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;segmentations&quot;: [
+  {
+   &quot;label&quot;: &quot;cabinet&quot;,
+   &quot;score&quot;: 0.8945,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    -1.0,
+    414.2,
+    209.8,
+    511.8
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 16017,
+   &quot;mask_fraction&quot;: 0.0611
+  },
+  {
+   &quot;label&quot;: &quot;cabinet&quot;,
+   &quot;score&quot;: 0.8477,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    431.8,
+    359.7,
+    513.2,
+    512.8
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 7302,
+   &quot;mask_fraction&quot;: 0.02785
+  },
+  {
+   &quot;label&quot;: &quot;cabinet&quot;,
+   &quot;score&quot;: 0.7422,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    -0.7,
+    -1.3,
+    104.9,
+    145.2
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 13427,
+   &quot;mask_fraction&quot;: 0.05122
+  },
+  {
+   &quot;label&quot;: &quot;cabinet&quot;,
+   &quot;score&quot;: 0.5352,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    484.5,
+    114.4,
+    514.2,
+    138.1
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 274,
+   &quot;mask_fraction&quot;: 0.00105
+  },
+  {
+   &quot;label&quot;: &quot;cabinet&quot;,
+   &quot;score&quot;: 0.2695,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    -1.3,
+    472.5,
+    19.1,
+    513.0
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 491,
+   &quot;mask_fraction&quot;: 0.00187
+  }
+ ],
+ &quot;diagnost
+  ... (truncated; full value in out/raw/*/records.json)</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>segment_text(&#x27;agentview&#x27;, &#x27;drawer&#x27;)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;camera_name&quot;: &quot;agentview&quot;,
+ &quot;text&quot;: &quot;drawer&quot;
+}</pre></td><td>5 mask(s), top score 0.4121<pre>{
+ &quot;ok&quot;: true,
+ &quot;n&quot;: 5,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;segmentations&quot;: [
+  {
+   &quot;label&quot;: &quot;drawer&quot;,
+   &quot;score&quot;: 0.4121,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    204.3,
+    369.1,
+    489.2,
+    444.9
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 4430,
+   &quot;mask_fraction&quot;: 0.0169
+  },
+  {
+   &quot;label&quot;: &quot;drawer&quot;,
+   &quot;score&quot;: 0.3613,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    389.1,
+    463.5,
+    450.5,
+    500.2
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 1395,
+   &quot;mask_fraction&quot;: 0.00532
+  },
+  {
+   &quot;label&quot;: &quot;drawer&quot;,
+   &quot;score&quot;: 0.3281,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    403.1,
+    397.5,
+    477.6,
+    472.0
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 2425,
+   &quot;mask_fraction&quot;: 0.00925
+  },
+  {
+   &quot;label&quot;: &quot;drawer&quot;,
+   &quot;score&quot;: 0.3262,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    206.8,
+    478.8,
+    443.7,
+    512.7
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 1772,
+   &quot;mask_fraction&quot;: 0.00676
+  },
+  {
+   &quot;label&quot;: &quot;drawer&quot;,
+   &quot;score&quot;: 0.293,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    394.1,
+    491.8,
+    439.1,
+    514.9
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 485,
+   &quot;mask_fraction&quot;: 0.00185
+  }
+ ],
+ &quot;diagnostic
+  ... (truncated; full value in out/raw/*/records.json)</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>segment_text(&#x27;agentview&#x27;, &#x27;cabinet handle&#x27;)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;camera_name&quot;: &quot;agentview&quot;,
+ &quot;text&quot;: &quot;cabinet handle&quot;
+}</pre></td><td>5 mask(s), top score 0.918<pre>{
+ &quot;ok&quot;: true,
+ &quot;n&quot;: 5,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;segmentations&quot;: [
+  {
+   &quot;label&quot;: &quot;cabinet handle&quot;,
+   &quot;score&quot;: 0.918,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    0.4,
+    443.8,
+    38.7,
+    506.7
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 561,
+   &quot;mask_fraction&quot;: 0.00214
+  },
+  {
+   &quot;label&quot;: &quot;cabinet handle&quot;,
+   &quot;score&quot;: 0.6875,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    -1.2,
+    53.8,
+    70.1,
+    61.1
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 348,
+   &quot;mask_fraction&quot;: 0.00133
+  },
+  {
+   &quot;label&quot;: &quot;cabinet handle&quot;,
+   &quot;score&quot;: 0.5742,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    432.9,
+    375.2,
+    467.3,
+    401.8
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 424,
+   &quot;mask_fraction&quot;: 0.00162
+  },
+  {
+   &quot;label&quot;: &quot;cabinet handle&quot;,
+   &quot;score&quot;: 0.5352,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    232.6,
+    410.3,
+    311.3,
+    430.3
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 1193,
+   &quot;mask_fraction&quot;: 0.00455
+  },
+  {
+   &quot;label&quot;: &quot;cabinet handle&quot;,
+   &quot;score&quot;: 0.5312,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    232.4,
+    375.8,
+    468.2,
+    430.9
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 1629,
+   &quot;mask_fractio
+  ... (truncated; full value in out/raw/*/records.json)</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>segment_text(&#x27;agentview&#x27;, &#x27;stove&#x27;)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;camera_name&quot;: &quot;agentview&quot;,
+ &quot;text&quot;: &quot;stove&quot;
+}</pre></td><td>5 mask(s), top score 0.7383<pre>{
+ &quot;ok&quot;: true,
+ &quot;n&quot;: 5,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;segmentations&quot;: [
+  {
+   &quot;label&quot;: &quot;stove&quot;,
+   &quot;score&quot;: 0.7383,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    178.6,
+    163.9,
+    493.8,
+    414.7
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 42540,
+   &quot;mask_fraction&quot;: 0.16228
+  },
+  {
+   &quot;label&quot;: &quot;stove&quot;,
+   &quot;score&quot;: 0.2139,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    185.3,
+    246.8,
+    382.8,
+    411.9
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 21729,
+   &quot;mask_fraction&quot;: 0.08289
+  },
+  {
+   &quot;label&quot;: &quot;stove&quot;,
+   &quot;score&quot;: 0.1631,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    227.9,
+    265.1,
+    292.0,
+    305.9
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 1961,
+   &quot;mask_fraction&quot;: 0.00748
+  },
+  {
+   &quot;label&quot;: &quot;stove&quot;,
+   &quot;score&quot;: 0.1523,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    179.0,
+    163.9,
+    493.5,
+    513.5
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 60613,
+   &quot;mask_fraction&quot;: 0.23122
+  },
+  {
+   &quot;label&quot;: &quot;stove&quot;,
+   &quot;score&quot;: 0.1396,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    227.5,
+    264.9,
+    312.1,
+    375.4
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 5483,
+   &quot;mask_fraction&quot;: 0.02092
+  }
+ ],
+ &quot;diagnosti
+  ... (truncated; full value in out/raw/*/records.json)</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>segment_text(&#x27;agentview&#x27;, &#x27;sink&#x27;)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;camera_name&quot;: &quot;agentview&quot;,
+ &quot;text&quot;: &quot;sink&quot;
+}</pre></td><td>5 mask(s), top score 0.7227<pre>{
+ &quot;ok&quot;: true,
+ &quot;n&quot;: 5,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;segmentations&quot;: [
+  {
+   &quot;label&quot;: &quot;sink&quot;,
+   &quot;score&quot;: 0.7227,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    84.7,
+    323.5,
+    181.2,
+    391.7
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 4487,
+   &quot;mask_fraction&quot;: 0.01712
+  },
+  {
+   &quot;label&quot;: &quot;sink&quot;,
+   &quot;score&quot;: 0.1494,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    310.6,
+    486.8,
+    406.5,
+    513.8
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 558,
+   &quot;mask_fraction&quot;: 0.00213
+  },
+  {
+   &quot;label&quot;: &quot;sink&quot;,
+   &quot;score&quot;: 0.0879,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    -0.3,
+    332.4,
+    8.5,
+    341.7
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 78,
+   &quot;mask_fraction&quot;: 0.0003
+  },
+  {
+   &quot;label&quot;: &quot;sink&quot;,
+   &quot;score&quot;: 0.0845,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    85.1,
+    323.5,
+    181.1,
+    391.7
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 4509,
+   &quot;mask_fraction&quot;: 0.0172
+  },
+  {
+   &quot;label&quot;: &quot;sink&quot;,
+   &quot;score&quot;: 0.082,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: [
+    325.5,
+    237.2,
+    372.4,
+    274.5
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 612,
+   &quot;mask_fraction&quot;: 0.00233
+  }
+ ],
+ &quot;diagnostics&quot;: {
+  &quot;provider&quot;:
+  ... (truncated; full value in out/raw/*/records.json)</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>segment_text(&#x27;robot0_eye_in_hand&#x27;, &#x27;plate&#x27;)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;camera_name&quot;: &quot;robot0_eye_in_hand&quot;,
+ &quot;text&quot;: &quot;plate&quot;
+}</pre></td><td>5 mask(s), top score 0.8086<pre>{
+ &quot;ok&quot;: true,
+ &quot;n&quot;: 5,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;segmentations&quot;: [
+  {
+   &quot;label&quot;: &quot;plate&quot;,
+   &quot;score&quot;: 0.8086,
+   &quot;camera_name&quot;: &quot;robot0_eye_in_hand&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_eye_in_hand&quot;,
+   &quot;box_xyxy&quot;: [
+    61.4,
+    51.2,
+    170.3,
+    153.6
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 7531,
+   &quot;mask_fraction&quot;: 0.02873
+  },
+  {
+   &quot;label&quot;: &quot;plate&quot;,
+   &quot;score&quot;: 0.4023,
+   &quot;camera_name&quot;: &quot;robot0_eye_in_hand&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_eye_in_hand&quot;,
+   &quot;box_xyxy&quot;: [
+    119.5,
+    280.4,
+    272.2,
+    380.0
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 3926,
+   &quot;mask_fraction&quot;: 0.01498
+  },
+  {
+   &quot;label&quot;: &quot;plate&quot;,
+   &quot;score&quot;: 0.1553,
+   &quot;camera_name&quot;: &quot;robot0_eye_in_hand&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_eye_in_hand&quot;,
+   &quot;box_xyxy&quot;: [
+    318.9,
+    228.9,
+    429.0,
+    341.1
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 9762,
+   &quot;mask_fraction&quot;: 0.03724
+  },
+  {
+   &quot;label&quot;: &quot;plate&quot;,
+   &quot;score&quot;: 0.1504,
+   &quot;camera_name&quot;: &quot;robot0_eye_in_hand&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_eye_in_hand&quot;,
+   &quot;box_xyxy&quot;: [
+    28.6,
+    282.3,
+    271.7,
+    426.4
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 4213,
+   &quot;mask_fraction&quot;: 0.01607
+  },
+  {
+   &quot;label&quot;: &quot;plate&quot;,
+   &quot;score&quot;: 0.1445,
+   &quot;camera_name&quot;: &quot;robot0_eye_in_hand&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_eye_in_hand&quot;,
+   &quot;box_xyxy&quot;: [
+    202.8,
+    156.9,
+    295.5,
+    247.5
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 6483,
+   &quot;mask_fraction&quot;: 0.0
+  ... (truncated; full value in out/raw/*/records.json)</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>segment_text(&#x27;robot0_eye_in_hand&#x27;, &#x27;fish&#x27;)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;camera_name&quot;: &quot;robot0_eye_in_hand&quot;,
+ &quot;text&quot;: &quot;fish&quot;
+}</pre></td><td>5 mask(s), top score 0.9414<pre>{
+ &quot;ok&quot;: true,
+ &quot;n&quot;: 5,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;segmentations&quot;: [
+  {
+   &quot;label&quot;: &quot;fish&quot;,
+   &quot;score&quot;: 0.9414,
+   &quot;camera_name&quot;: &quot;robot0_eye_in_hand&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_eye_in_hand&quot;,
+   &quot;box_xyxy&quot;: [
+    92.9,
+    66.0,
+    130.4,
+    141.8
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 1102,
+   &quot;mask_fraction&quot;: 0.0042
+  },
+  {
+   &quot;label&quot;: &quot;fish&quot;,
+   &quot;score&quot;: 0.1016,
+   &quot;camera_name&quot;: &quot;robot0_eye_in_hand&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_eye_in_hand&quot;,
+   &quot;box_xyxy&quot;: [
+    92.9,
+    65.8,
+    130.1,
+    141.9
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 1089,
+   &quot;mask_fraction&quot;: 0.00415
+  },
+  {
+   &quot;label&quot;: &quot;fish&quot;,
+   &quot;score&quot;: 0.0649,
+   &quot;camera_name&quot;: &quot;robot0_eye_in_hand&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_eye_in_hand&quot;,
+   &quot;box_xyxy&quot;: [
+    92.5,
+    66.0,
+    130.1,
+    141.9
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 1087,
+   &quot;mask_fraction&quot;: 0.00415
+  },
+  {
+   &quot;label&quot;: &quot;fish&quot;,
+   &quot;score&quot;: 0.0493,
+   &quot;camera_name&quot;: &quot;robot0_eye_in_hand&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_eye_in_hand&quot;,
+   &quot;box_xyxy&quot;: [
+    406.3,
+    129.8,
+    508.1,
+    243.0
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 9373,
+   &quot;mask_fraction&quot;: 0.03576
+  },
+  {
+   &quot;label&quot;: &quot;fish&quot;,
+   &quot;score&quot;: 0.0457,
+   &quot;camera_name&quot;: &quot;robot0_eye_in_hand&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_eye_in_hand&quot;,
+   &quot;box_xyxy&quot;: [
+    18.7,
+    -1.0,
+    47.5,
+    8.1
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 161,
+   &quot;mask_fraction&quot;: 0.00061
+  }
+ ],
+ &quot;
+  ... (truncated; full value in out/raw/*/records.json)</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>segment_text(&#x27;robot0_eye_in_hand&#x27;, &#x27;counter&#x27;)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;camera_name&quot;: &quot;robot0_eye_in_hand&quot;,
+ &quot;text&quot;: &quot;counter&quot;
+}</pre></td><td>5 mask(s), top score 0.3984<pre>{
+ &quot;ok&quot;: true,
+ &quot;n&quot;: 5,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;segmentations&quot;: [
+  {
+   &quot;label&quot;: &quot;counter&quot;,
+   &quot;score&quot;: 0.3984,
+   &quot;camera_name&quot;: &quot;robot0_eye_in_hand&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_eye_in_hand&quot;,
+   &quot;box_xyxy&quot;: [
+    -0.5,
+    -1.2,
+    279.8,
+    204.4
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 27463,
+   &quot;mask_fraction&quot;: 0.10476
+  },
+  {
+   &quot;label&quot;: &quot;counter&quot;,
+   &quot;score&quot;: 0.3984,
+   &quot;camera_name&quot;: &quot;robot0_eye_in_hand&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_eye_in_hand&quot;,
+   &quot;box_xyxy&quot;: [
+    2.5,
+    -1.2,
+    512.9,
+    428.1
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 36300,
+   &quot;mask_fraction&quot;: 0.13847
+  },
+  {
+   &quot;label&quot;: &quot;counter&quot;,
+   &quot;score&quot;: 0.2637,
+   &quot;camera_name&quot;: &quot;robot0_eye_in_hand&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_eye_in_hand&quot;,
+   &quot;box_xyxy&quot;: [
+    419.9,
+    237.3,
+    515.2,
+    429.2
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 9217,
+   &quot;mask_fraction&quot;: 0.03516
+  },
+  {
+   &quot;label&quot;: &quot;counter&quot;,
+   &quot;score&quot;: 0.1484,
+   &quot;camera_name&quot;: &quot;robot0_eye_in_hand&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_eye_in_hand&quot;,
+   &quot;box_xyxy&quot;: [
+    129.9,
+    -0.2,
+    489.5,
+    401.1
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 69671,
+   &quot;mask_fraction&quot;: 0.26577
+  },
+  {
+   &quot;label&quot;: &quot;counter&quot;,
+   &quot;score&quot;: 0.1055,
+   &quot;camera_name&quot;: &quot;robot0_eye_in_hand&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_eye_in_hand&quot;,
+   &quot;box_xyxy&quot;: [
+    5.5,
+    429.3,
+    510.0,
+    508.0
+   ],
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 37290,
+   &quot;mask_fract
+  ... (truncated; full value in out/raw/*/records.json)</pre></td><td class='ok'>yes</td></tr>
+</table>
+<figure><h3>Text prompts on agentview</h3><img src='figures/perception/segment_text_agentview.png' loading='lazy'><figcaption>Input: the RGB frame above plus the quoted prompt. Output: the highest-scoring mask (tinted, outlined) and its box and score.</figcaption></figure>
+<figure><h3>Text prompts on robot0_eye_in_hand</h3><img src='figures/perception/segment_text_eye_in_hand.png' loading='lazy'><figcaption>Input: the RGB frame above plus the quoted prompt. Output: the highest-scoring mask (tinted, outlined) and its box and score.</figcaption></figure>
+<figure><h3>All ranked masks for one prompt (&#x27;fish&#x27;)</h3><img src='figures/perception/segment_text_ranks.png' loading='lazy'><figcaption>segment_text returns a ranked list; only index 0 is usually meaningful here.</figcaption></figure>
+<h2 id='segment_points'><code>segment_points</code><span class='badge b-ok'>3/3 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>segment_points(&#x27;agentview&#x27;, [133.07993197278913, 354.36054421768705])</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;camera_name&quot;: &quot;agentview&quot;,
+ &quot;points_px&quot;: [
+  133.07993197278913,
+  354.36054421768705
+ ],
+ &quot;why&quot;: &quot;centroid of the fish mask&quot;
+}</pre></td><td>3 mask(s)<pre>{
+ &quot;ok&quot;: true,
+ &quot;n&quot;: 3,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;segmentations&quot;: [
+  {
+   &quot;label&quot;: &quot;point(133.08, 354.361)&quot;,
+   &quot;score&quot;: 0.918,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: null,
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 605,
+   &quot;mask_fraction&quot;: 0.00231
+  },
+  {
+   &quot;label&quot;: &quot;point(133.08, 354.361)&quot;,
+   &quot;score&quot;: 0.8203,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: null,
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 511,
+   &quot;mask_fraction&quot;: 0.00195
+  },
+  {
+   &quot;label&quot;: &quot;point(133.08, 354.361)&quot;,
+   &quot;score&quot;: 0.1426,
+   &quot;camera_name&quot;: &quot;agentview&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+   &quot;box_xyxy&quot;: null,
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 4932,
+   &quot;mask_fraction&quot;: 0.01881
+  }
+ ]
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>segment_points(&#x27;robot0_eye_in_hand&#x27;, [256.0, 256.0])</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;camera_name&quot;: &quot;robot0_eye_in_hand&quot;,
+ &quot;points_px&quot;: [
+  256.0,
+  256.0
+ ],
+ &quot;why&quot;: &quot;image centre&quot;
+}</pre></td><td>3 mask(s)<pre>{
+ &quot;ok&quot;: true,
+ &quot;n&quot;: 3,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;segmentations&quot;: [
+  {
+   &quot;label&quot;: &quot;point(256, 256)&quot;,
+   &quot;score&quot;: 0.9141,
+   &quot;camera_name&quot;: &quot;robot0_eye_in_hand&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_eye_in_hand&quot;,
+   &quot;box_xyxy&quot;: null,
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 75003,
+   &quot;mask_fraction&quot;: 0.28611
+  },
+  {
+   &quot;label&quot;: &quot;point(256, 256)&quot;,
+   &quot;score&quot;: 0.9023,
+   &quot;camera_name&quot;: &quot;robot0_eye_in_hand&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_eye_in_hand&quot;,
+   &quot;box_xyxy&quot;: null,
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 88351,
+   &quot;mask_fraction&quot;: 0.33703
+  },
+  {
+   &quot;label&quot;: &quot;point(256, 256)&quot;,
+   &quot;score&quot;: 0.2188,
+   &quot;camera_name&quot;: &quot;robot0_eye_in_hand&quot;,
+   &quot;frame&quot;: &quot;camera/robot0_eye_in_hand&quot;,
+   &quot;box_xyxy&quot;: null,
+   &quot;mask_shape&quot;: [
+    512,
+    512
+   ],
+   &quot;mask_pixels&quot;: 11568,
+   &quot;mask_fraction&quot;: 0.04413
+  }
+ ]
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>segment_points (two points -- expected refusal)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;camera_name&quot;: &quot;agentview&quot;,
+ &quot;points_px&quot;: [
+  [
+   200,
+   200
+  ],
+  [
+   300,
+   300
+  ]
+ ]
+}</pre></td><td>ErrorCode.UNSUPPORTED: the SAM3 service wire format supports exactly one finite point prompt<pre>{
+ &quot;ok&quot;: false,
+ &quot;error&quot;: &quot;ErrorCode.UNSUPPORTED: the SAM3 service wire format supports exactly one finite point prompt&quot;
+}</pre></td><td class='ok'>yes</td></tr>
+</table>
+<figure><h3>One point prompt on agentview</h3><img src='figures/perception/segment_points_agentview.png' loading='lazy'><figcaption>Input: a single (x, y) pixel, marked with a star. Output: three candidate masks (whole object / part / region), ranked by the service&#x27;s own score.</figcaption></figure>
+<figure><h3>One point prompt on robot0_eye_in_hand</h3><img src='figures/perception/segment_points_eye_in_hand.png' loading='lazy'><figcaption>Input: a single (x, y) pixel, marked with a star. Output: three candidate masks (whole object / part / region), ranked by the service&#x27;s own score.</figcaption></figure>
+<h2 id='mask_to_point_cloud'><code>mask_to_point_cloud</code><span class='badge b-ok'>9/9 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>calibration round trip (agentview)</b><br><span style='color:#8a9199'>stage identity</span></td><td><pre>{
+ &quot;mask&quot;: &quot;every valid depth pixel&quot;,
+ &quot;camera_name&quot;: &quot;agentview&quot;,
+ &quot;target_frame&quot;: &quot;robot0_link0&quot;
+}</pre></td><td>max reprojection error 2.80e-13 px<pre>{
+ &quot;n_points&quot;: 262144,
+ &quot;reprojection_residual_px&quot;: {
+  &quot;mean&quot;: 0.0,
+  &quot;p99&quot;: 0.0,
+  &quot;max&quot;: 0.0
+ },
+ &quot;cloud&quot;: {
+  &quot;n_points&quot;: 262144,
+  &quot;frame&quot;: &quot;robot0_link0&quot;,
+  &quot;centroid_m&quot;: [
+   0.4238,
+   0.1812,
+   0.4348
+  ],
+  &quot;aabb_min_m&quot;: [
+   -0.1048,
+   -0.9887,
+   -0.6972
+  ],
+  &quot;aabb_max_m&quot;: [
+   0.8439,
+   0.8669,
+   1.0294
+  ],
+  &quot;has_colors&quot;: true
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>calibration round trip (robot0_eye_in_hand)</b><br><span style='color:#8a9199'>stage identity</span></td><td><pre>{
+ &quot;mask&quot;: &quot;every valid depth pixel&quot;,
+ &quot;camera_name&quot;: &quot;robot0_eye_in_hand&quot;,
+ &quot;target_frame&quot;: &quot;robot0_link0&quot;
+}</pre></td><td>max reprojection error 9.32e-13 px<pre>{
+ &quot;n_points&quot;: 262144,
+ &quot;reprojection_residual_px&quot;: {
+  &quot;mean&quot;: 0.0,
+  &quot;p99&quot;: 0.0,
+  &quot;max&quot;: 0.0
+ },
+ &quot;cloud&quot;: {
+  &quot;n_points&quot;: 262144,
+  &quot;frame&quot;: &quot;robot0_link0&quot;,
+  &quot;centroid_m&quot;: [
+   0.2708,
+   0.1142,
+   0.2136
+  ],
+  &quot;aabb_min_m&quot;: [
+   -0.992,
+   -1.2392,
+   -0.6998
+  ],
+  &quot;aabb_max_m&quot;: [
+   0.8068,
+   1.4663,
+   0.915
+  ],
+  &quot;has_colors&quot;: true
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>mask_to_point_cloud (default frame -- expected to raise)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;mask&quot;: &quot;fish&quot;,
+ &quot;camera_name&quot;: &quot;agentview&quot;,
+ &quot;target_frame&quot;: &quot;(default)&quot;
+}</pre></td><td>ValueError: camera pose only defines &#x27;camera/robot0_agentview_left&#x27; to &#x27;robot0_link0&#x27;, not &#x27;robot_base&#x27;<pre>{
+ &quot;outcome&quot;: &quot;ValueError: camera pose only defines &#x27;camera/robot0_agentview_left&#x27; to &#x27;robot0_link0&#x27;, not &#x27;robot_base&#x27;&quot;
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>mask_to_point_cloud(&#x27;fish&#x27;)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;mask&quot;: &quot;segment_text(&#x27;fish&#x27;)[0]&quot;,
+ &quot;camera_name&quot;: &quot;agentview&quot;,
+ &quot;target_frame&quot;: &quot;robot0_link0&quot;
+}</pre></td><td>588 pts, centroid [0.343, 0.478, 0.247], 100.0% reproject inside the mask<pre>{
+ &quot;cloud&quot;: {
+  &quot;n_points&quot;: 588,
+  &quot;frame&quot;: &quot;robot0_link0&quot;,
+  &quot;centroid_m&quot;: [
+   0.3432,
+   0.4776,
+   0.2475
+  ],
+  &quot;aabb_min_m&quot;: [
+   0.2696,
+   0.4428,
+   0.2232
+  ],
+  &quot;aabb_max_m&quot;: [
+   0.4242,
+   0.5073,
+   0.2615
+  ],
+  &quot;has_colors&quot;: true
+ },
+ &quot;mask_pixels&quot;: 588,
+ &quot;reprojects_inside_mask_fraction&quot;: 1.0
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>mask_to_point_cloud(&#x27;plate&#x27;)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;mask&quot;: &quot;segment_text(&#x27;plate&#x27;)[0]&quot;,
+ &quot;camera_name&quot;: &quot;agentview&quot;,
+ &quot;target_frame&quot;: &quot;robot0_link0&quot;
+}</pre></td><td>4449 pts, centroid [0.352, 0.481, 0.23], 100.0% reproject inside the mask<pre>{
+ &quot;cloud&quot;: {
+  &quot;n_points&quot;: 4449,
+  &quot;frame&quot;: &quot;robot0_link0&quot;,
+  &quot;centroid_m&quot;: [
+   0.3518,
+   0.4815,
+   0.2305
+  ],
+  &quot;aabb_min_m&quot;: [
+   0.2392,
+   0.3615,
+   0.2217
+  ],
+  &quot;aabb_max_m&quot;: [
+   0.4736,
+   0.5961,
+   0.25
+  ],
+  &quot;has_colors&quot;: true
+ },
+ &quot;mask_pixels&quot;: 4449,
+ &quot;reprojects_inside_mask_fraction&quot;: 1.0
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>mask_to_point_cloud(&#x27;pan&#x27;)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;mask&quot;: &quot;segment_text(&#x27;pan&#x27;)[0]&quot;,
+ &quot;camera_name&quot;: &quot;agentview&quot;,
+ &quot;target_frame&quot;: &quot;robot0_link0&quot;
+}</pre></td><td>4434 pts, centroid [0.352, 0.481, 0.231], 100.0% reproject inside the mask<pre>{
+ &quot;cloud&quot;: {
+  &quot;n_points&quot;: 4434,
+  &quot;frame&quot;: &quot;robot0_link0&quot;,
+  &quot;centroid_m&quot;: [
+   0.3521,
+   0.4815,
+   0.2306
+  ],
+  &quot;aabb_min_m&quot;: [
+   0.2392,
+   0.3615,
+   0.2217
+  ],
+  &quot;aabb_max_m&quot;: [
+   0.4736,
+   0.5958,
+   0.2556
+  ],
+  &quot;has_colors&quot;: true
+ },
+ &quot;mask_pixels&quot;: 4434,
+ &quot;reprojects_inside_mask_fraction&quot;: 1.0
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>mask_to_point_cloud(&#x27;counter&#x27;)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;mask&quot;: &quot;segment_text(&#x27;counter&#x27;)[0]&quot;,
+ &quot;camera_name&quot;: &quot;agentview&quot;,
+ &quot;target_frame&quot;: &quot;robot0_link0&quot;
+}</pre></td><td>28310 pts, centroid [0.426, 0.367, 0.221], 100.0% reproject inside the mask<pre>{
+ &quot;cloud&quot;: {
+  &quot;n_points&quot;: 28310,
+  &quot;frame&quot;: &quot;robot0_link0&quot;,
+  &quot;centroid_m&quot;: [
+   0.4264,
+   0.3666,
+   0.2209
+  ],
+  &quot;aabb_min_m&quot;: [
+   0.1807,
+   -0.9767,
+   0.0994
+  ],
+  &quot;aabb_max_m&quot;: [
+   0.8332,
+   0.8176,
+   0.236
+  ],
+  &quot;has_colors&quot;: true
+ },
+ &quot;mask_pixels&quot;: 28310,
+ &quot;reprojects_inside_mask_fraction&quot;: 1.0
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>cross-camera agreement (&#x27;fish&#x27;)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;mask&quot;: &quot;fish&quot;,
+ &quot;camera_name&quot;: &quot;agentview vs robot0_eye_in_hand&quot;,
+ &quot;target_frame&quot;: &quot;robot0_link0&quot;
+}</pre></td><td>the two cameras place the fish 5 mm apart in robot0_link0<pre>{
+ &quot;agentview_centre_m&quot;: [
+  0.3484,
+  0.4779,
+  0.2355
+ ],
+ &quot;wrist_centre_m&quot;: [
+  0.3505,
+  0.481,
+  0.2328
+ ],
+ &quot;separation_m&quot;: 0.0046,
+ &quot;agentview_extents_m&quot;: [
+  0.1614,
+  0.0455,
+  0.0402
+ ],
+ &quot;wrist_extents_m&quot;: [
+  0.1646,
+  0.0455,
+  0.0384
+ ]
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>cross-camera agreement (&#x27;plate&#x27;)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;mask&quot;: &quot;plate&quot;,
+ &quot;camera_name&quot;: &quot;agentview vs robot0_eye_in_hand&quot;,
+ &quot;target_frame&quot;: &quot;robot0_link0&quot;
+}</pre></td><td>the two cameras place the plate 1 mm apart in robot0_link0<pre>{
+ &quot;agentview_centre_m&quot;: [
+  0.3562,
+  0.4791,
+  0.2358
+ ],
+ &quot;wrist_centre_m&quot;: [
+  0.3564,
+  0.4796,
+  0.2359
+ ],
+ &quot;separation_m&quot;: 0.0006,
+ &quot;agentview_extents_m&quot;: [
+  0.2347,
+  0.2344,
+  0.0287
+ ],
+ &quot;wrist_extents_m&quot;: [
+  0.2349,
+  0.2345,
+  0.0321
+ ]
+}</pre></td><td class='ok'>yes</td></tr>
+</table>
+<figure><h3>Calibration round trip is exact</h3><img src='figures/identity/reprojection.png' loading='lazy'><figcaption>Back-projection and reprojection agree to ~1e-13 px, so the published intrinsics and extrinsics are internally consistent to float precision.</figcaption></figure>
+<figure><h3>Cross-camera agreement on the fish</h3><img src='figures/perception/cross_camera.gif' loading='lazy'><figcaption>Independent back-projections from two cameras with different intrinsics and extrinsics land on top of each other -- the check a self-consistent reprojection cannot make.</figcaption></figure>
+<h2 id='crop_point_cloud'><code>crop_point_cloud</code><span class='badge b-ok'>2/2 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>crop_point_cloud</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;point_cloud&quot;: &quot;counter&quot;,
+ &quot;lower_xyz&quot;: [
+  0.1764,
+  0.1166,
+  -0.0291
+ ],
+ &quot;upper_xyz&quot;: [
+  0.6764,
+  0.6166,
+  0.4709
+ ]
+}</pre></td><td>28310 -&gt; 10881 points<pre>{
+ &quot;input&quot;: {
+  &quot;n_points&quot;: 28310,
+  &quot;frame&quot;: &quot;robot0_link0&quot;,
+  &quot;centroid_m&quot;: [
+   0.4264,
+   0.3666,
+   0.2209
+  ],
+  &quot;aabb_min_m&quot;: [
+   0.1807,
+   -0.9767,
+   0.0994
+  ],
+  &quot;aabb_max_m&quot;: [
+   0.8332,
+   0.8176,
+   0.236
+  ],
+  &quot;has_colors&quot;: true
+ },
+ &quot;output&quot;: {
+  &quot;n_points&quot;: 10881,
+  &quot;frame&quot;: &quot;robot0_link0&quot;,
+  &quot;centroid_m&quot;: [
+   0.3751,
+   0.4704,
+   0.2201
+  ],
+  &quot;aabb_min_m&quot;: [
+   0.1809,
+   0.3247,
+   0.0994
+  ],
+  &quot;aabb_max_m&quot;: [
+   0.6763,
+   0.6166,
+   0.236
+  ],
+  &quot;has_colors&quot;: true
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>crop_point_cloud (empty result -- expected to raise)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;point_cloud&quot;: &quot;counter&quot;,
+ &quot;lower_xyz&quot;: [
+  99,
+  99,
+  99
+ ],
+ &quot;upper_xyz&quot;: [
+  100,
+  100,
+  100
+ ]
+}</pre></td><td>ValueError: point cloud contains no points inside the requested bounds<pre>{
+ &quot;outcome&quot;: &quot;ValueError: point cloud contains no points inside the requested bounds&quot;
+}</pre></td><td class='ok'>yes</td></tr>
+</table>
+<figure><h3>Axis-aligned crop of the counter cloud</h3><img src='figures/perception/crop.png' loading='lazy'><figcaption>Red rectangle is the requested XY range; only points inside all three ranges survive.</figcaption></figure>
+<h2 id='estimate_geometry'><code>estimate_geometry</code><span class='badge b-ok'>4/4 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>estimate_geometry(&#x27;fish&#x27;)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;point_cloud&quot;: &quot;fish (588 pts, robot0_link0)&quot;
+}</pre></td><td>extents [0.161, 0.046, 0.04] m, centre [0.348, 0.478, 0.235]<pre>{
+ &quot;pose&quot;: {
+  &quot;position_m&quot;: [
+   0.34841,
+   0.47787,
+   0.23546
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.98743,
+   0.04876,
+   -0.06839,
+   0.13388
+  ],
+  &quot;yaw_rad&quot;: 0.26365,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;extents_m&quot;: [
+  0.1614,
+  0.0455,
+  0.0402
+ ],
+ &quot;point_count&quot;: 588
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>estimate_geometry(&#x27;plate&#x27;)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;point_cloud&quot;: &quot;plate (4449 pts, robot0_link0)&quot;
+}</pre></td><td>extents [0.235, 0.234, 0.029] m, centre [0.356, 0.479, 0.236]<pre>{
+ &quot;pose&quot;: {
+  &quot;position_m&quot;: [
+   0.35622,
+   0.47907,
+   0.23577
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.00134,
+   -0.59647,
+   -0.80264,
+   0.00067
+  ],
+  &quot;yaw_rad&quot;: 1.86341,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;extents_m&quot;: [
+  0.2347,
+  0.2344,
+  0.0287
+ ],
+ &quot;point_count&quot;: 4449
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>estimate_geometry(&#x27;pan&#x27;)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;point_cloud&quot;: &quot;pan (4434 pts, robot0_link0)&quot;
+}</pre></td><td>extents [0.237, 0.235, 0.034] m, centre [0.357, 0.478, 0.239]<pre>{
+ &quot;pose&quot;: {
+  &quot;position_m&quot;: [
+   0.35669,
+   0.47789,
+   0.23861
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.00114,
+   -0.60613,
+   -0.79536,
+   0.00054
+  ],
+  &quot;yaw_rad&quot;: 1.83921,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;extents_m&quot;: [
+  0.2372,
+  0.2347,
+  0.0343
+ ],
+ &quot;point_count&quot;: 4434
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>estimate_geometry(&#x27;counter&#x27;)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;point_cloud&quot;: &quot;counter (28310 pts, robot0_link0)&quot;
+}</pre></td><td>extents [1.81, 0.689, 0.135] m, centre [0.518, -0.085, 0.169]<pre>{
+ &quot;pose&quot;: {
+  &quot;position_m&quot;: [
+   0.51814,
+   -0.08532,
+   0.16939
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.00328,
+   0.69017,
+   0.72364,
+   0.00272
+  ],
+  &quot;yaw_rad&quot;: 1.61814,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;extents_m&quot;: [
+  1.8102,
+  0.6892,
+  0.1349
+ ],
+ &quot;point_count&quot;: 28310
+}</pre></td><td class='ok'>yes</td></tr>
+</table>
+<figure><h3>Per-object clouds with their estimated oriented bounding boxes</h3><img src='figures/perception/clouds_obb.gif' loading='lazy'><figcaption>Each mask back-projected to robot0_link0, with the PCA box estimate_geometry returns drawn around it.</figcaption></figure>
+<figure><h3>The same boxes drawn back onto the picture</h3><img src='figures/perception/obb_overlay.png' loading='lazy'><figcaption>A 3D box is hard to judge in a scatter plot; projected through the published calibration it either sits on the object or it does not.</figcaption></figure>
+<h2 id='localize_object'><code>localize_object</code><span class='badge b-ok'>4/4 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>localize_object(&#x27;fish&#x27;)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;query&quot;: &quot;fish&quot;,
+ &quot;camera_name&quot;: &quot;(default agentview)&quot;,
+ &quot;target_frame&quot;: &quot;(default)&quot;
+}</pre></td><td>centre [0.348, 0.478, 0.235] m (robot0_link0), extents [0.161, 0.046, 0.04] m<pre>{
+ &quot;segmentation&quot;: {
+  &quot;label&quot;: &quot;fish&quot;,
+  &quot;score&quot;: 0.9453,
+  &quot;camera_name&quot;: &quot;agentview&quot;,
+  &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+  &quot;box_xyxy&quot;: [
+   122.6,
+   331.0,
+   148.9,
+   379.1
+  ],
+  &quot;mask_shape&quot;: [
+   512,
+   512
+  ],
+  &quot;mask_pixels&quot;: 588,
+  &quot;mask_fraction&quot;: 0.00224
+ },
+ &quot;point_cloud&quot;: {
+  &quot;n_points&quot;: 588,
+  &quot;frame&quot;: &quot;robot0_link0&quot;,
+  &quot;centroid_m&quot;: [
+   0.3432,
+   0.4776,
+   0.2475
+  ],
+  &quot;aabb_min_m&quot;: [
+   0.2696,
+   0.4428,
+   0.2232
+  ],
+  &quot;aabb_max_m&quot;: [
+   0.4242,
+   0.5073,
+   0.2615
+  ],
+  &quot;has_colors&quot;: true
+ },
+ &quot;geometry&quot;: {
+  &quot;pose&quot;: {
+   &quot;position_m&quot;: [
+    0.34841,
+    0.47787,
+    0.23546
+   ],
+   &quot;quaternion_wxyz&quot;: [
+    0.98743,
+    0.04876,
+    -0.06839,
+    0.13388
+   ],
+   &quot;yaw_rad&quot;: 0.26365,
+   &quot;frame&quot;: &quot;robot0_link0&quot;
+  },
+  &quot;extents_m&quot;: [
+   0.1614,
+   0.0455,
+   0.0402
+  ],
+  &quot;point_count&quot;: 588
+ },
+ &quot;obb_centre_reprojects_to_px&quot;: [
+  133.6,
+  356.1
+ ]
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>localize_object(&#x27;pan&#x27;)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;query&quot;: &quot;pan&quot;,
+ &quot;camera_name&quot;: &quot;(default agentview)&quot;,
+ &quot;target_frame&quot;: &quot;(default)&quot;
+}</pre></td><td>centre [0.357, 0.478, 0.239] m (robot0_link0), extents [0.237, 0.235, 0.034] m<pre>{
+ &quot;segmentation&quot;: {
+  &quot;label&quot;: &quot;pan&quot;,
+  &quot;score&quot;: 0.0347,
+  &quot;camera_name&quot;: &quot;agentview&quot;,
+  &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+  &quot;box_xyxy&quot;: [
+   84.6,
+   323.3,
+   181.3,
+   392.0
+  ],
+  &quot;mask_shape&quot;: [
+   512,
+   512
+  ],
+  &quot;mask_pixels&quot;: 4434,
+  &quot;mask_fraction&quot;: 0.01691
+ },
+ &quot;point_cloud&quot;: {
+  &quot;n_points&quot;: 4434,
+  &quot;frame&quot;: &quot;robot0_link0&quot;,
+  &quot;centroid_m&quot;: [
+   0.3521,
+   0.4815,
+   0.2306
+  ],
+  &quot;aabb_min_m&quot;: [
+   0.2392,
+   0.3615,
+   0.2217
+  ],
+  &quot;aabb_max_m&quot;: [
+   0.4736,
+   0.5958,
+   0.2556
+  ],
+  &quot;has_colors&quot;: true
+ },
+ &quot;geometry&quot;: {
+  &quot;pose&quot;: {
+   &quot;position_m&quot;: [
+    0.35669,
+    0.47789,
+    0.23861
+   ],
+   &quot;quaternion_wxyz&quot;: [
+    0.00114,
+    -0.60613,
+    -0.79536,
+    0.00054
+   ],
+   &quot;yaw_rad&quot;: 1.83921,
+   &quot;frame&quot;: &quot;robot0_link0&quot;
+  },
+  &quot;extents_m&quot;: [
+   0.2372,
+   0.2347,
+   0.0343
+  ],
+  &quot;point_count&quot;: 4434
+ },
+ &quot;obb_centre_reprojects_to_px&quot;: [
+  133.5,
+  352.8
+ ]
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>localize_object(&#x27;plate&#x27;)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;query&quot;: &quot;plate&quot;,
+ &quot;camera_name&quot;: &quot;(default agentview)&quot;,
+ &quot;target_frame&quot;: &quot;(default)&quot;
+}</pre></td><td>centre [0.356, 0.479, 0.236] m (robot0_link0), extents [0.235, 0.234, 0.029] m<pre>{
+ &quot;segmentation&quot;: {
+  &quot;label&quot;: &quot;plate&quot;,
+  &quot;score&quot;: 0.8281,
+  &quot;camera_name&quot;: &quot;agentview&quot;,
+  &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+  &quot;box_xyxy&quot;: [
+   84.6,
+   323.7,
+   181.1,
+   391.8
+  ],
+  &quot;mask_shape&quot;: [
+   512,
+   512
+  ],
+  &quot;mask_pixels&quot;: 4449,
+  &quot;mask_fraction&quot;: 0.01697
+ },
+ &quot;point_cloud&quot;: {
+  &quot;n_points&quot;: 4449,
+  &quot;frame&quot;: &quot;robot0_link0&quot;,
+  &quot;centroid_m&quot;: [
+   0.3518,
+   0.4815,
+   0.2305
+  ],
+  &quot;aabb_min_m&quot;: [
+   0.2392,
+   0.3615,
+   0.2217
+  ],
+  &quot;aabb_max_m&quot;: [
+   0.4736,
+   0.5961,
+   0.25
+  ],
+  &quot;has_colors&quot;: true
+ },
+ &quot;geometry&quot;: {
+  &quot;pose&quot;: {
+   &quot;position_m&quot;: [
+    0.35622,
+    0.47907,
+    0.23577
+   ],
+   &quot;quaternion_wxyz&quot;: [
+    0.00134,
+    -0.59647,
+    -0.80264,
+    0.00067
+   ],
+   &quot;yaw_rad&quot;: 1.86341,
+   &quot;frame&quot;: &quot;robot0_link0&quot;
+  },
+  &quot;extents_m&quot;: [
+   0.2347,
+   0.2344,
+   0.0287
+  ],
+  &quot;point_count&quot;: 4449
+ },
+ &quot;obb_centre_reprojects_to_px&quot;: [
+  133.2,
+  353.8
+ ]
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>localize_object(&#x27;handle of the cabinet&#x27;)</b><br><span style='color:#8a9199'>stage perception</span></td><td><pre>{
+ &quot;query&quot;: &quot;handle of the cabinet&quot;,
+ &quot;camera_name&quot;: &quot;(default agentview)&quot;,
+ &quot;target_frame&quot;: &quot;(default)&quot;
+}</pre></td><td>centre [0.233, 0.783, -0.016] m (robot0_link0), extents [0.28, 0.057, 0.047] m<pre>{
+ &quot;segmentation&quot;: {
+  &quot;label&quot;: &quot;handle of the cabinet&quot;,
+  &quot;score&quot;: 0.9492,
+  &quot;camera_name&quot;: &quot;agentview&quot;,
+  &quot;frame&quot;: &quot;camera/robot0_agentview_left&quot;,
+  &quot;box_xyxy&quot;: [
+   0.4,
+   444.0,
+   38.8,
+   506.8
+  ],
+  &quot;mask_shape&quot;: [
+   512,
+   512
+  ],
+  &quot;mask_pixels&quot;: 563,
+  &quot;mask_fraction&quot;: 0.00215
+ },
+ &quot;point_cloud&quot;: {
+  &quot;n_points&quot;: 563,
+  &quot;frame&quot;: &quot;robot0_link0&quot;,
+  &quot;centroid_m&quot;: [
+   0.2179,
+   0.7768,
+   0.0204
+  ],
+  &quot;aabb_min_m&quot;: [
+   0.2069,
+   0.7607,
+   -0.1556
+  ],
+  &quot;aabb_max_m&quot;: [
+   0.2531,
+   0.8123,
+   0.1245
+  ],
+  &quot;has_colors&quot;: true
+ },
+ &quot;geometry&quot;: {
+  &quot;pose&quot;: {
+   &quot;position_m&quot;: [
+    0.23285,
+    0.78275,
+    -0.01562
+   ],
+   &quot;quaternion_wxyz&quot;: [
+    0.54992,
+    -0.43038,
+    -0.56448,
+    -0.44015
+   ],
+   &quot;yaw_rad&quot;: 3.06972,
+   &quot;frame&quot;: &quot;robot0_link0&quot;
+  },
+  &quot;extents_m&quot;: [
+   0.2804,
+   0.0567,
+   0.0466
+  ],
+  &quot;point_count&quot;: 563
+ },
+ &quot;obb_centre_reprojects_to_px&quot;: [
+  19.6,
+  479.4
+ ]
+}</pre></td><td class='ok'>yes</td></tr>
+</table>
+<figure><h3>One call per query: mask, cloud and box together</h3><img src='figures/perception/localize.png' loading='lazy'><figcaption>White wireframe is the returned geometry, white cross its centre, reprojected into the image. The centre is what a program would reach for.</figcaption></figure>
+<h2 id='generate_grasps'><code>generate_grasps</code><span class='badge b-part'>7/9 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>generate_grasps repeated on an identical mask</b><br><span style='color:#8a9199'>stage graspexec</span></td><td><pre>{
+ &quot;camera_name&quot;: &quot;agentview&quot;,
+ &quot;mask&quot;: &quot;fish&quot;,
+ &quot;max_candidates&quot;: 8,
+ &quot;repeats&quot;: 1
+}</pre></td><td>identical calls returned [2] candidates<pre>{
+ &quot;candidates_returned_per_identical_call&quot;: [
+  2
+ ]
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>grasp pose geometry (where is the pose relative to its contact point?)</b><br><span style='color:#8a9199'>stage graspexec</span></td><td><pre>{
+ &quot;candidate&quot;: {
+  &quot;score&quot;: 0.1677,
+  &quot;width_m&quot;: 0.08,
+  &quot;approach_distance_m&quot;: 0.0,
+  &quot;pose&quot;: {
+   &quot;position_m&quot;: [
+    0.43009,
+    0.48412,
+    0.34788
+   ],
+   &quot;quaternion_wxyz&quot;: [
+    0.08641,
+    0.8935,
+    -0.42017,
+    -0.13287
+   ],
+   &quot;yaw_rad&quot;: -0.90195,
+   &quot;frame&quot;: &quot;robot0_link0&quot;
+  },
+  &quot;metadata&quot;: {
+   &quot;orientation_correction&quot;: &quot;right_multiply_local_z_90_deg&quot;,
+   &quot;contact_point&quot;: &quot;(0.39369574154662657, 0.47593210968965627, 0.25125935208632344)&quot;
+  }
+ }
+}</pre></td><td>pose sits 0.1036 m behind the contact point along its own local +Z<pre>{
+ &quot;pose_to_contact_m&quot;: 0.1036,
+ &quot;approach_axis_base&quot;: [
+  -0.31,
+  -0.0427,
+  -0.9498
+ ],
+ &quot;cos_angle_between_local_z_and_pose_to_contact&quot;: 0.9983,
+ &quot;nearest_object_point_to_pose_m&quot;: 0.0925,
+ &quot;nearest_object_point_to_contact_m&quot;: 0.0
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>end-to-end pick outcome</b><br><span style='color:#8a9199'>stage graspexec</span></td><td><pre>{
+ &quot;pipeline&quot;: &quot;generate_grasps -&gt; select_grasp -&gt; move_to_pose -&gt; close_gripper -&gt; lift&quot;
+}</pre></td><td>NOT picked: jaw closed to 0.005 (empty) and the object rose +0.000 m<pre>{
+ &quot;reached_the_candidate&quot;: true,
+ &quot;jaw_after_closing&quot;: 0.0053,
+ &quot;object_rise_m&quot;: 0.0002,
+ &quot;reading&quot;: &quot;the jaw closed to near-zero, which on this gripper means it met no object; an object between the fingers stalls the jaw well short of 0&quot;
+}</pre></td><td class='bad'>NO</td></tr>
+<tr><td><b>generate_grasps(&#x27;fish&#x27;) -- does max_candidates change the count?</b><br><span style='color:#8a9199'>stage grasps</span></td><td><pre>{
+ &quot;camera_name&quot;: &quot;agentview&quot;,
+ &quot;mask&quot;: &quot;fish&quot;,
+ &quot;max_candidates&quot;: &quot;1 / 8 / 30&quot;
+}</pre></td><td>asked 1/8/30, got 0/1/0<pre>{
+ &quot;returned_counts&quot;: {
+  &quot;1&quot;: 0,
+  &quot;8&quot;: 1,
+  &quot;30&quot;: 0
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>generate_grasps(&#x27;fish&#x27;)</b><br><span style='color:#8a9199'>stage grasps</span></td><td><pre>{
+ &quot;camera_name&quot;: &quot;agentview&quot;,
+ &quot;mask&quot;: &quot;segment_text(&#x27;fish&#x27;)[0] (588 px)&quot;,
+ &quot;backend&quot;: &quot;contact-graspnet&quot;,
+ &quot;max_candidates&quot;: 8
+}</pre></td><td>ErrorCode.NO_GRASP: Contact-GraspNet returned no grasp candidates<pre>{
+ &quot;ok&quot;: false,
+ &quot;n&quot;: 0,
+ &quot;error&quot;: &quot;ErrorCode.NO_GRASP: Contact-GraspNet returned no grasp candidates&quot;,
+ &quot;frame&quot;: &quot;&quot;,
+ &quot;candidates&quot;: [],
+ &quot;distance_to_object_cloud_m&quot;: []
+}</pre></td><td class='bad'>NO</td></tr>
+<tr><td><b>generate_grasps(&#x27;pan&#x27;) -- does max_candidates change the count?</b><br><span style='color:#8a9199'>stage grasps</span></td><td><pre>{
+ &quot;camera_name&quot;: &quot;agentview&quot;,
+ &quot;mask&quot;: &quot;pan&quot;,
+ &quot;max_candidates&quot;: &quot;1 / 8 / 30&quot;
+}</pre></td><td>asked 1/8/30, got 1/8/1<pre>{
+ &quot;returned_counts&quot;: {
+  &quot;1&quot;: 1,
+  &quot;8&quot;: 8,
+  &quot;30&quot;: 1
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>generate_grasps(&#x27;pan&#x27;)</b><br><span style='color:#8a9199'>stage grasps</span></td><td><pre>{
+ &quot;camera_name&quot;: &quot;agentview&quot;,
+ &quot;mask&quot;: &quot;segment_text(&#x27;pan&#x27;)[0] (4434 px)&quot;,
+ &quot;backend&quot;: &quot;contact-graspnet&quot;,
+ &quot;max_candidates&quot;: 8
+}</pre></td><td>1 grasps, scores [0.169], nearest-object-point distance [0.007] m<pre>{
+ &quot;ok&quot;: true,
+ &quot;n&quot;: 1,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;frame&quot;: &quot;robot0_link0&quot;,
+ &quot;candidates&quot;: [
+  {
+   &quot;score&quot;: 0.1694,
+   &quot;width_m&quot;: 0.08,
+   &quot;approach_distance_m&quot;: 0.0,
+   &quot;pose&quot;: {
+    &quot;position_m&quot;: [
+     0.34878,
+     0.43374,
+     0.21777
+    ],
+    &quot;quaternion_wxyz&quot;: [
+     0.8222,
+     -0.54365,
+     0.15161,
+     0.07375
+    ],
+    &quot;yaw_rad&quot;: -0.04617,
+    &quot;frame&quot;: &quot;robot0_link0&quot;
+   },
+   &quot;metadata&quot;: {
+    &quot;orientation_correction&quot;: &quot;right_multiply_local_z_90_deg&quot;,
+    &quot;contact_point&quot;: &quot;(0.35660335643834673, 0.5419297245024932, 0.225861223005269)&quot;
+   }
+  }
+ ],
+ &quot;distance_to_object_cloud_m&quot;: [
+  0.0066
+ ]
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>generate_grasps(&#x27;plate&#x27;) -- does max_candidates change the count?</b><br><span style='color:#8a9199'>stage grasps</span></td><td><pre>{
+ &quot;camera_name&quot;: &quot;agentview&quot;,
+ &quot;mask&quot;: &quot;plate&quot;,
+ &quot;max_candidates&quot;: &quot;1 / 8 / 30&quot;
+}</pre></td><td>asked 1/8/30, got 1/0/0<pre>{
+ &quot;returned_counts&quot;: {
+  &quot;1&quot;: 1,
+  &quot;8&quot;: 0,
+  &quot;30&quot;: 0
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>generate_grasps(&#x27;plate&#x27;)</b><br><span style='color:#8a9199'>stage grasps</span></td><td><pre>{
+ &quot;camera_name&quot;: &quot;agentview&quot;,
+ &quot;mask&quot;: &quot;segment_text(&#x27;plate&#x27;)[0] (4449 px)&quot;,
+ &quot;backend&quot;: &quot;contact-graspnet&quot;,
+ &quot;max_candidates&quot;: 8
+}</pre></td><td>1 grasps, scores [0.181], nearest-object-point distance [0.014] m<pre>{
+ &quot;ok&quot;: true,
+ &quot;n&quot;: 1,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;frame&quot;: &quot;robot0_link0&quot;,
+ &quot;candidates&quot;: [
+  {
+   &quot;score&quot;: 0.1812,
+   &quot;width_m&quot;: 0.08,
+   &quot;approach_distance_m&quot;: 0.0,
+   &quot;pose&quot;: {
+    &quot;position_m&quot;: [
+     0.37154,
+     0.43086,
+     0.21085
+    ],
+    &quot;quaternion_wxyz&quot;: [
+     0.84692,
+     -0.52626,
+     0.07121,
+     0.0266
+    ],
+    &quot;yaw_rad&quot;: -0.03024,
+    &quot;frame&quot;: &quot;robot0_link0&quot;
+   },
+   &quot;metadata&quot;: {
+    &quot;orientation_correction&quot;: &quot;right_multiply_local_z_90_deg&quot;,
+    &quot;contact_point&quot;: &quot;(0.37706484731864826, 0.5384404607813542, 0.22596269509770867)&quot;
+   }
+  }
+ ],
+ &quot;distance_to_object_cloud_m&quot;: [
+  0.0137
+ ]
+}</pre></td><td class='ok'>yes</td></tr>
+</table>
+<figure><h3>Candidates on &#x27;pan&#x27;</h3><img src='figures/grasps/grasps_pan.png' loading='lazy'><figcaption>The drawn gripper is a Panda hand placed at the returned pose with the returned width, fingertips 0.1034 m along its local +Z.</figcaption></figure>
+<figure><h3>&#x27;pan&#x27; candidates in 3D</h3><img src='figures/grasps/grasps_pan_3d.gif' loading='lazy'><figcaption>Same candidates as above, now in 3D against the object&#x27;s own points.</figcaption></figure>
+<figure><h3>Candidates on &#x27;plate&#x27;</h3><img src='figures/grasps/grasps_plate.png' loading='lazy'><figcaption>The drawn gripper is a Panda hand placed at the returned pose with the returned width, fingertips 0.1034 m along its local +Z.</figcaption></figure>
+<figure><h3>&#x27;plate&#x27; candidates in 3D</h3><img src='figures/grasps/grasps_plate_3d.gif' loading='lazy'><figcaption>Same candidates as above, now in 3D against the object&#x27;s own points.</figcaption></figure>
+<figure><h3>Candidate pose vs the hand pose actually reached</h3><img src='figures/graspexec/grasp_conventions.png' loading='lazy'><figcaption>The candidate (red) is a gripper BASE pose: its fingertips, 0.1034 m along its local +Z, are what touch the object. Commanding it as a gripper0_right_eef target only works after adding that offset back; the blue hand is where the arm finished, reconstructed from the measured end-effector pose.</figcaption></figure>
+<figure><h3>Driving the best candidate: approach, close, lift</h3><img src='figures/graspexec/sequence.png' loading='lazy'><figcaption>The arm reaches the candidate to within 9 mm, but the jaws close beside the fish and the lift leaves it on the plate.</figcaption></figure>
+<h2 id='select_grasp'><code>select_grasp</code><span class='badge b-part'>2/4 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>select_grasp(&#x27;pan&#x27;, &#x27;top_down&#x27;)</b><br><span style='color:#8a9199'>stage grasps</span></td><td><pre>{
+ &quot;grasps&quot;: &quot;1 candidates from &#x27;pan&#x27;&quot;,
+ &quot;strategy&quot;: &quot;top_down&quot;
+}</pre></td><td>no candidate matched the strategy<pre>{
+ &quot;selected&quot;: null
+}</pre></td><td class='bad'>NO</td></tr>
+<tr><td><b>select_grasp(&#x27;pan&#x27;, &#x27;highest_score&#x27;)</b><br><span style='color:#8a9199'>stage grasps</span></td><td><pre>{
+ &quot;grasps&quot;: &quot;1 candidates from &#x27;pan&#x27;&quot;,
+ &quot;strategy&quot;: &quot;highest_score&quot;
+}</pre></td><td>score 0.169 at [0.349, 0.434, 0.218]<pre>{
+ &quot;selected&quot;: {
+  &quot;score&quot;: 0.1694,
+  &quot;width_m&quot;: 0.08,
+  &quot;approach_distance_m&quot;: 0.0,
+  &quot;pose&quot;: {
+   &quot;position_m&quot;: [
+    0.34878,
+    0.43374,
+    0.21777
+   ],
+   &quot;quaternion_wxyz&quot;: [
+    0.8222,
+    -0.54365,
+    0.15161,
+    0.07375
+   ],
+   &quot;yaw_rad&quot;: -0.04617,
+   &quot;frame&quot;: &quot;robot0_link0&quot;
+  },
+  &quot;metadata&quot;: {
+   &quot;orientation_correction&quot;: &quot;right_multiply_local_z_90_deg&quot;,
+   &quot;contact_point&quot;: &quot;(0.35660335643834673, 0.5419297245024932, 0.225861223005269)&quot;
+  }
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>select_grasp(&#x27;plate&#x27;, &#x27;top_down&#x27;)</b><br><span style='color:#8a9199'>stage grasps</span></td><td><pre>{
+ &quot;grasps&quot;: &quot;1 candidates from &#x27;plate&#x27;&quot;,
+ &quot;strategy&quot;: &quot;top_down&quot;
+}</pre></td><td>no candidate matched the strategy<pre>{
+ &quot;selected&quot;: null
+}</pre></td><td class='bad'>NO</td></tr>
+<tr><td><b>select_grasp(&#x27;plate&#x27;, &#x27;highest_score&#x27;)</b><br><span style='color:#8a9199'>stage grasps</span></td><td><pre>{
+ &quot;grasps&quot;: &quot;1 candidates from &#x27;plate&#x27;&quot;,
+ &quot;strategy&quot;: &quot;highest_score&quot;
+}</pre></td><td>score 0.181 at [0.372, 0.431, 0.211]<pre>{
+ &quot;selected&quot;: {
+  &quot;score&quot;: 0.1812,
+  &quot;width_m&quot;: 0.08,
+  &quot;approach_distance_m&quot;: 0.0,
+  &quot;pose&quot;: {
+   &quot;position_m&quot;: [
+    0.37154,
+    0.43086,
+    0.21085
+   ],
+   &quot;quaternion_wxyz&quot;: [
+    0.84692,
+    -0.52626,
+    0.07121,
+    0.0266
+   ],
+   &quot;yaw_rad&quot;: -0.03024,
+   &quot;frame&quot;: &quot;robot0_link0&quot;
+  },
+  &quot;metadata&quot;: {
+   &quot;orientation_correction&quot;: &quot;right_multiply_local_z_90_deg&quot;,
+   &quot;contact_point&quot;: &quot;(0.37706484731864826, 0.5384404607813542, 0.22596269509770867)&quot;
+  }
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+</table>
+<figure><h3>What each strategy picked</h3><img src='figures/grasps/select_grasp.png' loading='lazy'><figcaption>&#x27;top_down&#x27; filters on the approach axis pointing down; on this scene most candidates approach from the side, so it returns None.</figcaption></figure>
+<h2 id='solve_ik'><code>solve_ik</code><span class='badge b-part'>11/13 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>solve_ik on the &#x27;pan&#x27; grasp, as returned (treated as an eef pose)</b><br><span style='color:#8a9199'>stage grasps</span></td><td><pre>{
+ &quot;target_pose&quot;: {
+  &quot;position_m&quot;: [
+   0.34878,
+   0.43374,
+   0.21777
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.8222,
+   -0.54365,
+   0.15161,
+   0.07375
+  ],
+  &quot;yaw_rad&quot;: -0.04617,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;source&quot;: &quot;pan grasp, as returned (treated as an eef pose)&quot;
+}</pre></td><td>reachable<pre>{
+ &quot;ok&quot;: true,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;joint_positions_rad&quot;: [
+  1.1575,
+  0.4928,
+  -0.4794,
+  -2.5268,
+  2.606,
+  1.2161,
+  1.4431
+ ],
+ &quot;diagnostics&quot;: {
+  &quot;provider&quot;: &quot;pyroki&quot;,
+  &quot;target_frame&quot;: &quot;robot0_link0&quot;,
+  &quot;provider_target_link&quot;: &quot;panda_hand&quot;,
+  &quot;position_error_m&quot;: &quot;1.0148428206411971e-07&quot;,
+  &quot;orientation_error_rad&quot;: &quot;0.00041648487786517113&quot;
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>solve_ik on the &#x27;pan&#x27; grasp, mapped panda_hand -&gt; eef</b><br><span style='color:#8a9199'>stage grasps</span></td><td><pre>{
+ &quot;target_pose&quot;: {
+  &quot;position_m&quot;: [
+   0.36569,
+   0.52538,
+   0.25406
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.63353,
+   -0.49163,
+   -0.27722,
+   -0.52924
+  ],
+  &quot;yaw_rad&quot;: -0.9475,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;source&quot;: &quot;pan grasp, mapped panda_hand -&gt; eef&quot;
+}</pre></td><td>reachable<pre>{
+ &quot;ok&quot;: true,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;joint_positions_rad&quot;: [
+  1.2219,
+  0.4867,
+  -0.4191,
+  -2.3162,
+  2.724,
+  1.4464,
+  -0.0736
+ ],
+ &quot;diagnostics&quot;: {
+  &quot;provider&quot;: &quot;pyroki&quot;,
+  &quot;target_frame&quot;: &quot;robot0_link0&quot;,
+  &quot;provider_target_link&quot;: &quot;panda_hand&quot;,
+  &quot;position_error_m&quot;: &quot;6.810924063052666e-08&quot;,
+  &quot;orientation_error_rad&quot;: &quot;0.0011516806661205762&quot;
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>solve_ik on the &#x27;plate&#x27; grasp, as returned (treated as an eef pose)</b><br><span style='color:#8a9199'>stage grasps</span></td><td><pre>{
+ &quot;target_pose&quot;: {
+  &quot;position_m&quot;: [
+   0.37154,
+   0.43086,
+   0.21085
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.84692,
+   -0.52626,
+   0.07121,
+   0.0266
+  ],
+  &quot;yaw_rad&quot;: -0.03024,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;source&quot;: &quot;plate grasp, as returned (treated as an eef pose)&quot;
+}</pre></td><td>reachable<pre>{
+ &quot;ok&quot;: true,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;joint_positions_rad&quot;: [
+  0.7595,
+  0.5611,
+  -0.1843,
+  -2.397,
+  2.3787,
+  1.1804,
+  1.1767
+ ],
+ &quot;diagnostics&quot;: {
+  &quot;provider&quot;: &quot;pyroki&quot;,
+  &quot;target_frame&quot;: &quot;robot0_link0&quot;,
+  &quot;provider_target_link&quot;: &quot;panda_hand&quot;,
+  &quot;position_error_m&quot;: &quot;1.5193162926176957e-07&quot;,
+  &quot;orientation_error_rad&quot;: &quot;0.0003841918030867998&quot;
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>solve_ik on the &#x27;plate&#x27; grasp, mapped panda_hand -&gt; eef</b><br><span style='color:#8a9199'>stage grasps</span></td><td><pre>{
+ &quot;target_pose&quot;: {
+  &quot;position_m&quot;: [
+   0.3808,
+   0.52038,
+   0.25445
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.61767,
+   -0.42247,
+   -0.32176,
+   -0.58006
+  ],
+  &quot;yaw_rad&quot;: -1.30721,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;source&quot;: &quot;plate grasp, mapped panda_hand -&gt; eef&quot;
+}</pre></td><td>reachable<pre>{
+ &quot;ok&quot;: true,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;joint_positions_rad&quot;: [
+  1.3245,
+  0.6144,
+  -0.5737,
+  -2.2614,
+  2.7473,
+  1.2669,
+  -0.1435
+ ],
+ &quot;diagnostics&quot;: {
+  &quot;provider&quot;: &quot;pyroki&quot;,
+  &quot;target_frame&quot;: &quot;robot0_link0&quot;,
+  &quot;provider_target_link&quot;: &quot;panda_hand&quot;,
+  &quot;position_error_m&quot;: &quot;2.87340965487083e-07&quot;,
+  &quot;orientation_error_rad&quot;: &quot;0.0017292145165362486&quot;
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>solve_ik (identity: current pose)</b><br><span style='color:#8a9199'>stage ik</span></td><td><pre>{
+ &quot;target_pose&quot;: {
+  &quot;position_m&quot;: [
+   0.1441,
+   0.00031,
+   0.85701
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.04081,
+   0.46948,
+   0.88167,
+   0.02407
+  ],
+  &quot;yaw_rad&quot;: 2.161,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;note&quot;: &quot;the arm&#x27;s current pose&quot;
+}</pre></td><td>solved; max joint delta from the measured arm 0.0359 rad<pre>{
+ &quot;ok&quot;: true,
+ &quot;arm&quot;: &quot;primary&quot;,
+ &quot;embodiment&quot;: &quot;robocasa&quot;,
+ &quot;joint_positions_rad&quot;: [
+  0.00411,
+  -0.20529,
+  -0.00657,
+  -0.46727,
+  0.00871,
+  0.36352,
+  0.19911
+ ],
+ &quot;max_joint_delta_from_current_rad&quot;: 0.035929471254348755,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;diagnostics&quot;: {
+  &quot;provider&quot;: &quot;pyroki&quot;,
+  &quot;target_frame&quot;: &quot;robot0_link0&quot;,
+  &quot;provider_target_link&quot;: &quot;panda_hand&quot;,
+  &quot;position_error_m&quot;: &quot;0.002643975823577475&quot;,
+  &quot;orientation_error_rad&quot;: &quot;0.006775082137394373&quot;
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>solve_ik (+x 6cm)</b><br><span style='color:#8a9199'>stage ik</span></td><td><pre>{
+ &quot;target_pose&quot;: {
+  &quot;position_m&quot;: [
+   0.2041,
+   0.00031,
+   0.85701
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.04081,
+   0.46948,
+   0.88167,
+   0.02407
+  ],
+  &quot;yaw_rad&quot;: 2.161,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;seed_joints&quot;: [
+  0.0023,
+  -0.2233,
+  -0.0054,
+  -0.5032,
+  0.0088,
+  0.3746,
+  0.1989
+ ],
+ &quot;offset_from_current_m&quot;: [
+  0.06,
+  0.0,
+  0.0
+ ]
+}</pre></td><td>solved<pre>{
+ &quot;ok&quot;: true,
+ &quot;joint_positions_rad&quot;: [
+  0.00409,
+  -0.12399,
+  -0.00726,
+  -0.46688,
+  0.00847,
+  0.4565,
+  0.19787
+ ],
+ &quot;error&quot;: &quot;&quot;,
+ &quot;error_detail&quot;: null,
+ &quot;diagnostics&quot;: {
+  &quot;provider&quot;: &quot;pyroki&quot;,
+  &quot;target_frame&quot;: &quot;robot0_link0&quot;,
+  &quot;provider_target_link&quot;: &quot;panda_hand&quot;,
+  &quot;position_error_m&quot;: &quot;0.00679013774140812&quot;,
+  &quot;orientation_error_rad&quot;: &quot;0.01888789436531424&quot;
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>solve_ik (-x 6cm)</b><br><span style='color:#8a9199'>stage ik</span></td><td><pre>{
+ &quot;target_pose&quot;: {
+  &quot;position_m&quot;: [
+   0.0841,
+   0.00031,
+   0.85701
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.04081,
+   0.46948,
+   0.88167,
+   0.02407
+  ],
+  &quot;yaw_rad&quot;: 2.161,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;seed_joints&quot;: [
+  0.0023,
+  -0.2233,
+  -0.0054,
+  -0.5032,
+  0.0088,
+  0.3746,
+  0.1989
+ ],
+ &quot;offset_from_current_m&quot;: [
+  -0.06,
+  0.0,
+  0.0
+ ]
+}</pre></td><td>solved<pre>{
+ &quot;ok&quot;: true,
+ &quot;joint_positions_rad&quot;: [
+  0.00715,
+  -0.2883,
+  -0.00637,
+  -0.46736,
+  0.00833,
+  0.27917,
+  0.20227
+ ],
+ &quot;error&quot;: &quot;&quot;,
+ &quot;error_detail&quot;: null,
+ &quot;diagnostics&quot;: {
+  &quot;provider&quot;: &quot;pyroki&quot;,
+  &quot;target_frame&quot;: &quot;robot0_link0&quot;,
+  &quot;provider_target_link&quot;: &quot;panda_hand&quot;,
+  &quot;position_error_m&quot;: &quot;0.0022614009368263454&quot;,
+  &quot;orientation_error_rad&quot;: &quot;0.005420242261911114&quot;
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>solve_ik (+y 6cm)</b><br><span style='color:#8a9199'>stage ik</span></td><td><pre>{
+ &quot;target_pose&quot;: {
+  &quot;position_m&quot;: [
+   0.1441,
+   0.06031,
+   0.85701
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.04081,
+   0.46948,
+   0.88167,
+   0.02407
+  ],
+  &quot;yaw_rad&quot;: 2.161,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;seed_joints&quot;: [
+  0.0023,
+  -0.2233,
+  -0.0054,
+  -0.5032,
+  0.0088,
+  0.3746,
+  0.1989
+ ],
+ &quot;offset_from_current_m&quot;: [
+  0.0,
+  0.06,
+  0.0
+ ]
+}</pre></td><td>solved<pre>{
+ &quot;ok&quot;: true,
+ &quot;joint_positions_rad&quot;: [
+  0.12555,
+  -0.19106,
+  0.1548,
+  -0.46557,
+  0.02019,
+  0.37847,
+  0.49129
+ ],
+ &quot;error&quot;: &quot;&quot;,
+ &quot;error_detail&quot;: null,
+ &quot;diagnostics&quot;: {
+  &quot;provider&quot;: &quot;pyroki&quot;,
+  &quot;target_frame&quot;: &quot;robot0_link0&quot;,
+  &quot;provider_target_link&quot;: &quot;panda_hand&quot;,
+  &quot;position_error_m&quot;: &quot;0.0036127797392690223&quot;,
+  &quot;orientation_error_rad&quot;: &quot;0.009539951455852536&quot;
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>solve_ik (-y 6cm)</b><br><span style='color:#8a9199'>stage ik</span></td><td><pre>{
+ &quot;target_pose&quot;: {
+  &quot;position_m&quot;: [
+   0.1441,
+   -0.05969,
+   0.85701
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.04081,
+   0.46948,
+   0.88167,
+   0.02407
+  ],
+  &quot;yaw_rad&quot;: 2.161,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;seed_joints&quot;: [
+  0.0023,
+  -0.2233,
+  -0.0054,
+  -0.5032,
+  0.0088,
+  0.3746,
+  0.1989
+ ],
+ &quot;offset_from_current_m&quot;: [
+  0.0,
+  -0.06,
+  0.0
+ ]
+}</pre></td><td>solved<pre>{
+ &quot;ok&quot;: true,
+ &quot;joint_positions_rad&quot;: [
+  -0.07107,
+  -0.19197,
+  -0.18544,
+  -0.46442,
+  -0.02076,
+  0.37636,
+  -0.0813
+ ],
+ &quot;error&quot;: &quot;&quot;,
+ &quot;error_detail&quot;: null,
+ &quot;diagnostics&quot;: {
+  &quot;provider&quot;: &quot;pyroki&quot;,
+  &quot;target_frame&quot;: &quot;robot0_link0&quot;,
+  &quot;provider_target_link&quot;: &quot;panda_hand&quot;,
+  &quot;position_error_m&quot;: &quot;0.0038221140068418415&quot;,
+  &quot;orientation_error_rad&quot;: &quot;0.01004076789439325&quot;
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>solve_ik (+z 6cm)</b><br><span style='color:#8a9199'>stage ik</span></td><td><pre>{
+ &quot;target_pose&quot;: {
+  &quot;position_m&quot;: [
+   0.1441,
+   0.00031,
+   0.91701
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.04081,
+   0.46948,
+   0.88167,
+   0.02407
+  ],
+  &quot;yaw_rad&quot;: 2.161,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;seed_joints&quot;: [
+  0.0023,
+  -0.2233,
+  -0.0054,
+  -0.5032,
+  0.0088,
+  0.3746,
+  0.1989
+ ],
+ &quot;offset_from_current_m&quot;: [
+  0.0,
+  0.0,
+  0.06
+ ]
+}</pre></td><td>ErrorCode.IK_FAILED: PyRoki solution exceeds the public pose residual limits<pre>{
+ &quot;ok&quot;: false,
+ &quot;joint_positions_rad&quot;: null,
+ &quot;error&quot;: &quot;ErrorCode.IK_FAILED: PyRoki solution exceeds the public pose residual limits&quot;,
+ &quot;error_detail&quot;: {
+  &quot;code&quot;: &quot;ErrorCode.IK_FAILED&quot;,
+  &quot;message&quot;: &quot;PyRoki solution exceeds the public pose residual limits&quot;,
+  &quot;details&quot;: {
+   &quot;provider&quot;: &quot;pyroki&quot;,
+   &quot;position_error_m&quot;: &quot;0.04857424840559338&quot;,
+   &quot;orientation_error_rad&quot;: &quot;0.13655210615606841&quot;,
+   &quot;max_position_error_m&quot;: &quot;0.02&quot;,
+   &quot;max_orientation_error_rad&quot;: &quot;0.15&quot;
+  }
+ },
+ &quot;diagnostics&quot;: {}
+}</pre></td><td class='bad'>NO</td></tr>
+<tr><td><b>solve_ik (-z 6cm)</b><br><span style='color:#8a9199'>stage ik</span></td><td><pre>{
+ &quot;target_pose&quot;: {
+  &quot;position_m&quot;: [
+   0.1441,
+   0.00031,
+   0.79701
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.04081,
+   0.46948,
+   0.88167,
+   0.02407
+  ],
+  &quot;yaw_rad&quot;: 2.161,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;seed_joints&quot;: [
+  0.0023,
+  -0.2233,
+  -0.0054,
+  -0.5032,
+  0.0088,
+  0.3746,
+  0.1989
+ ],
+ &quot;offset_from_current_m&quot;: [
+  0.0,
+  0.0,
+  -0.06
+ ]
+}</pre></td><td>solved<pre>{
+ &quot;ok&quot;: true,
+ &quot;joint_positions_rad&quot;: [
+  -0.00312,
+  -0.63965,
+  -0.00108,
+  -1.26904,
+  0.00584,
+  0.7241,
+  0.19373
+ ],
+ &quot;error&quot;: &quot;&quot;,
+ &quot;error_detail&quot;: null,
+ &quot;diagnostics&quot;: {
+  &quot;provider&quot;: &quot;pyroki&quot;,
+  &quot;target_frame&quot;: &quot;robot0_link0&quot;,
+  &quot;provider_target_link&quot;: &quot;panda_hand&quot;,
+  &quot;position_error_m&quot;: &quot;1.4365872153615669e-07&quot;,
+  &quot;orientation_error_rad&quot;: &quot;0.000629171610808573&quot;
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>solve_ik (+x 40cm (expected out of reach))</b><br><span style='color:#8a9199'>stage ik</span></td><td><pre>{
+ &quot;target_pose&quot;: {
+  &quot;position_m&quot;: [
+   0.5441,
+   0.00031,
+   0.85701
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.04081,
+   0.46948,
+   0.88167,
+   0.02407
+  ],
+  &quot;yaw_rad&quot;: 2.161,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;seed_joints&quot;: [
+  0.0023,
+  -0.2233,
+  -0.0054,
+  -0.5032,
+  0.0088,
+  0.3746,
+  0.1989
+ ],
+ &quot;offset_from_current_m&quot;: [
+  0.4,
+  0.0,
+  0.0
+ ]
+}</pre></td><td>ErrorCode.IK_FAILED: PyRoki solution exceeds the public pose residual limits<pre>{
+ &quot;ok&quot;: false,
+ &quot;joint_positions_rad&quot;: null,
+ &quot;error&quot;: &quot;ErrorCode.IK_FAILED: PyRoki solution exceeds the public pose residual limits&quot;,
+ &quot;error_detail&quot;: {
+  &quot;code&quot;: &quot;ErrorCode.IK_FAILED&quot;,
+  &quot;message&quot;: &quot;PyRoki solution exceeds the public pose residual limits&quot;,
+  &quot;details&quot;: {
+   &quot;provider&quot;: &quot;pyroki&quot;,
+   &quot;position_error_m&quot;: &quot;0.0844915807812569&quot;,
+   &quot;orientation_error_rad&quot;: &quot;0.29016633147342674&quot;,
+   &quot;max_position_error_m&quot;: &quot;0.02&quot;,
+   &quot;max_orientation_error_rad&quot;: &quot;0.15&quot;
+  }
+ },
+ &quot;diagnostics&quot;: {}
+}</pre></td><td class='bad'>NO</td></tr>
+<tr><td><b>solve_ik reach sweep (where does it stop solving?)</b><br><span style='color:#8a9199'>stage ik</span></td><td><pre>{
+ &quot;target_pose&quot;: &quot;current pose displaced along +z and +x, 1 cm to 20 cm&quot;
+}</pre></td><td>first failure: +z at 0.03 m, +x at 0.2 m<pre>{
+ &quot;sweep&quot;: [
+  {
+   &quot;axis&quot;: &quot;+z&quot;,
+   &quot;distance_m&quot;: 0.01,
+   &quot;ok&quot;: true,
+   &quot;error&quot;: &quot;&quot;
+  },
+  {
+   &quot;axis&quot;: &quot;+z&quot;,
+   &quot;distance_m&quot;: 0.02,
+   &quot;ok&quot;: true,
+   &quot;error&quot;: &quot;&quot;
+  },
+  {
+   &quot;axis&quot;: &quot;+z&quot;,
+   &quot;distance_m&quot;: 0.03,
+   &quot;ok&quot;: false,
+   &quot;error&quot;: &quot;ErrorCode.IK_FAILED: PyRoki solution exceeds the public pose residual limits&quot;
+  },
+  {
+   &quot;axis&quot;: &quot;+z&quot;,
+   &quot;distance_m&quot;: 0.04,
+   &quot;ok&quot;: false,
+   &quot;error&quot;: &quot;ErrorCode.IK_FAILED: PyRoki solution exceeds the public pose residual limits&quot;
+  },
+  {
+   &quot;axis&quot;: &quot;+z&quot;,
+   &quot;distance_m&quot;: 0.05,
+   &quot;ok&quot;: false,
+   &quot;error&quot;: &quot;ErrorCode.IK_FAILED: PyRoki solution exceeds the public pose residual limits&quot;
+  },
+  {
+   &quot;axis&quot;: &quot;+z&quot;,
+   &quot;distance_m&quot;: 0.06,
+   &quot;ok&quot;: false,
+   &quot;error&quot;: &quot;ErrorCode.IK_FAILED: PyRoki solution exceeds the public pose residual limits&quot;
+  },
+  {
+   &quot;axis&quot;: &quot;+z&quot;,
+   &quot;distance_m&quot;: 0.08,
+   &quot;ok&quot;: false,
+   &quot;error&quot;: &quot;ErrorCode.IK_FAILED: PyRoki solution exceeds the public pose residual limits&quot;
+  },
+  {
+   &quot;axis&quot;: &quot;+z&quot;,
+   &quot;distance_m&quot;: 0.12,
+   &quot;ok&quot;: false,
+   &quot;error&quot;: &quot;ErrorCode.IK_FAILED: PyRoki solution exceeds the public pose residual limits&quot;
+  },
+  {
+   &quot;axis&quot;: &quot;+z&quot;,
+   &quot;distance_m&quot;: 0.2,
+   &quot;ok&quot;: false,
+   &quot;error&quot;: &quot;ErrorCode.IK_FAILED: PyRoki solution exceeds the public pose residual limits&quot;
+  },
+  {
+   &quot;axis&quot;: &quot;+x&quot;,
+   &quot;distance_m&quot;: 0.01,
+   &quot;ok&quot;: true,
+   &quot;error&quot;: &quot;&quot;
+  },
+  {
+   &quot;axis&quot;: &quot;+x&quot;,
+   &quot;distance_m&quot;: 0.02,
+   &quot;ok&quot;: true,
+   &quot;error&quot;: &quot;&quot;
+  },
+  {
+   &quot;axis&quot;: &quot;+x&quot;,
+   &quot;distance_m&quot;: 0.03,
+   &quot;ok&quot;: true,
+   &quot;error&quot;: &quot;&quot;
+  },
+
+  ... (truncated; full value in out/raw/*/records.json)</pre></td><td class='ok'>yes</td></tr>
+</table>
+<figure><h3>Where IK stops solving</h3><img src='figures/ik/reach_sweep.png' loading='lazy'><figcaption>Upward motion from the spawn pose fails beyond 2 cm; forward motion survives to 12 cm. The arm starts near the top of its workspace.</figcaption></figure>
+<figure><h3>IK verified by actually driving the solution</h3><img src='figures/ik/verification.png' loading='lazy'><figcaption>Each IK solution was commanded with move_to_joints; the bars are the gap between the pose requested and the pose measured afterwards.</figcaption></figure>
+<figure><h3>Path to the IK solution (-z 6 cm)</h3><img src='figures/ik/verify_mz_6cm_3d.gif' loading='lazy'><figcaption>The star is the Cartesian pose handed to solve_ik; the line is where the arm actually went when its joint answer was commanded.</figcaption></figure>
+<figure><h3>Path to the IK solution (+y 6 cm)</h3><img src='figures/ik/verify_py_6cm_3d.gif' loading='lazy'><figcaption>The star is the Cartesian pose handed to solve_ik; the line is where the arm actually went when its joint answer was commanded.</figcaption></figure>
+<figure><h3>Recorded episodes</h3>
+<div class='vid'><video src='raw/ik/verify_mz_6cm__agentview.mp4' controls muted loop preload='metadata'></video><div class='t'>Scene camera: driving the IK solution (-z 6 cm)</div></div>
+<div class='vid'><video src='raw/ik/verify_py_6cm__agentview.mp4' controls muted loop preload='metadata'></video><div class='t'>Scene camera: driving the IK solution (+y 6 cm)</div></div>
+</figure>
+<h2 id='plan_motion'><code>plan_motion</code><span class='badge b-ok'>6/6 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>plan_motion (joint goal, interpolation)</b><br><span style='color:#8a9199'>stage planning</span></td><td><pre>{
+ &quot;goal&quot;: [
+  0.0023,
+  -0.2233,
+  -0.0054,
+  -0.3832,
+  0.0088,
+  0.2746,
+  0.1989
+ ],
+ &quot;strategy&quot;: {
+  &quot;ik_solver&quot;: &quot;pyroki&quot;,
+  &quot;trajectory_planner&quot;: &quot;interpolation&quot;,
+  &quot;pose_planner&quot;: &quot;composed&quot;
+ }
+}</pre></td><td>3 waypoints, planner=joint_interpolation, collision_aware=False<pre>{
+ &quot;ok&quot;: true,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;diagnostics&quot;: {
+  &quot;ik_solver&quot;: &quot;pyroki&quot;,
+  &quot;trajectory_planner&quot;: &quot;interpolation&quot;,
+  &quot;max_joint_delta_rad&quot;: &quot;0.05&quot;
+ },
+ &quot;trajectory&quot;: {
+  &quot;n_waypoints&quot;: 3,
+  &quot;dt_s&quot;: 0.05,
+  &quot;planner&quot;: &quot;joint_interpolation&quot;,
+  &quot;collision_aware&quot;: false,
+  &quot;joint_names&quot;: [
+   &quot;joint_0&quot;,
+   &quot;joint_1&quot;,
+   &quot;joint_2&quot;,
+   &quot;joint_3&quot;,
+   &quot;joint_4&quot;,
+   &quot;joint_5&quot;,
+   &quot;joint_6&quot;
+  ],
+  &quot;start&quot;: [
+   0.00225,
+   -0.22333,
+   -0.00542,
+   -0.4632,
+   0.00881,
+   0.34126,
+   0.19894
+  ],
+  &quot;end&quot;: [
+   0.00225,
+   -0.22333,
+   -0.00542,
+   -0.3832,
+   0.00881,
+   0.27459,
+   0.19894
+  ],
+  &quot;max_step_rad&quot;: 0.04,
+  &quot;start_matches_measured_rad&quot;: 0.04,
+  &quot;end_vs_joint_goal_rad&quot;: 0.0
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>plan_motion (joint goal, curobo)</b><br><span style='color:#8a9199'>stage planning</span></td><td><pre>{
+ &quot;goal&quot;: [
+  0.0023,
+  -0.2233,
+  -0.0054,
+  -0.3832,
+  0.0088,
+  0.2746,
+  0.1989
+ ],
+ &quot;strategy&quot;: {
+  &quot;ik_solver&quot;: &quot;pyroki&quot;,
+  &quot;trajectory_planner&quot;: &quot;curobo&quot;,
+  &quot;pose_planner&quot;: &quot;composed&quot;
+ }
+}</pre></td><td>27 waypoints, planner=curobo_v2_cspace, collision_aware=True<pre>{
+ &quot;ok&quot;: true,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;diagnostics&quot;: {
+  &quot;provider&quot;: &quot;curobo&quot;,
+  &quot;planning_mode&quot;: &quot;cspace&quot;,
+  &quot;source_dt_s&quot;: &quot;0.02500000037252903&quot;,
+  &quot;time_dilation_factor&quot;: &quot;0.4&quot;,
+  &quot;time_dilation&quot;: &quot;0.4&quot;,
+  &quot;interpolation_dt_s&quot;: &quot;None&quot;,
+  &quot;maximum_trajectory_dt_s&quot;: &quot;None&quot;,
+  &quot;scene_points&quot;: &quot;44951&quot;
+ },
+ &quot;trajectory&quot;: {
+  &quot;n_waypoints&quot;: 27,
+  &quot;dt_s&quot;: 0.05,
+  &quot;planner&quot;: &quot;curobo_v2_cspace&quot;,
+  &quot;collision_aware&quot;: true,
+  &quot;joint_names&quot;: [
+   &quot;joint_0&quot;,
+   &quot;joint_1&quot;,
+   &quot;joint_2&quot;,
+   &quot;joint_3&quot;,
+   &quot;joint_4&quot;,
+   &quot;joint_5&quot;,
+   &quot;joint_6&quot;
+  ],
+  &quot;start&quot;: [
+   0.00225,
+   -0.22333,
+   -0.00542,
+   -0.5032,
+   0.00881,
+   0.37459,
+   0.19894
+  ],
+  &quot;end&quot;: [
+   0.00225,
+   -0.22333,
+   -0.00542,
+   -0.3832,
+   0.00881,
+   0.27459,
+   0.19894
+  ],
+  &quot;max_step_rad&quot;: 0.00796,
+  &quot;start_matches_measured_rad&quot;: 0.0,
+  &quot;end_vs_joint_goal_rad&quot;: 0.0
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>plan_motion (pose goal, composed (pyroki IK + interpolation))</b><br><span style='color:#8a9199'>stage planning</span></td><td><pre>{
+ &quot;goal&quot;: {
+  &quot;position_m&quot;: [
+   0.1441,
+   0.00031,
+   0.77701
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.04081,
+   0.46948,
+   0.88167,
+   0.02407
+  ],
+  &quot;yaw_rad&quot;: 2.161,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;strategy&quot;: {
+  &quot;ik_solver&quot;: &quot;pyroki&quot;,
+  &quot;trajectory_planner&quot;: &quot;interpolation&quot;,
+  &quot;pose_planner&quot;: &quot;composed&quot;
+ }
+}</pre></td><td>18 waypoints, planner=pyroki+joint_interpolation, collision_aware=False<pre>{
+ &quot;ok&quot;: true,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;diagnostics&quot;: {
+  &quot;ik_solver&quot;: &quot;pyroki&quot;,
+  &quot;trajectory_planner&quot;: &quot;interpolation&quot;,
+  &quot;max_joint_delta_rad&quot;: &quot;0.05&quot;
+ },
+ &quot;trajectory&quot;: {
+  &quot;n_waypoints&quot;: 18,
+  &quot;dt_s&quot;: 0.05,
+  &quot;planner&quot;: &quot;pyroki+joint_interpolation&quot;,
+  &quot;collision_aware&quot;: false,
+  &quot;joint_names&quot;: [
+   &quot;joint_0&quot;,
+   &quot;joint_1&quot;,
+   &quot;joint_2&quot;,
+   &quot;joint_3&quot;,
+   &quot;joint_4&quot;,
+   &quot;joint_5&quot;,
+   &quot;joint_6&quot;
+  ],
+  &quot;start&quot;: [
+   0.00186,
+   -0.25047,
+   -0.00515,
+   -0.55315,
+   0.00865,
+   0.39739,
+   0.19858
+  ],
+  &quot;end&quot;: [
+   -0.0048,
+   -0.71195,
+   -0.00061,
+   -1.40224,
+   0.00598,
+   0.785,
+   0.19234
+  ],
+  &quot;max_step_rad&quot;: 0.04995,
+  &quot;start_matches_measured_rad&quot;: 0.04995
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>plan_motion (pose goal, pyroki IK + curobo trajectory)</b><br><span style='color:#8a9199'>stage planning</span></td><td><pre>{
+ &quot;goal&quot;: {
+  &quot;position_m&quot;: [
+   0.1441,
+   0.00031,
+   0.77701
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.04081,
+   0.46948,
+   0.88167,
+   0.02407
+  ],
+  &quot;yaw_rad&quot;: 2.161,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;strategy&quot;: {
+  &quot;ik_solver&quot;: &quot;pyroki&quot;,
+  &quot;trajectory_planner&quot;: &quot;curobo&quot;,
+  &quot;pose_planner&quot;: &quot;composed&quot;
+ }
+}</pre></td><td>52 waypoints, planner=curobo_v2_cspace, collision_aware=True<pre>{
+ &quot;ok&quot;: true,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;diagnostics&quot;: {
+  &quot;provider&quot;: &quot;curobo&quot;,
+  &quot;planning_mode&quot;: &quot;cspace&quot;,
+  &quot;source_dt_s&quot;: &quot;0.02500000037252903&quot;,
+  &quot;time_dilation_factor&quot;: &quot;0.4&quot;,
+  &quot;time_dilation&quot;: &quot;0.4&quot;,
+  &quot;interpolation_dt_s&quot;: &quot;None&quot;,
+  &quot;maximum_trajectory_dt_s&quot;: &quot;None&quot;,
+  &quot;scene_points&quot;: &quot;44951&quot;
+ },
+ &quot;trajectory&quot;: {
+  &quot;n_waypoints&quot;: 52,
+  &quot;dt_s&quot;: 0.05,
+  &quot;planner&quot;: &quot;curobo_v2_cspace&quot;,
+  &quot;collision_aware&quot;: true,
+  &quot;joint_names&quot;: [
+   &quot;joint_0&quot;,
+   &quot;joint_1&quot;,
+   &quot;joint_2&quot;,
+   &quot;joint_3&quot;,
+   &quot;joint_4&quot;,
+   &quot;joint_5&quot;,
+   &quot;joint_6&quot;
+  ],
+  &quot;start&quot;: [
+   0.00225,
+   -0.22333,
+   -0.00542,
+   -0.5032,
+   0.00881,
+   0.37459,
+   0.19894
+  ],
+  &quot;end&quot;: [
+   -0.0048,
+   -0.71195,
+   -0.00061,
+   -1.40224,
+   0.00598,
+   0.785,
+   0.19234
+  ],
+  &quot;max_step_rad&quot;: 0.0298,
+  &quot;start_matches_measured_rad&quot;: 0.0
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>plan_motion (pose goal, curobo-integrated pose planner)</b><br><span style='color:#8a9199'>stage planning</span></td><td><pre>{
+ &quot;goal&quot;: {
+  &quot;position_m&quot;: [
+   0.1441,
+   0.00031,
+   0.77701
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.04081,
+   0.46948,
+   0.88167,
+   0.02407
+  ],
+  &quot;yaw_rad&quot;: 2.161,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;strategy&quot;: {
+  &quot;ik_solver&quot;: &quot;curobo&quot;,
+  &quot;trajectory_planner&quot;: &quot;curobo&quot;,
+  &quot;pose_planner&quot;: &quot;curobo-integrated&quot;
+ }
+}</pre></td><td>52 waypoints, planner=curobo_v2_pose, collision_aware=True<pre>{
+ &quot;ok&quot;: true,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;diagnostics&quot;: {
+  &quot;provider&quot;: &quot;curobo&quot;,
+  &quot;planning_mode&quot;: &quot;pose&quot;,
+  &quot;source_dt_s&quot;: &quot;0.02500000037252903&quot;,
+  &quot;time_dilation_factor&quot;: &quot;0.4&quot;,
+  &quot;time_dilation&quot;: &quot;0.4&quot;,
+  &quot;interpolation_dt_s&quot;: &quot;None&quot;,
+  &quot;maximum_trajectory_dt_s&quot;: &quot;None&quot;,
+  &quot;scene_points&quot;: &quot;44951&quot;
+ },
+ &quot;trajectory&quot;: {
+  &quot;n_waypoints&quot;: 52,
+  &quot;dt_s&quot;: 0.05,
+  &quot;planner&quot;: &quot;curobo_v2_pose&quot;,
+  &quot;collision_aware&quot;: true,
+  &quot;joint_names&quot;: [
+   &quot;joint_0&quot;,
+   &quot;joint_1&quot;,
+   &quot;joint_2&quot;,
+   &quot;joint_3&quot;,
+   &quot;joint_4&quot;,
+   &quot;joint_5&quot;,
+   &quot;joint_6&quot;
+  ],
+  &quot;start&quot;: [
+   0.00225,
+   -0.22333,
+   -0.00542,
+   -0.5032,
+   0.00881,
+   0.37459,
+   0.19894
+  ],
+  &quot;end&quot;: [
+   -0.90888,
+   -0.75771,
+   0.15679,
+   -1.37569,
+   0.27553,
+   0.70744,
+   -0.38053
+  ],
+  &quot;max_step_rad&quot;: 0.03017,
+  &quot;start_matches_measured_rad&quot;: 0.0
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>plan_motion (curobo, target cloud excluded from the collision world)</b><br><span style='color:#8a9199'>stage planning</span></td><td><pre>{
+ &quot;goal&quot;: [
+  0.0023,
+  -0.2233,
+  -0.0054,
+  -0.3832,
+  0.0088,
+  0.2746,
+  0.1989
+ ],
+ &quot;strategy&quot;: &quot;curobo&quot;,
+ &quot;target_point_cloud&quot;: &quot;fish cloud (588 pts, robot0_link0)&quot;
+}</pre></td><td>planned<pre>{
+ &quot;ok&quot;: true,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;n_waypoints&quot;: 27,
+ &quot;collision_aware&quot;: true,
+ &quot;diagnostics&quot;: {
+  &quot;provider&quot;: &quot;curobo&quot;,
+  &quot;planning_mode&quot;: &quot;cspace&quot;,
+  &quot;source_dt_s&quot;: &quot;0.02500000037252903&quot;,
+  &quot;time_dilation_factor&quot;: &quot;0.4&quot;,
+  &quot;time_dilation&quot;: &quot;0.4&quot;,
+  &quot;interpolation_dt_s&quot;: &quot;None&quot;,
+  &quot;maximum_trajectory_dt_s&quot;: &quot;None&quot;,
+  &quot;scene_points&quot;: &quot;44810&quot;
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+</table>
+<figure><h3>Joint paths from each planner</h3><img src='figures/planning/plans.png' loading='lazy'><figcaption>Interpolation returns a 3-point straight line in joint space; cuRobo returns a smooth collision-aware path of 27-52 waypoints.</figcaption></figure>
+<h2 id='plan_synchronized_motion'><code>plan_synchronized_motion</code><span class='badge b-ok'>1/1 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>plan_synchronized_motion (one arm)</b><br><span style='color:#8a9199'>stage planning</span></td><td><pre>{
+ &quot;targets&quot;: {
+  &quot;primary&quot;: {
+   &quot;position_m&quot;: [
+    0.1441,
+    0.00031,
+    0.85701
+   ],
+   &quot;quaternion_wxyz&quot;: [
+    0.04081,
+    0.46948,
+    0.88167,
+    0.02407
+   ],
+   &quot;yaw_rad&quot;: 2.161,
+   &quot;frame&quot;: &quot;robot0_link0&quot;
+  }
+ }
+}</pre></td><td>planned<pre>{
+ &quot;ok&quot;: true,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;diagnostics&quot;: {
+  &quot;provider&quot;: &quot;curobo&quot;,
+  &quot;source_dt_s&quot;: &quot;0.02500000037252903&quot;,
+  &quot;time_dilation_factor&quot;: &quot;0.4&quot;,
+  &quot;time_dilation&quot;: &quot;0.4&quot;,
+  &quot;interpolation_dt_s&quot;: &quot;None&quot;,
+  &quot;maximum_trajectory_dt_s&quot;: &quot;None&quot;
+ },
+ &quot;trajectory&quot;: {
+  &quot;planner&quot;: &quot;curobo_v2&quot;,
+  &quot;n_waypoints&quot;: 27,
+  &quot;collision_aware&quot;: true
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+</table>
+<h2 id='step'><code>step</code><span class='badge b-ok'>3/3 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>step</b><br><span style='color:#8a9199'>stage gripper</span></td><td><pre>{
+ &quot;action&quot;: &quot;RobotAction(primary=ArmCommand(&#x27;joint_position&#x27;, current joints))&quot;,
+ &quot;target&quot;: [
+  0.00224,
+  -0.22326,
+  -0.00544,
+  -0.503,
+  0.00876,
+  0.37412,
+  0.19878
+ ]
+}</pre></td><td>one tick advanced; joint drift 0.00000 rad; reward=None<pre>{
+ &quot;ok&quot;: true,
+ &quot;terminated&quot;: false,
+ &quot;truncated&quot;: false,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;diagnostics&quot;: {
+  &quot;elapsed_steps&quot;: &quot;151&quot;
+ },
+ &quot;reward_visible_to_program&quot;: null,
+ &quot;observation_cameras&quot;: [
+  &quot;agentview&quot;,
+  &quot;robot0_eye_in_hand&quot;
+ ],
+ &quot;joint_drift_rad&quot;: 0.0
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>step (unsupported mode -- expected refusal)</b><br><span style='color:#8a9199'>stage gripper</span></td><td><pre>{
+ &quot;action&quot;: &quot;ArmCommand(mode=&#x27;cartesian_pose&#x27;)&quot;
+}</pre></td><td>ValueError: mode must be &#x27;joint_position&#x27;<pre>{
+ &quot;ok&quot;: false,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;raised&quot;: &quot;ValueError: mode must be &#x27;joint_position&#x27;&quot;
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>step (3-joint target on a 7-joint arm -- expected refusal)</b><br><span style='color:#8a9199'>stage gripper</span></td><td><pre>{
+ &quot;action&quot;: &quot;ArmCommand(mode=&#x27;joint_position&#x27;, target=zeros(3))&quot;
+}</pre></td><td>ValueError: target must have shape (7,), got (3,)<pre>{
+ &quot;ok&quot;: false,
+ &quot;error&quot;: &quot;&quot;,
+ &quot;raised&quot;: &quot;ValueError: target must have shape (7,), got (3,)&quot;
+}</pre></td><td class='ok'>yes</td></tr>
+</table>
+<h2 id='execute_trajectory'><code>execute_trajectory</code><span class='badge b-ok'>3/3 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>execute_trajectory (hand-built ramp)</b><br><span style='color:#8a9199'>stage motion</span></td><td><pre>{
+ &quot;trajectory&quot;: &quot;25 hand-built waypoints, dt=0.05s, joint 2 += 0.25 rad&quot;,
+ &quot;stop_on_termination&quot;: true
+}</pre></td><td>26 ticks for 25 waypoints (densified at 0.05 rad), final joint error 0.01946 rad<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: true,
+  &quot;status&quot;: &quot;ExecutionStatus.SUCCESS&quot;,
+  &quot;steps_executed&quot;: 26,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {
+   &quot;joint_position&quot;: 0.01947
+  },
+  &quot;error&quot;: &quot;&quot;,
+  &quot;diagnostics&quot;: {}
+ },
+ &quot;goal&quot;: [
+  0.00223,
+  -0.02948,
+  0.24453,
+  -0.6445,
+  0.0087,
+  0.37236,
+  0.19812
+ ],
+ &quot;reached&quot;: [
+  0.00223,
+  -0.02948,
+  0.22507,
+  -0.64452,
+  0.00865,
+  0.37238,
+  0.19824
+ ],
+ &quot;max_joint_error_rad&quot;: 0.01946
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>execute_trajectory (the cuRobo plan)</b><br><span style='color:#8a9199'>stage planning</span></td><td><pre>{
+ &quot;trajectory&quot;: &quot;27 waypoints from curobo_v2_cspace, dt=0.05s&quot;
+}</pre></td><td>27 ticks, final joint error 0.0145 rad<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: true,
+  &quot;status&quot;: &quot;ExecutionStatus.SUCCESS&quot;,
+  &quot;steps_executed&quot;: 27,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {
+   &quot;joint_position&quot;: 0.01864
+  },
+  &quot;error&quot;: &quot;&quot;,
+  &quot;diagnostics&quot;: {}
+ },
+ &quot;joint_goal&quot;: [
+  0.00225,
+  -0.22333,
+  -0.00542,
+  -0.3832,
+  0.00881,
+  0.27459,
+  0.19894
+ ],
+ &quot;reached&quot;: [
+  0.00224,
+  -0.22324,
+  -0.00544,
+  -0.39774,
+  0.00876,
+  0.28626,
+  0.19872
+ ],
+ &quot;max_joint_error_rad&quot;: 0.01454
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>execute_trajectory (stale plan -- expected refusal)</b><br><span style='color:#8a9199'>stage planning</span></td><td><pre>{
+ &quot;trajectory&quot;: &quot;a plan made before the arm was moved 0.10 rad away from its start&quot;
+}</pre></td><td>ErrorCode.STALE_PLAN: trajectory start state no longer matches measured robot state<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: false,
+  &quot;status&quot;: &quot;ExecutionStatus.STALE_PLAN&quot;,
+  &quot;steps_executed&quot;: 0,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {
+   &quot;primary&quot;: 0.08064
+  },
+  &quot;error&quot;: &quot;ErrorCode.STALE_PLAN: trajectory start state no longer matches measured robot state&quot;,
+  &quot;diagnostics&quot;: {}
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+</table>
+<figure><h3>Tracking of the cuRobo plan</h3><img src='figures/planning/execute_tracking.png' loading='lazy'><figcaption>The arm takes absolute joint targets, so it lags each waypoint by roughly one tick and converges when the goal is held.</figcaption></figure>
+<figure><h3>End-effector path of the executed plan</h3><img src='figures/planning/execute_path_3d.gif' loading='lazy'><figcaption></figcaption></figure>
+<figure><h3>Hand-built 25-waypoint ramp</h3><img src='figures/motion/execute_trajectory_tracking.png' loading='lazy'><figcaption>The adapter densifies to 0.05 rad per tick and then servos the final waypoint, which is why the tick count exceeds the waypoint count.</figcaption></figure>
+<figure><h3>Recorded episodes</h3>
+<div class='vid'><video src='raw/planning/execute_curobo_plan__agentview.mp4' controls muted loop preload='metadata'></video><div class='t'>Scene camera: executing the cuRobo plan</div></div>
+<div class='vid'><video src='raw/planning/execute_curobo_plan__robot0_eye_in_hand.mp4' controls muted loop preload='metadata'></video><div class='t'>Wrist camera: executing the cuRobo plan</div></div>
+<div class='vid'><video src='raw/motion/execute_trajectory__agentview.mp4' controls muted loop preload='metadata'></video><div class='t'>Scene camera: execute_trajectory</div></div>
+</figure>
+<h2 id='move_to_joints'><code>move_to_joints</code><span class='badge b-ok'>3/3 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>verify solve_ik by execution (-z 6cm)</b><br><span style='color:#8a9199'>stage ik</span></td><td><pre>{
+ &quot;target&quot;: [
+  -0.0031,
+  -0.6396,
+  -0.0011,
+  -1.269,
+  0.0058,
+  0.7241,
+  0.1937
+ ],
+ &quot;tolerance&quot;: 0.02,
+ &quot;max_steps&quot;: 90,
+ &quot;note&quot;: &quot;IK solution for -z 6cm&quot;
+}</pre></td><td>commanded the IK solution; EE landed 5.9 mm and 0.24 deg from the pose IK was asked for<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: true,
+  &quot;status&quot;: &quot;ExecutionStatus.SUCCESS&quot;,
+  &quot;steps_executed&quot;: 21,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {
+   &quot;primary&quot;: 0.01952
+  },
+  &quot;error&quot;: &quot;&quot;,
+  &quot;diagnostics&quot;: {
+   &quot;joint_error_rad&quot;: &quot;0.01952064037322998&quot;
+  }
+ },
+ &quot;ik_target_pose&quot;: {
+  &quot;position_m&quot;: [
+   0.1441,
+   0.00031,
+   0.79701
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.04081,
+   0.46948,
+   0.88167,
+   0.02407
+  ],
+  &quot;yaw_rad&quot;: 2.161,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;reached_pose&quot;: {
+  &quot;position_m&quot;: [
+   0.14269,
+   0.00027,
+   0.80278
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.03899,
+   0.4691,
+   0.88198,
+   0.02313
+  ],
+  &quot;yaw_rad&quot;: 2.16213,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;position_error_m&quot;: 0.00594,
+ &quot;orientation_error_deg&quot;: 0.242
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>verify solve_ik by execution (+y 6cm)</b><br><span style='color:#8a9199'>stage ik</span></td><td><pre>{
+ &quot;target&quot;: [
+  0.1256,
+  -0.1911,
+  0.1548,
+  -0.4656,
+  0.0202,
+  0.3785,
+  0.4913
+ ],
+ &quot;tolerance&quot;: 0.02,
+ &quot;max_steps&quot;: 90,
+ &quot;note&quot;: &quot;IK solution for +y 6cm&quot;
+}</pre></td><td>commanded the IK solution; EE landed 3.7 mm and 0.51 deg from the pose IK was asked for<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: true,
+  &quot;status&quot;: &quot;ExecutionStatus.SUCCESS&quot;,
+  &quot;steps_executed&quot;: 15,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {
+   &quot;primary&quot;: 0.01918
+  },
+  &quot;error&quot;: &quot;&quot;,
+  &quot;diagnostics&quot;: {
+   &quot;joint_error_rad&quot;: &quot;0.019184231758117676&quot;
+  }
+ },
+ &quot;ik_target_pose&quot;: {
+  &quot;position_m&quot;: [
+   0.1441,
+   0.06031,
+   0.85701
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.04081,
+   0.46948,
+   0.88167,
+   0.02407
+  ],
+  &quot;yaw_rad&quot;: 2.161,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;reached_pose&quot;: {
+  &quot;position_m&quot;: [
+   0.145,
+   0.05677,
+   0.85702
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.04409,
+   0.46878,
+   0.8818,
+   0.02698
+  ],
+  &quot;yaw_rad&quot;: 2.16202,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;position_error_m&quot;: 0.00365,
+ &quot;orientation_error_deg&quot;: 0.509
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>move_to_joints</b><br><span style='color:#8a9199'>stage motion</span></td><td><pre>{
+ &quot;target&quot;: [
+  0.00225,
+  -0.02333,
+  -0.00542,
+  -0.6532,
+  0.00881,
+  0.37459,
+  0.19894
+ ],
+ &quot;tolerance&quot;: 0.01,
+ &quot;max_steps&quot;: 120
+}</pre></td><td>18 ticks, max joint error 0.00870 rad<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: true,
+  &quot;status&quot;: &quot;ExecutionStatus.SUCCESS&quot;,
+  &quot;steps_executed&quot;: 18,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {
+   &quot;primary&quot;: 0.0087
+  },
+  &quot;error&quot;: &quot;&quot;,
+  &quot;diagnostics&quot;: {
+   &quot;joint_error_rad&quot;: &quot;0.008698785305023216&quot;
+  }
+ },
+ &quot;start&quot;: [
+  0.00225,
+  -0.22333,
+  -0.00542,
+  -0.5032,
+  0.00881,
+  0.37459,
+  0.19894
+ ],
+ &quot;reached&quot;: [
+  0.00223,
+  -0.02948,
+  -0.00547,
+  -0.6445,
+  0.0087,
+  0.37236,
+  0.19812
+ ],
+ &quot;max_joint_error_rad&quot;: 0.0087
+}</pre></td><td class='ok'>yes</td></tr>
+</table>
+<figure><h3>Servo to an absolute joint target</h3><img src='figures/motion/move_to_joints_tracking.png' loading='lazy'><figcaption>Horizontal lines are the requested joint angles; the loop re-commands the same absolute target every tick until the measurement is inside tolerance.</figcaption></figure>
+<figure><h3>Recorded episodes</h3>
+<div class='vid'><video src='raw/motion/move_to_joints__agentview.mp4' controls muted loop preload='metadata'></video><div class='t'>Scene camera: move_to_joints</div></div>
+</figure>
+<h2 id='move_to_pose'><code>move_to_pose</code><span class='badge b-ok'>9/9 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>move_to_pose -&gt; standoff (10 cm back along the approach axis)</b><br><span style='color:#8a9199'>stage graspexec</span></td><td><pre>{
+ &quot;target_pose&quot;: {
+  &quot;position_m&quot;: [
+   0.43009,
+   0.48412,
+   0.34788
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.03285,
+   -0.9289,
+   -0.33469,
+   0.15505
+  ],
+  &quot;yaw_rad&quot;: 0.71498,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;tolerance&quot;: 0.015,
+ &quot;max_steps&quot;: 200,
+ &quot;why&quot;: &quot;standoff (10 cm back along the approach axis)&quot;
+}</pre></td><td>69 ticks, 8.4 mm error<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: true,
+  &quot;status&quot;: &quot;ExecutionStatus.SUCCESS&quot;,
+  &quot;steps_executed&quot;: 69,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {
+   &quot;primary&quot;: 0.00837
+  },
+  &quot;error&quot;: &quot;&quot;,
+  &quot;diagnostics&quot;: {
+   &quot;position_error_m&quot;: &quot;0.008367953990481332&quot;,
+   &quot;orientation_error_rad&quot;: &quot;0.010758812504913971&quot;,
+   &quot;trajectory_executed&quot;: &quot;True&quot;,
+   &quot;joint_target_converged&quot;: &quot;True&quot;
+  }
+ },
+ &quot;reached&quot;: {
+  &quot;position_m&quot;: [
+   0.43111,
+   0.48171,
+   0.35583
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.02965,
+   -0.92844,
+   -0.33768,
+   0.15197
+  ],
+  &quot;yaw_rad&quot;: 0.71961,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;position_error_m&quot;: 0.00837,
+ &quot;orientation_error_deg&quot;: 0.616
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>move_to_pose -&gt; grasp pose (panda_hand -&gt; eef mapping)</b><br><span style='color:#8a9199'>stage graspexec</span></td><td><pre>{
+ &quot;target_pose&quot;: {
+  &quot;position_m&quot;: [
+   0.39909,
+   0.47984,
+   0.2529
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.03285,
+   -0.9289,
+   -0.33469,
+   0.15505
+  ],
+  &quot;yaw_rad&quot;: 0.71498,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;tolerance&quot;: 0.015,
+ &quot;max_steps&quot;: 200,
+ &quot;why&quot;: &quot;grasp pose (panda_hand -&gt; eef mapping)&quot;
+}</pre></td><td>19 ticks, 8.7 mm error<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: true,
+  &quot;status&quot;: &quot;ExecutionStatus.SUCCESS&quot;,
+  &quot;steps_executed&quot;: 19,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {
+   &quot;primary&quot;: 0.00866
+  },
+  &quot;error&quot;: &quot;&quot;,
+  &quot;diagnostics&quot;: {
+   &quot;position_error_m&quot;: &quot;0.008655832606861251&quot;,
+   &quot;orientation_error_rad&quot;: &quot;0.0012702746983277908&quot;,
+   &quot;trajectory_executed&quot;: &quot;True&quot;,
+   &quot;joint_target_converged&quot;: &quot;True&quot;
+  }
+ },
+ &quot;reached&quot;: {
+  &quot;position_m&quot;: [
+   0.40217,
+   0.48059,
+   0.26096
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.03253,
+   -0.92882,
+   -0.33511,
+   0.15471
+  ],
+  &quot;yaw_rad&quot;: 0.71569,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;position_error_m&quot;: 0.00866,
+ &quot;orientation_error_deg&quot;: 0.073
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>lift after the grasp (did the object come with it?)</b><br><span style='color:#8a9199'>stage graspexec</span></td><td><pre>{
+ &quot;target_pose&quot;: {
+  &quot;position_m&quot;: [
+   0.40215,
+   0.48058,
+   0.38092
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.03254,
+   -0.92882,
+   -0.3351,
+   0.1547
+  ],
+  &quot;yaw_rad&quot;: 0.71568,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;why&quot;: &quot;lift 12 cm after closing&quot;
+}</pre></td><td>fish centroid moved +0.000 m in z<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: true,
+  &quot;status&quot;: &quot;ExecutionStatus.SUCCESS&quot;,
+  &quot;steps_executed&quot;: 19,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {
+   &quot;primary&quot;: 0.00329
+  },
+  &quot;error&quot;: &quot;&quot;,
+  &quot;diagnostics&quot;: {
+   &quot;position_error_m&quot;: &quot;0.0032860989088057796&quot;,
+   &quot;orientation_error_rad&quot;: &quot;0.0005645225270222126&quot;,
+   &quot;trajectory_executed&quot;: &quot;True&quot;,
+   &quot;joint_target_converged&quot;: &quot;True&quot;
+  }
+ },
+ &quot;fish_centroid_z_before_m&quot;: 0.2475,
+ &quot;fish_centroid_z_after_m&quot;: 0.2477,
+ &quot;fish_rise_m&quot;: 0.0002,
+ &quot;jaw_after&quot;: 0.0053
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>move_to_pose (-z 5cm)</b><br><span style='color:#8a9199'>stage motion</span></td><td><pre>{
+ &quot;target_pose&quot;: {
+  &quot;position_m&quot;: [
+   0.14902,
+   0.00246,
+   0.80522
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.03559,
+   0.46596,
+   0.88386,
+   0.02043
+  ],
+  &quot;yaw_rad&quot;: 2.16975,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;tolerance&quot;: 0.01,
+ &quot;max_steps&quot;: 120,
+ &quot;offset_from_home_m&quot;: [
+  0.0,
+  0.0,
+  -0.05
+ ]
+}</pre></td><td>28 ticks; EE within 5.5 mm of the requested pose<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: true,
+  &quot;status&quot;: &quot;ExecutionStatus.SUCCESS&quot;,
+  &quot;steps_executed&quot;: 28,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {
+   &quot;primary&quot;: 0.00552
+  },
+  &quot;error&quot;: &quot;&quot;,
+  &quot;diagnostics&quot;: {
+   &quot;position_error_m&quot;: &quot;0.005523807831475155&quot;,
+   &quot;orientation_error_rad&quot;: &quot;0.00044404640077363994&quot;,
+   &quot;trajectory_executed&quot;: &quot;True&quot;,
+   &quot;joint_target_converged&quot;: &quot;True&quot;
+  }
+ },
+ &quot;ee_before&quot;: {
+  &quot;position_m&quot;: [
+   0.14902,
+   0.00246,
+   0.85522
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.03559,
+   0.46596,
+   0.88386,
+   0.02043
+  ],
+  &quot;yaw_rad&quot;: 2.16975,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;ee_after&quot;: {
+  &quot;position_m&quot;: [
+   0.14875,
+   0.00246,
+   0.81073
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.03556,
+   0.46576,
+   0.88396,
+   0.02044
+  ],
+  &quot;yaw_rad&quot;: 2.1702,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;position_error_m&quot;: 0.00552,
+ &quot;orientation_error_deg&quot;: 0.025,
+ &quot;commanded_delta_m&quot;: [
+  0.0,
+  0.0,
+  -0.05
+ ],
+ &quot;measured_delta_m&quot;: [
+  -0.00027,
+  -0.0,
+  -0.04448
+ ]
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>move_to_pose (+x 5cm)</b><br><span style='color:#8a9199'>stage motion</span></td><td><pre>{
+ &quot;target_pose&quot;: {
+  &quot;position_m&quot;: [
+   0.19902,
+   0.00246,
+   0.85522
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.03559,
+   0.46596,
+   0.88386,
+   0.02043
+  ],
+  &quot;yaw_rad&quot;: 2.16975,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;tolerance&quot;: 0.01,
+ &quot;max_steps&quot;: 120,
+ &quot;offset_from_home_m&quot;: [
+  0.05,
+  0.0,
+  0.0
+ ]
+}</pre></td><td>29 ticks; EE within 2.5 mm of the requested pose<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: true,
+  &quot;status&quot;: &quot;ExecutionStatus.SUCCESS&quot;,
+  &quot;steps_executed&quot;: 29,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {
+   &quot;primary&quot;: 0.00252
+  },
+  &quot;error&quot;: &quot;&quot;,
+  &quot;diagnostics&quot;: {
+   &quot;position_error_m&quot;: &quot;0.00252284998685963&quot;,
+   &quot;orientation_error_rad&quot;: &quot;0.016770056925414396&quot;,
+   &quot;trajectory_executed&quot;: &quot;True&quot;,
+   &quot;joint_target_converged&quot;: &quot;True&quot;
+  }
+ },
+ &quot;ee_before&quot;: {
+  &quot;position_m&quot;: [
+   0.14875,
+   0.00246,
+   0.81073
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.03556,
+   0.46576,
+   0.88396,
+   0.02044
+  ],
+  &quot;yaw_rad&quot;: 2.1702,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;ee_after&quot;: {
+  &quot;position_m&quot;: [
+   0.19851,
+   0.00246,
+   0.85275
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.04295,
+   0.46555,
+   0.88364,
+   0.02442
+  ],
+  &quot;yaw_rad&quot;: 2.16957,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;position_error_m&quot;: 0.00252,
+ &quot;orientation_error_deg&quot;: 0.961,
+ &quot;commanded_delta_m&quot;: [
+  0.05027,
+  0.0,
+  0.04448
+ ],
+ &quot;measured_delta_m&quot;: [
+  0.04976,
+  1e-05,
+  0.04201
+ ]
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>move_to_pose (+y 5cm)</b><br><span style='color:#8a9199'>stage motion</span></td><td><pre>{
+ &quot;target_pose&quot;: {
+  &quot;position_m&quot;: [
+   0.14902,
+   0.05246,
+   0.85522
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.03559,
+   0.46596,
+   0.88386,
+   0.02043
+  ],
+  &quot;yaw_rad&quot;: 2.16975,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;tolerance&quot;: 0.01,
+ &quot;max_steps&quot;: 120,
+ &quot;offset_from_home_m&quot;: [
+  0.0,
+  0.05,
+  0.0
+ ]
+}</pre></td><td>18 ticks; EE within 4.3 mm of the requested pose<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: true,
+  &quot;status&quot;: &quot;ExecutionStatus.SUCCESS&quot;,
+  &quot;steps_executed&quot;: 18,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {
+   &quot;primary&quot;: 0.00427
+  },
+  &quot;error&quot;: &quot;&quot;,
+  &quot;diagnostics&quot;: {
+   &quot;position_error_m&quot;: &quot;0.004274357130851608&quot;,
+   &quot;orientation_error_rad&quot;: &quot;0.009241163812867317&quot;,
+   &quot;trajectory_executed&quot;: &quot;True&quot;,
+   &quot;joint_target_converged&quot;: &quot;True&quot;
+  }
+ },
+ &quot;ee_before&quot;: {
+  &quot;position_m&quot;: [
+   0.19851,
+   0.00246,
+   0.85275
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.04295,
+   0.46555,
+   0.88364,
+   0.02442
+  ],
+  &quot;yaw_rad&quot;: 2.16957,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;ee_after&quot;: {
+  &quot;position_m&quot;: [
+   0.15257,
+   0.05008,
+   0.85536
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.03888,
+   0.46558,
+   0.88384,
+   0.02365
+  ],
+  &quot;yaw_rad&quot;: 2.1701,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;position_error_m&quot;: 0.00427,
+ &quot;orientation_error_deg&quot;: 0.529,
+ &quot;commanded_delta_m&quot;: [
+  -0.04949,
+  0.05,
+  0.00247
+ ],
+ &quot;measured_delta_m&quot;: [
+  -0.04594,
+  0.04761,
+  0.00261
+ ]
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>move_to_pose (back to the home pose)</b><br><span style='color:#8a9199'>stage motion</span></td><td><pre>{
+ &quot;target_pose&quot;: {
+  &quot;position_m&quot;: [
+   0.14902,
+   0.00246,
+   0.85522
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.03559,
+   0.46596,
+   0.88386,
+   0.02043
+  ],
+  &quot;yaw_rad&quot;: 2.16975,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;tolerance&quot;: 0.01,
+ &quot;max_steps&quot;: 120,
+ &quot;offset_from_home_m&quot;: [
+  0.0,
+  0.0,
+  0.0
+ ]
+}</pre></td><td>16 ticks; EE within 3.8 mm of the requested pose<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: true,
+  &quot;status&quot;: &quot;ExecutionStatus.SUCCESS&quot;,
+  &quot;steps_executed&quot;: 16,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {
+   &quot;primary&quot;: 0.00383
+  },
+  &quot;error&quot;: &quot;&quot;,
+  &quot;diagnostics&quot;: {
+   &quot;position_error_m&quot;: &quot;0.0038347369605033995&quot;,
+   &quot;orientation_error_rad&quot;: &quot;0.007053242945136995&quot;,
+   &quot;trajectory_executed&quot;: &quot;True&quot;,
+   &quot;joint_target_converged&quot;: &quot;True&quot;
+  }
+ },
+ &quot;ee_before&quot;: {
+  &quot;position_m&quot;: [
+   0.15257,
+   0.05008,
+   0.85536
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.03888,
+   0.46558,
+   0.88384,
+   0.02365
+  ],
+  &quot;yaw_rad&quot;: 2.1701,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;ee_after&quot;: {
+  &quot;position_m&quot;: [
+   0.14985,
+   0.00609,
+   0.85613
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.03866,
+   0.46569,
+   0.88383,
+   0.02215
+  ],
+  &quot;yaw_rad&quot;: 2.16993,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;position_error_m&quot;: 0.00383,
+ &quot;orientation_error_deg&quot;: 0.404,
+ &quot;commanded_delta_m&quot;: [
+  -0.00355,
+  -0.04762,
+  -0.00014
+ ],
+ &quot;measured_delta_m&quot;: [
+  -0.00272,
+  -0.04399,
+  0.00078
+ ]
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>move_to_pose (+x 60cm (expected unreachable))</b><br><span style='color:#8a9199'>stage motion</span></td><td><pre>{
+ &quot;target_pose&quot;: {
+  &quot;position_m&quot;: [
+   0.74902,
+   0.00246,
+   0.85522
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.03559,
+   0.46596,
+   0.88386,
+   0.02043
+  ],
+  &quot;yaw_rad&quot;: 2.16975,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;tolerance&quot;: 0.01,
+ &quot;max_steps&quot;: 120,
+ &quot;offset_from_home_m&quot;: [
+  0.6,
+  0.0,
+  0.0
+ ]
+}</pre></td><td>refused without moving: ErrorCode.IK_FAILED: PyRoki solution exceeds the public pose residual limits<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: false,
+  &quot;status&quot;: &quot;ExecutionStatus.PLANNER_FAILED&quot;,
+  &quot;steps_executed&quot;: 0,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {},
+  &quot;error&quot;: &quot;ErrorCode.IK_FAILED: PyRoki solution exceeds the public pose residual limits&quot;,
+  &quot;diagnostics&quot;: {}
+ },
+ &quot;ee_before&quot;: {
+  &quot;position_m&quot;: [
+   0.14985,
+   0.00609,
+   0.85613
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.03866,
+   0.46569,
+   0.88383,
+   0.02215
+  ],
+  &quot;yaw_rad&quot;: 2.16993,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;ee_after&quot;: {
+  &quot;position_m&quot;: [
+   0.14985,
+   0.00609,
+   0.85613
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.03866,
+   0.46569,
+   0.88383,
+   0.02215
+  ],
+  &quot;yaw_rad&quot;: 2.16993,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;position_error_m&quot;: 0.59919,
+ &quot;orientation_error_deg&quot;: 0.404,
+ &quot;commanded_delta_m&quot;: [
+  0.59918,
+  -0.00363,
+  -0.00092
+ ],
+ &quot;measured_delta_m&quot;: [
+  0.0,
+  0.0,
+  0.0
+ ]
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>move_to_pose (rotate the tool 20 deg in place)</b><br><span style='color:#8a9199'>stage motion</span></td><td><pre>{
+ &quot;target_pose&quot;: {
+  &quot;position_m&quot;: [
+   0.14985,
+   0.00609,
+   0.85613
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.03422,
+   0.61209,
+   0.78953,
+   0.02852
+  ],
+  &quot;yaw_rad&quot;: 1.82182,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;why&quot;: &quot;20 deg about the tool&#x27;s own z, same position&quot;
+}</pre></td><td>turned 18.9 deg; orientation error 1.21 deg<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: true,
+  &quot;status&quot;: &quot;ExecutionStatus.SUCCESS&quot;,
+  &quot;steps_executed&quot;: 19,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {
+   &quot;primary&quot;: 0.0008
+  },
+  &quot;error&quot;: &quot;&quot;,
+  &quot;diagnostics&quot;: {
+   &quot;position_error_m&quot;: &quot;0.0007976650154004197&quot;,
+   &quot;orientation_error_rad&quot;: &quot;0.021046490527391035&quot;,
+   &quot;trajectory_executed&quot;: &quot;True&quot;,
+   &quot;joint_target_converged&quot;: &quot;True&quot;
+  }
+ },
+ &quot;ee_before&quot;: {
+  &quot;position_m&quot;: [
+   0.14985,
+   0.00609,
+   0.85613
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.03866,
+   0.46569,
+   0.88383,
+   0.02215
+  ],
+  &quot;yaw_rad&quot;: 2.16993,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;ee_after&quot;: {
+  &quot;position_m&quot;: [
+   0.15002,
+   0.00611,
+   0.85691
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.03707,
+   0.60408,
+   0.79548,
+   0.0303
+  ],
+  &quot;yaw_rad&quot;: 1.84158,
+  &quot;frame&quot;: &quot;robot0_link0&quot;
+ },
+ &quot;position_error_m&quot;: 0.0008,
+ &quot;orientation_error_deg&quot;: 1.206,
+ &quot;orientation_change_deg&quot;: 18.86
+}</pre></td><td class='ok'>yes</td></tr>
+</table>
+<figure><h3>End-effector path of the whole grasp attempt</h3><img src='figures/graspexec/grasp_path_3d.gif' loading='lazy'><figcaption>Measured gripper0_right_eef position at every control tick, against the fish cloud and the candidate pose.</figcaption></figure>
+<figure><h3>Commanded vs achieved Cartesian displacement</h3><img src='figures/motion/move_to_pose_errors.png' loading='lazy'><figcaption>Each move holds orientation and shifts one axis by 5 cm. Final error stays under 6 mm on every axis tested.</figcaption></figure>
+<figure><h3>Every move_to_pose path in one 3D view</h3><img src='figures/motion/move_to_pose_3d.gif' loading='lazy'><figcaption>Measured gripper0_right_eef position at every tick for each requested pose.</figcaption></figure>
+<figure><h3>Recorded episodes</h3>
+<div class='vid'><video src='raw/graspexec/grasp_01_standoff__agentview.mp4' controls muted loop preload='metadata'></video><div class='t'>Scene camera: approach to standoff</div></div>
+<div class='vid'><video src='raw/graspexec/grasp_01_standoff__robot0_eye_in_hand.mp4' controls muted loop preload='metadata'></video><div class='t'>Wrist camera: approach to standoff</div></div>
+<div class='vid'><video src='raw/graspexec/grasp_02_grasp__agentview.mp4' controls muted loop preload='metadata'></video><div class='t'>Scene camera: descend to grasp</div></div>
+<div class='vid'><video src='raw/graspexec/grasp_02_grasp__robot0_eye_in_hand.mp4' controls muted loop preload='metadata'></video><div class='t'>Wrist camera: descend to grasp</div></div>
+<div class='vid'><video src='raw/graspexec/grasp_03_close__agentview.mp4' controls muted loop preload='metadata'></video><div class='t'>Scene camera: close</div></div>
+<div class='vid'><video src='raw/graspexec/grasp_03_close__robot0_eye_in_hand.mp4' controls muted loop preload='metadata'></video><div class='t'>Wrist camera: close</div></div>
+<div class='vid'><video src='raw/graspexec/grasp_04_lift__agentview.mp4' controls muted loop preload='metadata'></video><div class='t'>Scene camera: lift</div></div>
+<div class='vid'><video src='raw/graspexec/grasp_04_lift__robot0_eye_in_hand.mp4' controls muted loop preload='metadata'></video><div class='t'>Wrist camera: lift</div></div>
+<div class='vid'><video src='raw/motion/move_to_pose_+x_5cm__agentview.mp4' controls muted loop preload='metadata'></video><div class='t'>Scene camera: move_to_pose +x_5cm</div></div>
+<div class='vid'><video src='raw/motion/move_to_pose_+y_5cm__agentview.mp4' controls muted loop preload='metadata'></video><div class='t'>Scene camera: move_to_pose +y_5cm</div></div>
+<div class='vid'><video src='raw/motion/move_to_pose_-z_5cm__agentview.mp4' controls muted loop preload='metadata'></video><div class='t'>Scene camera: move_to_pose -z_5cm</div></div>
+<div class='vid'><video src='raw/motion/move_to_pose_back_to_the_home_pose__agentview.mp4' controls muted loop preload='metadata'></video><div class='t'>Scene camera: move_to_pose back_to_the_home_pose</div></div>
+<div class='vid'><video src='raw/motion/move_to_pose_rotate20__agentview.mp4' controls muted loop preload='metadata'></video><div class='t'>Scene camera: move_to_pose rotate20</div></div>
+</figure>
+<h2 id='move_synchronized'><code>move_synchronized</code><span class='badge b-bad'>0/1 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>move_synchronized (one arm, current pose)</b><br><span style='color:#8a9199'>stage motion</span></td><td><pre>{
+ &quot;targets&quot;: {
+  &quot;primary&quot;: {
+   &quot;position_m&quot;: [
+    0.15002,
+    0.00611,
+    0.85691
+   ],
+   &quot;quaternion_wxyz&quot;: [
+    0.03707,
+    0.60408,
+    0.79548,
+    0.0303
+   ],
+   &quot;yaw_rad&quot;: 1.84158,
+   &quot;frame&quot;: &quot;robot0_link0&quot;
+  }
+ },
+ &quot;tolerance&quot;: 0.02,
+ &quot;max_steps&quot;: 60
+}</pre></td><td>ErrorCode.INVALID_REQUEST: invalid trajectory: trajectory must be a Trajectory<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: false,
+  &quot;status&quot;: &quot;ExecutionStatus.INVALID_REQUEST&quot;,
+  &quot;steps_executed&quot;: 0,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {},
+  &quot;error&quot;: &quot;ErrorCode.INVALID_REQUEST: invalid trajectory: trajectory must be a Trajectory&quot;,
+  &quot;diagnostics&quot;: {}
+ }
+}</pre></td><td class='bad'>NO</td></tr>
+</table>
+<h2 id='open_gripper'><code>open_gripper</code><span class='badge b-ok'>1/1 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>open_gripper()</b><br><span style='color:#8a9199'>stage gripper</span></td><td><pre>{
+ &quot;call&quot;: &quot;open_gripper()&quot;
+}</pre></td><td>jaw 0.514 -&gt; 0.986 in 30 ticks<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: true,
+  &quot;status&quot;: &quot;ExecutionStatus.SUCCESS&quot;,
+  &quot;steps_executed&quot;: 30,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {
+   &quot;gripper_position&quot;: 0.01362
+  },
+  &quot;error&quot;: &quot;&quot;,
+  &quot;diagnostics&quot;: {}
+ },
+ &quot;measured_before&quot;: 0.5138,
+ &quot;measured_after&quot;: 0.9864
+}</pre></td><td class='ok'>yes</td></tr>
+</table>
+<figure><h3>Jaw width through every gripper call</h3><img src='figures/gripper/gripper_trace.png' loading='lazy'><figcaption>Each call runs a fixed 30-tick settle loop; the jaw reaches 0.98 open / 0.01 closed and holds. set_gripper(0.5) is refused before any tick is spent.</figcaption></figure>
+<h2 id='close_gripper'><code>close_gripper</code><span class='badge b-ok'>2/2 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>close_gripper on the candidate grasp</b><br><span style='color:#8a9199'>stage graspexec</span></td><td><pre>{
+ &quot;at&quot;: &quot;the grasp pose&quot;
+}</pre></td><td>jaw settled at 0.008 (1 = open, 0 = closed)<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: true,
+  &quot;status&quot;: &quot;ExecutionStatus.SUCCESS&quot;,
+  &quot;steps_executed&quot;: 30,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {
+   &quot;gripper_position&quot;: 0.00838
+  },
+  &quot;error&quot;: &quot;&quot;,
+  &quot;diagnostics&quot;: {}
+ },
+ &quot;measured_jaw&quot;: 0.0084
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>close_gripper()</b><br><span style='color:#8a9199'>stage gripper</span></td><td><pre>{
+ &quot;call&quot;: &quot;close_gripper()&quot;
+}</pre></td><td>jaw 0.986 -&gt; 0.014 in 30 ticks<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: true,
+  &quot;status&quot;: &quot;ExecutionStatus.SUCCESS&quot;,
+  &quot;steps_executed&quot;: 30,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {
+   &quot;gripper_position&quot;: 0.01422
+  },
+  &quot;error&quot;: &quot;&quot;,
+  &quot;diagnostics&quot;: {}
+ },
+ &quot;measured_before&quot;: 0.9864,
+ &quot;measured_after&quot;: 0.0142
+}</pre></td><td class='ok'>yes</td></tr>
+</table>
+<figure><h3>Jaw width through every gripper call</h3><img src='figures/gripper/gripper_trace.png' loading='lazy'><figcaption>Each call runs a fixed 30-tick settle loop; the jaw reaches 0.98 open / 0.01 closed and holds. set_gripper(0.5) is refused before any tick is spent.</figcaption></figure>
+<h2 id='set_gripper'><code>set_gripper</code><span class='badge b-ok'>3/3 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>set_gripper(1.0)</b><br><span style='color:#8a9199'>stage gripper</span></td><td><pre>{
+ &quot;call&quot;: &quot;set_gripper(1.0)&quot;
+}</pre></td><td>jaw 0.014 -&gt; 0.983 in 30 ticks<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: true,
+  &quot;status&quot;: &quot;ExecutionStatus.SUCCESS&quot;,
+  &quot;steps_executed&quot;: 30,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {
+   &quot;gripper_position&quot;: 0.01687
+  },
+  &quot;error&quot;: &quot;&quot;,
+  &quot;diagnostics&quot;: {}
+ },
+ &quot;measured_before&quot;: 0.0142,
+ &quot;measured_after&quot;: 0.9831
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>set_gripper(0.0)</b><br><span style='color:#8a9199'>stage gripper</span></td><td><pre>{
+ &quot;call&quot;: &quot;set_gripper(0.0)&quot;
+}</pre></td><td>jaw 0.983 -&gt; 0.014 in 30 ticks<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: true,
+  &quot;status&quot;: &quot;ExecutionStatus.SUCCESS&quot;,
+  &quot;steps_executed&quot;: 30,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {
+   &quot;gripper_position&quot;: 0.01422
+  },
+  &quot;error&quot;: &quot;&quot;,
+  &quot;diagnostics&quot;: {}
+ },
+ &quot;measured_before&quot;: 0.9831,
+ &quot;measured_after&quot;: 0.0142
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>set_gripper(0.5)</b><br><span style='color:#8a9199'>stage gripper</span></td><td><pre>{
+ &quot;call&quot;: &quot;set_gripper(0.5)&quot;
+}</pre></td><td>refused: ErrorCode.UNSUPPORTED: this gripper only holds fully open (1.0) or fully closed (0.0); 0.5 cannot be held -- use open_gripper() or close_gripper(), and control approach clearance with geometry instead<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: false,
+  &quot;status&quot;: &quot;ExecutionStatus.UNSUPPORTED&quot;,
+  &quot;steps_executed&quot;: 0,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {},
+  &quot;error&quot;: &quot;ErrorCode.UNSUPPORTED: this gripper only holds fully open (1.0) or fully closed (0.0); 0.5 cannot be held -- use open_gripper() or close_gripper(), and control approach clearance with geometry instead&quot;,
+  &quot;diagnostics&quot;: {}
+ },
+ &quot;measured_before&quot;: 0.0142,
+ &quot;measured_after&quot;: 0.0142
+}</pre></td><td class='ok'>yes</td></tr>
+</table>
+<figure><h3>Jaw width through every gripper call</h3><img src='figures/gripper/gripper_trace.png' loading='lazy'><figcaption>Each call runs a fixed 30-tick settle loop; the jaw reaches 0.98 open / 0.01 closed and holds. set_gripper(0.5) is refused before any tick is spent.</figcaption></figure>
+<h2 id='set_grippers'><code>set_grippers</code><span class='badge b-ok'>2/2 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>set_grippers({&#x27;primary&#x27;: 1.0})</b><br><span style='color:#8a9199'>stage gripper</span></td><td><pre>{
+ &quot;call&quot;: &quot;set_grippers({&#x27;primary&#x27;: 1.0})&quot;
+}</pre></td><td>jaw 0.014 -&gt; 0.983 in 30 ticks<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: true,
+  &quot;status&quot;: &quot;ExecutionStatus.SUCCESS&quot;,
+  &quot;steps_executed&quot;: 30,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {
+   &quot;gripper_position&quot;: 0.01687
+  },
+  &quot;error&quot;: &quot;&quot;,
+  &quot;diagnostics&quot;: {}
+ },
+ &quot;measured_before&quot;: 0.0142,
+ &quot;measured_after&quot;: 0.9831
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>set_grippers({&#x27;left&#x27;: 1.0}) -- wrong arm name</b><br><span style='color:#8a9199'>stage gripper</span></td><td><pre>{
+ &quot;call&quot;: &quot;set_grippers({&#x27;left&#x27;: 1.0}) -- wrong arm name&quot;
+}</pre></td><td>refused: ErrorCode.INVALID_REQUEST: positions must name every robot arm<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: false,
+  &quot;status&quot;: &quot;ExecutionStatus.INVALID_REQUEST&quot;,
+  &quot;steps_executed&quot;: 0,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {},
+  &quot;error&quot;: &quot;ErrorCode.INVALID_REQUEST: positions must name every robot arm&quot;,
+  &quot;diagnostics&quot;: {}
+ },
+ &quot;measured_before&quot;: 0.9831,
+ &quot;measured_after&quot;: 0.9831
+}</pre></td><td class='ok'>yes</td></tr>
+</table>
+<figure><h3>Jaw width through every gripper call</h3><img src='figures/gripper/gripper_trace.png' loading='lazy'><figcaption>Each call runs a fixed 30-tick settle loop; the jaw reaches 0.98 open / 0.01 closed and holds. set_gripper(0.5) is refused before any tick is spent.</figcaption></figure>
+<h2 id='go_home'><code>go_home</code><span class='badge b-ok'>1/1 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>go_home</b><br><span style='color:#8a9199'>stage motion</span></td><td><pre>{}</pre></td><td>18 ticks, max joint error from the captured home 0.00837 rad<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: true,
+  &quot;status&quot;: &quot;ExecutionStatus.SUCCESS&quot;,
+  &quot;steps_executed&quot;: 18,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {
+   &quot;primary&quot;: 0.00837
+  },
+  &quot;error&quot;: &quot;&quot;,
+  &quot;diagnostics&quot;: {
+   &quot;joint_error_rad&quot;: &quot;0.008371650706976652&quot;
+  }
+ },
+ &quot;home_joints&quot;: [
+  0.00225,
+  -0.22333,
+  -0.00542,
+  -0.5032,
+  0.00881,
+  0.37459,
+  0.19894
+ ],
+ &quot;reached&quot;: [
+  0.00222,
+  -0.21558,
+  0.00295,
+  -0.50777,
+  0.00866,
+  0.37435,
+  0.19879
+ ],
+ &quot;max_joint_error_rad&quot;: 0.00837
+}</pre></td><td class='ok'>yes</td></tr>
+</table>
+<figure><h3>go_home()</h3><img src='figures/motion/go_home_tracking.png' loading='lazy'><figcaption>Returns to the joint vector captured when the API was constructed.</figcaption></figure>
+<figure><h3>Recorded episodes</h3>
+<div class='vid'><video src='raw/motion/go_home__agentview.mp4' controls muted loop preload='metadata'></video><div class='t'>Scene camera: go_home</div></div>
+</figure>
+<h2 id='robocasa.get_task_metadata'><code>robocasa.get_task_metadata</code><span class='badge b-ok'>1/1 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>robocasa.get_task_metadata</b><br><span style='color:#8a9199'>stage identity</span></td><td><pre>{}</pre></td><td>10 fields<pre>{
+ &quot;arms&quot;: [
+  &quot;primary&quot;
+ ],
+ &quot;camera_names&quot;: [
+  &quot;agentview&quot;,
+  &quot;robot0_eye_in_hand&quot;
+ ],
+ &quot;environment&quot;: &quot;PickPlaceCounterToStove&quot;,
+ &quot;family&quot;: &quot;robocasa&quot;,
+ &quot;language&quot;: &quot;Pick the object from the counter and place it on the stove.&quot;,
+ &quot;robots&quot;: [
+  &quot;PandaOmron&quot;
+ ],
+ &quot;suite_name&quot;: &quot;PickPlaceCounterToStove&quot;,
+ &quot;task_id&quot;: 0,
+ &quot;task_name&quot;: &quot;PickPlaceCounterToStove&quot;,
+ &quot;task_ref&quot;: &quot;PickPlaceCounterToStove:0&quot;
+}</pre></td><td class='ok'>yes</td></tr>
+</table>
+<h2 id='robocasa.get_controller_metadata'><code>robocasa.get_controller_metadata</code><span class='badge b-part'>1/2 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>robocasa.get_controller_metadata</b><br><span style='color:#8a9199'>stage identity</span></td><td><pre>{}</pre></td><td>12 fields<pre>{
+ &quot;action_dimension&quot;: 13,
+ &quot;arm_names&quot;: [
+  &quot;primary&quot;
+ ],
+ &quot;base_frame&quot;: &quot;robot0_link0&quot;,
+ &quot;camera_names&quot;: [
+  &quot;agentview&quot;,
+  &quot;robot0_eye_in_hand&quot;
+ ],
+ &quot;control_frequency_hz&quot;: 20.0,
+ &quot;control_period_s&quot;: 0.05,
+ &quot;controller&quot;: &quot;JOINT_POSITION&quot;,
+ &quot;gripper_semantics&quot;: {
+  &quot;normalized&quot;: &quot;0=closed, 1=open&quot;,
+  &quot;native&quot;: &quot;1=closed, -1=open&quot;
+ },
+ &quot;controllable_gripper_arms&quot;: [
+  &quot;primary&quot;
+ ],
+ &quot;supported_action_modes&quot;: [
+  &quot;joint_position&quot;
+ ],
+ &quot;mobile_base&quot;: true,
+ &quot;joint_limits&quot;: {
+  &quot;low&quot;: [
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   -2.8973,
+   -1.7628,
+   -2.8973
+  ],
+  &quot;high&quot;: [
+   0.0,
+   0.0,
+   0.0,
+   0.34,
+   2.8973,
+   1.7628,
+   2.8973
+  ]
+ }
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>robocasa.get_controller_metadata joint_limits vs the measured arm</b><br><span style='color:#8a9199'>stage identity</span></td><td><pre>{
+ &quot;check&quot;: &quot;measured joint positions against the published joint_limits&quot;
+}</pre></td><td>4 of 7 measured joints fall OUTSIDE the published range (joints [0, 1, 2, 3])<pre>{
+ &quot;published_low&quot;: [
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  -2.8973,
+  -1.7628,
+  -2.8973
+ ],
+ &quot;published_high&quot;: [
+  0.0,
+  0.0,
+  0.0,
+  0.34,
+  2.8973,
+  1.7628,
+  2.8973
+ ],
+ &quot;measured&quot;: [
+  0.0023,
+  -0.2233,
+  -0.0054,
+  -0.5032,
+  0.0088,
+  0.3746,
+  0.1989
+ ],
+ &quot;joints_outside_their_published_range&quot;: [
+  {
+   &quot;joint&quot;: 0,
+   &quot;measured_rad&quot;: 0.0023,
+   &quot;published_low&quot;: 0.0,
+   &quot;published_high&quot;: 0.0
+  },
+  {
+   &quot;joint&quot;: 1,
+   &quot;measured_rad&quot;: -0.2233,
+   &quot;published_low&quot;: 0.0,
+   &quot;published_high&quot;: 0.0
+  },
+  {
+   &quot;joint&quot;: 2,
+   &quot;measured_rad&quot;: -0.0054,
+   &quot;published_low&quot;: 0.0,
+   &quot;published_high&quot;: 0.0
+  },
+  {
+   &quot;joint&quot;: 3,
+   &quot;measured_rad&quot;: -0.5032,
+   &quot;published_low&quot;: 0.0,
+   &quot;published_high&quot;: 0.34
+  }
+ ],
+ &quot;panda_reference_low&quot;: [
+  -2.8973,
+  -1.7628,
+  -2.8973,
+  -3.0718,
+  -2.8973,
+  -0.0175,
+  -2.8973
+ ],
+ &quot;panda_reference_high&quot;: [
+  2.8973,
+  1.7628,
+  2.8973,
+  -0.0698,
+  2.8973,
+  3.7525,
+  2.8973
+ ]
+}</pre></td><td class='bad'>NO</td></tr>
+</table>
+<h2 id='robocasa.get_base_pose'><code>robocasa.get_base_pose</code><span class='badge b-ok'>2/2 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>robocasa.get_base_pose</b><br><span style='color:#8a9199'>stage base</span></td><td><pre>{}</pre></td><td>spawn at (2.113, -0.840) world, yaw 1.570 rad<pre>{
+ &quot;position_m&quot;: [
+  2.1125,
+  -0.84047,
+  0.70001
+ ],
+ &quot;quaternion_wxyz&quot;: [
+  0.70754,
+  0.0,
+  0.0,
+  0.70667
+ ],
+ &quot;yaw_rad&quot;: 1.56956,
+ &quot;frame&quot;: &quot;world&quot;
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>robocasa.get_base_pose</b><br><span style='color:#8a9199'>stage identity</span></td><td><pre>{}</pre></td><td>world pose of robot0_link0, yaw=1.570<pre>{
+ &quot;position_m&quot;: [
+  2.1125,
+  -0.84047,
+  0.70001
+ ],
+ &quot;quaternion_wxyz&quot;: [
+  0.70754,
+  0.0,
+  0.0,
+  0.70667
+ ],
+ &quot;yaw_rad&quot;: 1.56956,
+ &quot;frame&quot;: &quot;world&quot;
+}</pre></td><td class='ok'>yes</td></tr>
+</table>
+<figure><h3>Spawn pose on the occupancy map</h3><img src='figures/base/occupancy.png' loading='lazy'><figcaption></figcaption></figure>
+<h2 id='robocasa.navigate_to_pose'><code>robocasa.navigate_to_pose</code><span class='badge b-part'>3/5 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>robocasa.navigate_to_pose (lateral +0.15 m)</b><br><span style='color:#8a9199'>stage base</span></td><td><pre>{
+ &quot;dx&quot;: 0.0,
+ &quot;dy&quot;: 0.15,
+ &quot;dyaw&quot;: 0.0,
+ &quot;frame&quot;: &quot;current base frame, relative&quot;
+}</pre></td><td>commanded (0.0, 0.15, 0.0) -&gt; measured (-0.000, +0.141, -0.000); converged<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: true,
+  &quot;status&quot;: &quot;ExecutionStatus.SUCCESS&quot;,
+  &quot;steps_executed&quot;: 14,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {
+   &quot;base_translation_m&quot;: 0.14072
+  },
+  &quot;error&quot;: &quot;&quot;,
+  &quot;diagnostics&quot;: {}
+ },
+ &quot;base_before&quot;: {
+  &quot;position_m&quot;: [
+   2.1125,
+   -0.84047,
+   0.70001
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.70754,
+   0.0,
+   0.0,
+   0.70667
+  ],
+  &quot;yaw_rad&quot;: 1.56956,
+  &quot;frame&quot;: &quot;world&quot;
+ },
+ &quot;base_after&quot;: {
+  &quot;position_m&quot;: [
+   1.97178,
+   -0.84045,
+   0.7
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.70755,
+   0.0,
+   0.0,
+   0.70666
+  ],
+  &quot;yaw_rad&quot;: 1.56953,
+  &quot;frame&quot;: &quot;world&quot;
+ },
+ &quot;commanded_local&quot;: [
+  0.0,
+  0.15,
+  0.0
+ ],
+ &quot;measured_local&quot;: [
+  -0.0001,
+  0.1407,
+  -0.0
+ ]
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>robocasa.navigate_to_pose (lateral -0.15 m)</b><br><span style='color:#8a9199'>stage base</span></td><td><pre>{
+ &quot;dx&quot;: 0.0,
+ &quot;dy&quot;: -0.15,
+ &quot;dyaw&quot;: 0.0,
+ &quot;frame&quot;: &quot;current base frame, relative&quot;
+}</pre></td><td>commanded (0.0, -0.15, 0.0) -&gt; measured (+0.000, -0.141, +0.000); converged<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: true,
+  &quot;status&quot;: &quot;ExecutionStatus.SUCCESS&quot;,
+  &quot;steps_executed&quot;: 14,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {
+   &quot;base_translation_m&quot;: 0.14062
+  },
+  &quot;error&quot;: &quot;&quot;,
+  &quot;diagnostics&quot;: {}
+ },
+ &quot;base_before&quot;: {
+  &quot;position_m&quot;: [
+   1.97178,
+   -0.84045,
+   0.7
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.70755,
+   0.0,
+   0.0,
+   0.70666
+  ],
+  &quot;yaw_rad&quot;: 1.56953,
+  &quot;frame&quot;: &quot;world&quot;
+ },
+ &quot;base_after&quot;: {
+  &quot;position_m&quot;: [
+   2.1124,
+   -0.84045,
+   0.7
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.70753,
+   0.0,
+   0.0,
+   0.70668
+  ],
+  &quot;yaw_rad&quot;: 1.5696,
+  &quot;frame&quot;: &quot;world&quot;
+ },
+ &quot;commanded_local&quot;: [
+  0.0,
+  -0.15,
+  0.0
+ ],
+ &quot;measured_local&quot;: [
+  0.0002,
+  -0.1406,
+  0.0001
+ ]
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>robocasa.navigate_to_pose (yaw +0.30 rad)</b><br><span style='color:#8a9199'>stage base</span></td><td><pre>{
+ &quot;dx&quot;: 0.0,
+ &quot;dy&quot;: 0.0,
+ &quot;dyaw&quot;: 0.3,
+ &quot;frame&quot;: &quot;current base frame, relative&quot;
+}</pre></td><td>commanded (0.0, 0.0, 0.3) -&gt; measured (-0.031, -0.006, +0.279); ErrorCode.EXECUTION_FAILED: base did not converge; the path is probably blocked (moved 0.032 m of the requested motion)<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: false,
+  &quot;status&quot;: &quot;ExecutionStatus.CONTROLLER_FAILED&quot;,
+  &quot;steps_executed&quot;: 1200,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {
+   &quot;base_translation_m&quot;: 0.03182
+  },
+  &quot;error&quot;: &quot;ErrorCode.EXECUTION_FAILED: base did not converge; the path is probably blocked (moved 0.032 m of the requested motion)&quot;,
+  &quot;diagnostics&quot;: {}
+ },
+ &quot;base_before&quot;: {
+  &quot;position_m&quot;: [
+   2.1124,
+   -0.84045,
+   0.7
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.70753,
+   0.0,
+   0.0,
+   0.70668
+  ],
+  &quot;yaw_rad&quot;: 1.5696,
+  &quot;frame&quot;: &quot;world&quot;
+ },
+ &quot;base_after&quot;: {
+  &quot;position_m&quot;: [
+   2.11828,
+   -0.87172,
+   0.7
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.60232,
+   0.0,
+   0.0,
+   0.79826
+  ],
+  &quot;yaw_rad&quot;: 1.84879,
+  &quot;frame&quot;: &quot;world&quot;
+ },
+ &quot;commanded_local&quot;: [
+  0.0,
+  0.0,
+  0.3
+ ],
+ &quot;measured_local&quot;: [
+  -0.0313,
+  -0.0059,
+  0.2792
+ ]
+}</pre></td><td class='bad'>NO</td></tr>
+<tr><td><b>robocasa.navigate_to_pose (yaw -0.30 rad)</b><br><span style='color:#8a9199'>stage base</span></td><td><pre>{
+ &quot;dx&quot;: 0.0,
+ &quot;dy&quot;: 0.0,
+ &quot;dyaw&quot;: -0.3,
+ &quot;frame&quot;: &quot;current base frame, relative&quot;
+}</pre></td><td>commanded (0.0, 0.0, -0.3) -&gt; measured (+0.002, -0.019, -0.281); converged<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: true,
+  &quot;status&quot;: &quot;ExecutionStatus.SUCCESS&quot;,
+  &quot;steps_executed&quot;: 9,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {
+   &quot;base_translation_m&quot;: 0.01951
+  },
+  &quot;error&quot;: &quot;&quot;,
+  &quot;diagnostics&quot;: {}
+ },
+ &quot;base_before&quot;: {
+  &quot;position_m&quot;: [
+   2.11828,
+   -0.87172,
+   0.7
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.60232,
+   0.0,
+   0.0,
+   0.79826
+  ],
+  &quot;yaw_rad&quot;: 1.84879,
+  &quot;frame&quot;: &quot;world&quot;
+ },
+ &quot;base_after&quot;: {
+  &quot;position_m&quot;: [
+   2.13631,
+   -0.86427,
+   0.7
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.70827,
+   0.0,
+   0.0,
+   0.70594
+  ],
+  &quot;yaw_rad&quot;: 1.5675,
+  &quot;frame&quot;: &quot;world&quot;
+ },
+ &quot;commanded_local&quot;: [
+  0.0,
+  0.0,
+  -0.3
+ ],
+ &quot;measured_local&quot;: [
+  0.0022,
+  -0.0194,
+  -0.2813
+ ]
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>robocasa.navigate_to_pose (forward +0.30 m (counter ahead))</b><br><span style='color:#8a9199'>stage base</span></td><td><pre>{
+ &quot;dx&quot;: 0.3,
+ &quot;dy&quot;: 0.0,
+ &quot;dyaw&quot;: 0.0,
+ &quot;frame&quot;: &quot;current base frame, relative&quot;
+}</pre></td><td>commanded (0.3, 0.0, 0.0) -&gt; measured (+0.055, -0.000, +0.003); ErrorCode.EXECUTION_FAILED: base did not converge; the path is probably blocked (moved 0.055 m of the requested motion)<pre>{
+ &quot;execution&quot;: {
+  &quot;ok&quot;: false,
+  &quot;status&quot;: &quot;ExecutionStatus.CONTROLLER_FAILED&quot;,
+  &quot;steps_executed&quot;: 1200,
+  &quot;terminated&quot;: false,
+  &quot;truncated&quot;: false,
+  &quot;final_errors&quot;: {
+   &quot;base_translation_m&quot;: 0.05542
+  },
+  &quot;error&quot;: &quot;ErrorCode.EXECUTION_FAILED: base did not converge; the path is probably blocked (moved 0.055 m of the requested motion)&quot;,
+  &quot;diagnostics&quot;: {}
+ },
+ &quot;base_before&quot;: {
+  &quot;position_m&quot;: [
+   2.13631,
+   -0.86427,
+   0.7
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.70827,
+   0.0,
+   0.0,
+   0.70594
+  ],
+  &quot;yaw_rad&quot;: 1.5675,
+  &quot;frame&quot;: &quot;world&quot;
+ },
+ &quot;base_after&quot;: {
+  &quot;position_m&quot;: [
+   2.13681,
+   -0.80886,
+   0.7
+  ],
+  &quot;quaternion_wxyz&quot;: [
+   0.70713,
+   0.0,
+   0.0,
+   0.70708
+  ],
+  &quot;yaw_rad&quot;: 1.57072,
+  &quot;frame&quot;: &quot;world&quot;
+ },
+ &quot;commanded_local&quot;: [
+  0.3,
+  0.0,
+  0.0
+ ],
+ &quot;measured_local&quot;: [
+  0.0554,
+  -0.0003,
+  0.0032
+ ]
+}</pre></td><td class='bad'>NO</td></tr>
+</table>
+<figure><h3>Commanded vs measured base motion</h3><img src='figures/base/navigate.png' loading='lazy'><figcaption>Lateral and yaw track within ~6%. The forward command is blocked by the counter and stops after 5 cm, which the tool reports as a non-converged ExecutionResult.</figcaption></figure>
+<figure><h3>Recorded episodes</h3>
+<div class='vid'><video src='raw/base/navigate_forward_0p3_0p0_0p0.mp4' controls muted loop preload='metadata'></video><div class='t'>Scene camera: navigate_forward_0p3_0p0_0p0</div></div>
+<div class='vid'><video src='raw/base/navigate_lateral_0p0_-0p15_0p0.mp4' controls muted loop preload='metadata'></video><div class='t'>Scene camera: navigate_lateral_0p0_-0p15_0p0</div></div>
+<div class='vid'><video src='raw/base/navigate_lateral_0p0_0p15_0p0.mp4' controls muted loop preload='metadata'></video><div class='t'>Scene camera: navigate_lateral_0p0_0p15_0p0</div></div>
+<div class='vid'><video src='raw/base/navigate_yaw_0p0_0p0_-0p3.mp4' controls muted loop preload='metadata'></video><div class='t'>Scene camera: navigate_yaw_0p0_0p0_-0p3</div></div>
+<div class='vid'><video src='raw/base/navigate_yaw_0p0_0p0_0p3.mp4' controls muted loop preload='metadata'></video><div class='t'>Scene camera: navigate_yaw_0p0_0p0_0p3</div></div>
+</figure>
+<h2 id='robocasa.base_pose_is_free'><code>robocasa.base_pose_is_free</code><span class='badge b-ok'>2/2 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>robocasa.base_pose_is_free (961-cell occupancy sweep)</b><br><span style='color:#8a9199'>stage base</span></td><td><pre>{
+ &quot;x,y&quot;: &quot;a 31x31 grid, 0.1 m, centred on the spawn pose&quot;,
+ &quot;yaw&quot;: 1.5696
+}</pre></td><td>spawn free=True; 287/961 cells free (9.6 s for the sweep)<pre>{
+ &quot;spawn_is_free&quot;: true,
+ &quot;free_cells&quot;: 287,
+ &quot;blocked_cells&quot;: 674,
+ &quot;total_queries&quot;: 962,
+ &quot;seconds_for_all_queries&quot;: 9.58
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>frame cross-check: counter cloud -&gt; world -&gt; base_pose_is_free</b><br><span style='color:#8a9199'>stage base</span></td><td><pre>{
+ &quot;x,y&quot;: &quot;counter cloud centroids pushed from robot0_link0 into world with robocasa.get_base_pose&quot;
+}</pre></td><td>100% of counter points report a blocked footprint, so the two frames agree<pre>{
+ &quot;n_sampled&quot;: 766,
+ &quot;fraction_reported_blocked&quot;: 1.0,
+ &quot;counter_centroid_base&quot;: [
+  0.4264,
+  0.3666,
+  0.2209
+ ],
+ &quot;counter_centroid_world&quot;: [
+  1.7464,
+  -0.4136,
+  0.9209
+ ]
+}</pre></td><td class='ok'>yes</td></tr>
+</table>
+<figure><h3>An occupancy map built from the yes/no answer</h3><img src='figures/base/occupancy.png' loading='lazy'><figcaption>The tool answers one pose at a time; sweeping it reconstructs the free space. The black counter points -- pushed into world with robocasa.get_base_pose -- land on the red band, so the two frames agree.</figcaption></figure>
+<h2 id='robocasa.plan_standoff_pose'><code>robocasa.plan_standoff_pose</code><span class='badge b-ok'>2/2 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>robocasa.plan_standoff_pose(standoff_m=0.3)</b><br><span style='color:#8a9199'>stage base</span></td><td><pre>{
+ &quot;support_cloud&quot;: &quot;counter (28310 pts, robot0_link0)&quot;,
+ &quot;object_cloud&quot;: &quot;fish (588 pts)&quot;,
+ &quot;standoff_m&quot;: 0.3
+}</pre></td><td>(x,y,yaw)=(-0.119, 0.477, 0.001) in robot0_link0; footprint free there: True<pre>{
+ &quot;x_y_yaw&quot;: [
+  -0.1189,
+  0.4765,
+  0.0014
+ ],
+ &quot;frame&quot;: &quot;robot0_link0&quot;,
+ &quot;world_xy&quot;: [
+  1.6358,
+  -0.9588
+ ],
+ &quot;base_pose_is_free_there&quot;: true
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>robocasa.plan_standoff_pose(standoff_m=0.6)</b><br><span style='color:#8a9199'>stage base</span></td><td><pre>{
+ &quot;support_cloud&quot;: &quot;counter (28310 pts, robot0_link0)&quot;,
+ &quot;object_cloud&quot;: &quot;fish (588 pts)&quot;,
+ &quot;standoff_m&quot;: 0.6
+}</pre></td><td>(x,y,yaw)=(-0.419, 0.476, 0.001) in robot0_link0; footprint free there: True<pre>{
+ &quot;x_y_yaw&quot;: [
+  -0.4189,
+  0.4761,
+  0.0014
+ ],
+ &quot;frame&quot;: &quot;robot0_link0&quot;,
+ &quot;world_xy&quot;: [
+  1.6359,
+  -1.2588
+ ],
+ &quot;base_pose_is_free_there&quot;: true
+}</pre></td><td class='ok'>yes</td></tr>
+</table>
+<figure><h3>Where the standoff poses land</h3><img src='figures/base/occupancy.png' loading='lazy'><figcaption></figcaption></figure>
+<h2 id='robocasa.plan_approach_pose'><code>robocasa.plan_approach_pose</code><span class='badge b-ok'>2/2 checks behaved</span></h2>
+<table><tr><th>call</th><th>input</th><th>result</th><th>ok</th></tr>
+<tr><td><b>robocasa.plan_approach_pose(distance_m=0.7)</b><br><span style='color:#8a9199'>stage base</span></td><td><pre>{
+ &quot;object_cloud&quot;: &quot;fish (588 pts, robot0_link0)&quot;,
+ &quot;distance_m&quot;: 0.7
+}</pre></td><td>(x,y,yaw)=(0.000, 0.000, 0.945) in robot0_link0; footprint free there: False<pre>{
+ &quot;x_y_yaw&quot;: [
+  0.0,
+  0.0,
+  0.945
+ ],
+ &quot;frame&quot;: &quot;robot0_link0&quot;,
+ &quot;world_xy&quot;: [
+  2.1125,
+  -0.8405
+ ],
+ &quot;base_pose_is_free_there&quot;: false
+}</pre></td><td class='ok'>yes</td></tr>
+<tr><td><b>robocasa.plan_approach_pose(distance_m=0.4)</b><br><span style='color:#8a9199'>stage base</span></td><td><pre>{
+ &quot;object_cloud&quot;: &quot;fish (588 pts, robot0_link0)&quot;,
+ &quot;distance_m&quot;: 0.4
+}</pre></td><td>(x,y,yaw)=(0.111, 0.153, 0.945) in robot0_link0; footprint free there: False<pre>{
+ &quot;x_y_yaw&quot;: [
+  0.1106,
+  0.153,
+  0.945
+ ],
+ &quot;frame&quot;: &quot;robot0_link0&quot;,
+ &quot;world_xy&quot;: [
+  1.9596,
+  -0.7297
+ ],
+ &quot;base_pose_is_free_there&quot;: false
+}</pre></td><td class='ok'>yes</td></tr>
+</table>
+<figure><h3>Where the approach poses land</h3><img src='figures/base/occupancy.png' loading='lazy'><figcaption></figcaption></figure>
+</div></body></html>

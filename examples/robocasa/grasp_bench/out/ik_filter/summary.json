@@ -1,0 +1,21 @@
+{
+  "task": "PickPlaceCounterToStove",
+  "ik_filter": true,
+  "seeds": "101-150",
+  "episodes": 50,
+  "picked": 5,
+  "success_rate": 0.1,
+  "succeeded_on_rank": {
+    "1": 2,
+    "2": 2,
+    "0": 1
+  },
+  "failure_reasons": {
+    "no_attempt_succeeded": 27,
+    "no_grasps": 18
+  },
+  "episodes_with_no_candidates": 2,
+  "episodes_with_no_feasible_candidate": 16,
+  "mean_candidates": 17.68,
+  "total_minutes": 21.9
+}

@@ -1,0 +1,9 @@
+{
+  "task": "PickPlaceCounterToStove",
+  "seed": 101,
+  "stages": [
+    "planning",
+    "graspexec"
+  ],
+  "stage_failures": []
+}

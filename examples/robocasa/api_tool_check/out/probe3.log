@@ -1,0 +1,26 @@
+task=PickPlaceCounterToStove seed=101 stages=['planning', 'graspexec']
+connected; 31 public tools
+
+=== stage planning ====================================================
+  [ok  ] plan_motion (joint goal, interpolation)  -- 3 waypoints, planner=joint_interpolation, collision_aware=False
+  [ok  ] plan_motion (joint goal, curobo)  -- 27 waypoints, planner=curobo_v2_cspace, collision_aware=True
+  [ok  ] plan_motion (pose goal, composed (pyroki IK + interpolation))  -- 18 waypoints, planner=pyroki+joint_interpolation, collision_aware=False
+  [ok  ] plan_motion (pose goal, pyroki IK + curobo trajectory)  -- 52 waypoints, planner=curobo_v2_cspace, collision_aware=True
+  [ok  ] plan_motion (pose goal, curobo-integrated pose planner)  -- 52 waypoints, planner=curobo_v2_pose, collision_aware=True
+  [ok  ] plan_motion (curobo, target cloud excluded from the collision world)  -- planned
+  [ok  ] plan_synchronized_motion (one arm)  -- planned
+  [ok  ] execute_trajectory (the cuRobo plan)  -- 27 ticks, final joint error 0.0145 rad
+  [ok  ] execute_trajectory (stale plan -- expected refusal)  -- ErrorCode.STALE_PLAN: trajectory start state no longer matches measured robot state
+  -> /home/felix/robocasa_sim/aspire/examples/robocasa/api_tool_check/out/raw/planning  (9 records, 12 arrays)
+
+=== stage graspexec ===================================================
+  [ok  ] generate_grasps repeated on an identical mask  -- identical calls returned [2] candidates
+  [ok  ] grasp pose geometry (where is the pose relative to its contact point?)  -- pose sits 0.1036 m behind the contact point along its own local +Z
+  [ok  ] move_to_pose -> standoff (10 cm back along the approach axis)  -- 69 ticks, 8.4 mm error
+  [ok  ] move_to_pose -> grasp pose (panda_hand -> eef mapping)  -- 19 ticks, 8.7 mm error
+  [ok  ] close_gripper on the candidate grasp  -- jaw settled at 0.008 (1 = open, 0 = closed)
+  [ok  ] lift after the grasp (did the object come with it?)  -- fish centroid moved +0.000 m in z
+  [FAIL] end-to-end pick outcome  -- NOT picked: jaw closed to 0.005 (empty) and the object rose +0.000 m
+  -> /home/felix/robocasa_sim/aspire/examples/robocasa/api_tool_check/out/raw/graspexec  (7 records, 36 arrays)
+
+stages that raised: none

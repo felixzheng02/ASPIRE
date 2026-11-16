@@ -1,0 +1,19 @@
+{
+  "task": "PickPlaceCounterToStove",
+  "seeds": "101-150",
+  "episodes": 50,
+  "picked": 2,
+  "success_rate": 0.04,
+  "succeeded_on_rank": {
+    "1": 1,
+    "0": 1
+  },
+  "failure_reasons": {
+    "no_attempt_succeeded": 45,
+    "raised: RuntimeError: simulator error in 'get_depth': ValueError: depth buffer for 'robot0_agentview_left' is not normalized: min=nan max=nan shape=(512, 512, 1) dtype=float32 (px<0=90509 px>1=8763)": 1,
+    "no_grasps": 2
+  },
+  "episodes_with_no_candidates": 3,
+  "mean_candidates": 17.3,
+  "total_minutes": 17.8
+}

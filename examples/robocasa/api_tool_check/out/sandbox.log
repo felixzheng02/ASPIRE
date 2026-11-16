@@ -1,0 +1,2 @@
+run: examples/robocasa/api_tool_check/out/sandbox/robocasa/pickplacecountertostove/00-pickplacecountertostove/0101/run-20261107T173846.997190Z-c8e604b5
+program_ok=True task_success=False protocol_success=None termination_reason=program_completed

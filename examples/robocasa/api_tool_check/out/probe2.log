@@ -1,0 +1,39 @@
+task=PickPlaceCounterToStove seed=101 stages=['identity', 'planning', 'graspexec']
+connected; 31 public tools
+
+=== stage identity ====================================================
+  [ok  ] register_tools (the namespace itself)  -- 31 tools exposed
+  [ok  ] get_task_context  -- instruction: 'Pick the fish from the plate and place it in the pan.'
+  [ok  ] robocasa.get_task_metadata  -- 10 fields
+  [ok  ] robocasa.get_controller_metadata  -- 12 fields
+  [FAIL] robocasa.get_controller_metadata joint_limits vs the measured arm  -- 4 of 7 measured joints fall OUTSIDE the published range (joints [0, 1, 2, 3])
+  [ok  ] get_observation  -- both cameras, RGB + metric depth + K + extrinsics
+  [ok  ] calibration round trip (agentview)  -- max reprojection error 2.80e-13 px
+  [ok  ] calibration round trip (robot0_eye_in_hand)  -- max reprojection error 9.32e-13 px
+  [ok  ] get_robot_state  -- 7 joints, base_frame=robot0_link0
+  [ok  ] get_robot_state cross-check against the wrist camera mounting  -- the end-effector origin sits 109 mm from the wrist camera and projects into the wrist image at (256, 428) px, 0.097 m in front of it
+  [ok  ] robocasa.get_base_pose  -- world pose of robot0_link0, yaw=1.570
+  -> /home/felix/robocasa_sim/aspire/examples/robocasa/api_tool_check/out/raw/identity  (11 records, 16 arrays)
+
+=== stage planning ====================================================
+  [ok  ] plan_motion (joint goal, interpolation)  -- 3 waypoints, planner=joint_interpolation, collision_aware=False
+  [ok  ] plan_motion (joint goal, curobo)  -- 27 waypoints, planner=curobo_v2_cspace, collision_aware=True
+  [ok  ] plan_motion (pose goal, composed (pyroki IK + interpolation))  -- 18 waypoints, planner=pyroki+joint_interpolation, collision_aware=False
+  [ok  ] plan_motion (pose goal, pyroki IK + curobo trajectory)  -- 52 waypoints, planner=curobo_v2_cspace, collision_aware=True
+  [ok  ] plan_motion (pose goal, curobo-integrated pose planner)  -- 52 waypoints, planner=curobo_v2_pose, collision_aware=True
+  [ok  ] plan_motion (curobo, target cloud excluded from the collision world)  -- planned
+  [ok  ] execute_trajectory (stale plan -- expected refusal)  -- ErrorCode.STALE_PLAN: trajectory start state no longer matches measured robot state
+  [ok  ] plan_synchronized_motion (one arm)  -- planned
+  [FAIL] execute_trajectory (the cuRobo plan)  -- 0 ticks, final joint error 0.1172 rad
+  -> /home/felix/robocasa_sim/aspire/examples/robocasa/api_tool_check/out/raw/planning  (9 records, 6 arrays)
+
+=== stage graspexec ===================================================
+  [ok  ] generate_grasps repeated on an identical mask  -- identical calls returned [0, 0, 0, 2] candidates
+  [ok  ] grasp pose geometry (where is the pose relative to its contact point?)  -- pose sits 0.1034 m behind the contact point along its own local +Z
+  [ok  ] move_to_pose -> standoff (10 cm back along the approach axis)  -- 64 ticks, 8.3 mm error
+  [ok  ] move_to_pose -> grasp pose (panda_hand -> eef mapping)  -- 19 ticks, 8.6 mm error
+  [ok  ] close_gripper on the candidate grasp  -- jaw settled at 0.011 (1 = open, 0 = closed)
+  [ok  ] lift after the grasp (did the object come with it?)  -- fish centroid moved +0.000 m in z
+  -> /home/felix/robocasa_sim/aspire/examples/robocasa/api_tool_check/out/raw/graspexec  (6 records, 36 arrays)
+
+stages that raised: none
