@@ -48,7 +48,13 @@ def _decode_numpy(value: object) -> np.ndarray:
 
 
 class ContactGraspNetProvider:
-    """Generate grasp transforms in exactly the input point-cloud frame."""
+    """Generate grasp transforms in exactly the input point-cloud frame.
+
+    That frame must be the depth camera's optical frame (+Z into the scene):
+    the network is view-dependent, so a base- or world-frame cloud yields
+    grasps that are wrong, not merely re-expressed. ``CapApi.generate_grasps``
+    maps the answer to the robot base frame.
+    """
 
     def __init__(
         self,
