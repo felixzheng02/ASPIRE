@@ -18,11 +18,18 @@ _TRANSIENT_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 
 
 class ProviderHttpError(RuntimeError):
-    """Internal exception carrying the public structured provider failure."""
+    """Internal exception carrying the public structured provider failure.
 
-    def __init__(self, error: ApiError) -> None:
+    ``response_body`` is the decoded JSON of a non-2xx reply, or ``None`` when the
+    reply was not JSON. ``error.details["response"]`` keeps only a 512-character
+    text preview, which cuts a long service explanation mid-string; a provider
+    client that reads the service's own reason must read it from here.
+    """
+
+    def __init__(self, error: ApiError, *, response_body: object = None) -> None:
         super().__init__(error.message)
         self.error = error
+        self.response_body = response_body
 
 
 class HttpProviderClient:
@@ -132,7 +139,8 @@ class HttpProviderClient:
                             "response": response.text[:512],
                             "attempt": attempt + 1,
                         },
-                    )
+                    ),
+                    response_body=_json_or_none(response),
                 )
 
             try:
@@ -183,6 +191,14 @@ class HttpProviderClient:
                 details={"url": url, "attempts": attempts, "error": str(error)},
             )
         )
+
+
+def _json_or_none(response: requests.Response) -> object:
+    """Decode an error reply's JSON body, or return None if it has none."""
+    try:
+        return response.json()
+    except (ValueError, requests.RequestException):
+        return None
 
 
 __all__ = ["HttpProviderClient", "ProviderHttpError"]
