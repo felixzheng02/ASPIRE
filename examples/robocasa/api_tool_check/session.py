@@ -48,6 +48,7 @@ from cap_harness.providers.graspnet.client import ContactGraspNetProvider
 from cap_harness.providers.pyroki.client import PyRokiProvider
 from cap_harness.providers.sam3.client import Sam3Provider
 from cap_harness.registry import ROBOCASA_PUBLIC_TOOL_NAMES, ToolRegistry
+from cap_harness.run import segmentation_min_score
 from cap_harness.robocasa.adapter import RobocasaAdapter
 from cap_harness.robocasa.registry import RobocasaTaskRegistry
 
@@ -192,7 +193,9 @@ def build_session(task: str, seed: int, *, horizon: int = 1000) -> Session:
     curobo = CuRoboProvider()
     api = CapApi(
         adapter,
-        segmentation_provider=Sam3Provider(),
+        # min_score via run.py, so this really does match run_program: on robocasa it
+        # is 0.5, and segment_text reports absence instead of five ranked guesses.
+        segmentation_provider=Sam3Provider(min_score=segmentation_min_score("robocasa")),
         grasp_providers={"contact-graspnet": ContactGraspNetProvider()},
         ik_providers={"pyroki": PyRokiProvider(), "curobo": curobo},
         trajectory_planning_providers={"curobo": curobo},

@@ -33,6 +33,7 @@ from cap_harness.providers.graspnet.client import ContactGraspNetProvider
 from cap_harness.providers.pyroki.client import PyRokiProvider
 from cap_harness.providers.sam3.client import Sam3Provider
 from cap_harness.registry import ROBOCASA_PUBLIC_TOOL_NAMES, ToolRegistry
+from cap_harness.run import segmentation_min_score
 from cap_harness.robocasa.adapter import RobocasaAdapter
 from cap_harness.robocasa.registry import RobocasaTaskRegistry
 
@@ -51,7 +52,9 @@ def build_tools() -> tuple[RobocasaAdapter, dict]:
     curobo = CuRoboProvider()
     api = CapApi(
         adapter,
-        segmentation_provider=Sam3Provider(),
+        # Same floor run_program applies, so a mask scoring 0.089 is now a reported
+        # absence rather than a counted grasp "success".
+        segmentation_provider=Sam3Provider(min_score=segmentation_min_score("robocasa")),
         grasp_providers={"contact-graspnet": ContactGraspNetProvider()},
         ik_providers={"pyroki": PyRokiProvider(), "curobo": curobo},
         trajectory_planning_providers={"curobo": curobo},

@@ -114,9 +114,13 @@ class Sam3Provider:
         #: Client-side floor on ``Segmentation.score``. Defaults to 0.0, which keeps the
         #: long-standing contract that a scene noun yields masks and ``ok=True``. Raising
         #: it turns ``segment_text`` into a detector: prompts whose best candidate falls
-        #: below it come back ``ok=False`` with ``NO_SEGMENTATION``. See
-        #: ``SUGGESTED_PRESENCE_THRESHOLD`` for the measured value, and note that callers
-        #: such as ``examples/robocasa/connectivity_check.py`` currently assume 0.0.
+        #: below it come back ``ok=False`` with ``NO_SEGMENTATION``.
+        #:
+        #: The default stays 0.0 here because the right floor is a property of the prompt
+        #: style, not of SAM3. ``cap_harness.run`` picks it per benchmark
+        #: (``SEGMENTATION_MIN_SCORE``): RoboCasa, whose prompts are bare scene nouns, runs
+        #: at ``SUGGESTED_PRESENCE_THRESHOLD``; the benchmarks that prompt with long
+        #: descriptive phrases stay permissive until someone measures them.
         self._min_score = float(min_score)
         if not 0.0 <= self._min_score <= 1.0:
             raise ValueError("min_score must be in [0, 1]")
@@ -142,14 +146,19 @@ class Sam3Provider:
     ) -> SegmentationSet:
         """Segment ``query`` in one camera image.
 
-        ``ok=True`` is **not** evidence that ``query`` is in the frame. The service runs
-        SAM3 at a 0.0 detection threshold, so it answers every noun with its five
-        best-ranked regions; prompt a kitchen with no sink for "sink" and it returns the
-        plate, at score 0.72. Read ``Segmentation.score`` -- it is a concept-presence
-        confidence, not a mask-quality score (see ``wire.py``) -- and compare it against
-        ``SUGGESTED_PRESENCE_THRESHOLD`` rather than trusting ``ok``.
+        What ``ok=True`` promises depends on ``min_score``. At the 0.0 default it promises
+        only that SAM3 returned something: the service runs at a 0.0 detection threshold,
+        so it answers every noun with its five best-ranked regions, and a kitchen with no
+        sink answers "sink" with the plate at score 0.72. Above 0.0 it also means the best
+        candidate cleared the floor, and a prompt that does not comes back ``ok=False``
+        with ``NO_SEGMENTATION`` naming the rejected score.
 
-        ``diagnostics`` carries ``top_score``, ``best_candidate_score`` and
+        Either way ``Segmentation.score`` is the number to read -- a concept-presence
+        confidence, not a mask-quality score (see ``wire.py``). It is a filter and not a
+        proof: a semantically close noun can clear the floor on the wrong object, and a
+        present object can fall under it when prompted with the wrong word.
+
+        ``diagnostics`` carries ``top_score``, ``best_candidate_score``, ``min_score`` and
         ``service_threshold`` so a run's trace records the judgement call either way.
         """
         if not isinstance(observation, CameraObservation):

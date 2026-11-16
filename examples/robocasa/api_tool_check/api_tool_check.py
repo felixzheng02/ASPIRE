@@ -419,7 +419,21 @@ call("robocasa.get_controller_metadata", do_controller_metadata)
 
 
 # --------------------------------------------------------------------------- perception
-# Reliable scene nouns on this kitchen: cabinet / counter. Wrist uses the same.
+# Reliable scene nouns on this kitchen: cabinet / counter -- on agentview. The wrist is
+# prompted with the same two nouns on purpose, and both are expected to come back
+# ok=False: segment_text enforces a 0.5 presence floor on robocasa, and from
+# robot0_eye_in_hand the cabinet scores 0.049 and the counter 0.398 because neither is
+# really in that frame. The check passes on the agentview hits; the wrist rejections are
+# recorded with the score that caused them.
+
+def best_candidate(found):
+    """SAM3's top score before filtering, wherever this result carries it."""
+    if found.ok:
+        return found.diagnostics.get("best_candidate_score")
+    if found.error is None:
+        return None
+    return found.error.details.get("best_candidate_score")
+
 
 def do_segment_text():
     by_camera = {}
@@ -428,10 +442,12 @@ def do_segment_text():
         hits = []
         for prompt in ["cabinet", "counter"]:
             found = segment_text(camera_name, prompt)
+            score = best_candidate(found)
             entry = {
                 "prompt": prompt,
                 "ok": bool(found.ok),
                 "n": 0 if not found.ok else len(found.segmentations),
+                "best_candidate_score": None if score is None else round(float(score), 4),
                 "error": error_text(found.error),
                 "top": None,
             }
