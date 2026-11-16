@@ -122,6 +122,19 @@ string is the CLI's `--suite`, the registry key and the simulator's `--task`. `h
 RoboCasa's own 1000 control ticks at 20 Hz; the simulator process is built with a larger
 `max_steps` so one server can serve harnesses with different budgets.
 
+The OopsieVerse kitchen tasks (`family` `oopsieverse`) are registered as well:
+`OopsiePickEgg`, `OopsieServePastry`, `OopsieOpenSingleDoor`, `OopsieTurnOnFaucet`,
+`OopsieTurnOnMicrowave`, `OopsieTurnOnStove`, `OopsieOpenDrawer`, `OopsieCloseDrawer`,
+`OopsiePlacePlate`, `OopsieCounterToMicrowave`, `OopsiePrepareCoffee`, `OopsiePrepareBreakfast`,
+`OopsieDishesToSink`, `OopsieNavLiftBowl`, `OopsieWipeCounter`. They run on their own simulator,
+started from the workspace root with `oopsieverse/aspire_sim/run_server.sh <environment>`
+(`environment` is the lower-case task name, e.g. `turn_on_microwave`), and the harness connects
+with `CAP_HARNESS_ROBOCASA_ENDPOINT=ipc:///tmp/capx-sim-oopsie.sock`. A run refuses a simulator
+serving a different task. The public API is unchanged. Seven of them (`OopsiePickEgg`,
+`OopsiePlacePlate`, `OopsieWipeCounter`, `OopsieDishesToSink`, `OopsieServePastry`,
+`OopsiePrepareBreakfast`, `OopsieNavLiftBowl`) always use one fixed kitchen; there the seed only
+moves the objects.
+
 ## Seeds and scenes
 
 A seed selects the kitchen. The partition is ASPIRE's Robosuite one — development **101-125**,

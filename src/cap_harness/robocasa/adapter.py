@@ -762,6 +762,17 @@ class RobocasaAdapter:
         """
         return bool(self._require_client().evaluate()["success"])
 
+    def safety_record(self) -> dict[str, Any]:
+        """The simulator's full scoring record (OopsieVerse adds health), for the host only.
+
+        Like ``check_success``, not in the extension allowlist, so never a tool.
+        """
+        return dict(self._require_client().evaluate())
+
+    def served_task(self) -> str | None:
+        """The task the connected simulator was started with (``server.py --task``)."""
+        return self._require_client().spec.get("task")
+
     def compute_reward(self) -> float | None:
         return self._last_reward
 

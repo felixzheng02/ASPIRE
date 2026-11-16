@@ -159,6 +159,7 @@ def run_program(
     if not source.strip():
         raise ValueError("program file must contain non-empty Python source")
 
+    oopsieverse = False
     if benchmark == "libero-pro":
         registry = LiberoSuiteRegistry()
         metadata = registry.resolve(suite, task_id)
@@ -176,12 +177,14 @@ def run_program(
     elif benchmark == "robocasa":
         from cap_harness.registry import ROBOCASA_PUBLIC_TOOL_NAMES
         from cap_harness.robocasa.adapter import RobocasaAdapter
-        from cap_harness.robocasa.registry import RobocasaTaskRegistry
+        from cap_harness.robocasa.registry import OOPSIEVERSE_FAMILY, RobocasaTaskRegistry
 
         registry = RobocasaTaskRegistry()
         metadata = registry.resolve(suite, task_id)
         adapter_type = RobocasaAdapter
         extension_allowlist = ROBOCASA_PUBLIC_TOOL_NAMES
+        # OopsieVerse: health is scored host-only, outside the run directory (robocasa/safety.py).
+        oopsieverse = getattr(metadata, "family", None) == OOPSIEVERSE_FAMILY
         require_sam3_health()
         require_pyroki_health()
     elif benchmark == "yam_real":
@@ -303,6 +306,36 @@ def run_program(
         protocol_success = bool(evidence["protocol_success"])
         protocol_saved = True
 
+    safety_saved = False
+
+    def save_safety_record(final_task_success: bool | None) -> None:
+        # Nothing about this record may reach the run directory or the console: both are what
+        # the coding agent reads. A failure is written next to the records instead.
+        nonlocal safety_saved
+        if not oopsieverse or safety_saved or adapter is None:
+            return
+        safety_saved = True
+        from cap_harness.robocasa.safety import safety_root, write_safety_record
+
+        try:
+            write_safety_record(
+                evaluation=adapter.safety_record(),  # type: ignore[attr-defined]
+                run_root=recorder.root,
+                suite=metadata.suite_name,
+                environment=metadata.environment,
+                seed=seed,
+                task_success=final_task_success,
+            )
+        except Exception as exc:
+            try:
+                directory = safety_root() / metadata.suite_name / str(seed)
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / f"{recorder.root.name}.error.txt").write_text(
+                    f"{type(exc).__name__}: {exc}\n", encoding="utf-8"
+                )
+            except OSError:
+                pass
+
     try:
         recorder.save_program(program_path)
         recorder.import_model_trace(model_trace)
@@ -334,6 +367,10 @@ def run_program(
                 adapter = adapter_type(**adapter_kwargs)
         with recorder.timing.measure("reset"):
             adapter.reset(metadata, seed)
+        if oopsieverse:
+            from cap_harness.robocasa.safety import check_served_task
+
+            check_served_task(adapter.served_task(), metadata.environment)  # type: ignore[attr-defined]
         # Take the embodiment's real control rate before anything is recorded:
         # RunRecorder defaults to 20 Hz, and an adapter that knows its own rate
         # exposes control_frequency. Probed after reset, not before, because an
@@ -444,6 +481,7 @@ def run_program(
         (recorder.root / "logs/program.stderr").write_text("", encoding="utf-8")
         task_success = adapter.check_success()  # type: ignore[attr-defined]
         save_protocol_evidence(bool(task_success))
+        save_safety_record(task_success)
         if recorder.terminal_reason == "step_limit":
             termination_reason = "step_limit"
         elif task_success:
@@ -477,6 +515,7 @@ def run_program(
             except Exception:
                 task_success = None
         save_protocol_evidence(bool(task_success))
+        save_safety_record(task_success)
         close_before_recording()
         recorder.finalize(
             program_ok=False,
@@ -500,6 +539,7 @@ def run_program(
             except Exception:
                 task_success = None
         save_protocol_evidence(bool(task_success))
+        save_safety_record(task_success)
         close_before_recording()
         recorder.finalize(
             program_ok=False,
