@@ -137,6 +137,12 @@ It is opt-in because it is neither free nor permanent.
 - **Not permanent.** IK is seeded from the arm's *current* configuration, so an attempt that
   moves the arm invalidates the answer. Call it again instead of reusing an old result.
 
+It is also necessary, not sufficient. The probe is scene-free IK: cuRobo's
+scene-aware planner has been measured refusing 0 of 6 standoff configurations
+that its own scene-free IK accepts 6 of 6, so a candidate passing this filter
+means the arm has a solution for that pose, not that the motion will execute.
+Plan it with `plan_motion` and a collision-aware strategy to find out.
+
 An empty answer is typed, never silent:
 
 - `ok=False` with `ik_unreachable` -- candidates existed and none solved, with
