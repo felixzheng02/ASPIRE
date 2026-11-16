@@ -187,6 +187,21 @@ def _plan(request: PlanPointCloudsRequest) -> PlanResponse:
         raise HTTPException(status_code=400, detail="pc_full must have non-empty shape (N, 3)")
     if segment.ndim != 2 or segment.shape[1] != 3 or not len(segment):
         raise HTTPException(status_code=400, detail="pc_segment must have non-empty shape (N, 3)")
+    # The model must see the scene cloud in random order, not in the caller's
+    # pixel (raster) order. Its PointNet++ ball query keeps the nsample LOWEST
+    # INDICES inside each ball (Pointnet_Pointnet2_pytorch/models/
+    # pointnet2_utils.py, query_ball_point), so it relies on the input being
+    # shuffled. regularize_pc_point_count (contact_graspnet_pytorch/data.py)
+    # shuffles only when it DOWNsamples: a local crop with fewer than
+    # raw_num_points (20000) points keeps its order and gets duplicates
+    # appended. Then every 2/4/8 cm neighbourhood is the top two or three image
+    # rows of the ball, and the width head answers its smallest bin (4 mm) on
+    # nearly every point. Measured on RoboCasa PickPlaceCounterToStove (512x512
+    # agentview, 2.8k-8.5k points per crop): 65-100% of candidates in bin 0,
+    # unshuffled; 0-4% shuffled, with openings that match the objects (lime
+    # 72 mm, tomato 57-65 mm). The model's own test_data scenes, thinned to the
+    # same density, collapse the same way and recover when shuffled.
+    full = full[np.random.permutation(len(full))]
     grasps, scores, contacts = _predict(full, segment, request)
     return PlanResponse(
         grasps_base64=_encode_numpy(grasps),
