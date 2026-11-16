@@ -43,11 +43,19 @@ LIFT_M = 0.12
 PICKED_RISE_M = 0.05
 TOLERANCE_M = 0.02
 MAX_STEPS = 150
+# The recorded runs used horizon=1000, which silently skipped 15 of their 87
+# "executed" attempts -- all of them the third attempt of an episode. The adapter
+# truncates at `_elapsed_steps >= horizon`, `_elapsed_steps` only resets on
+# `reset()`, and three attempts of (open + approach + grasp + close + lift)
+# exhaust 1000 ticks; after that every step is truncated and the jaw is never
+# commanded (see `caf7d72` on main). Raised so the attempt budget is what limits
+# an episode, and each attempt now records its tick cost and truncation flag.
+HORIZON = 3000
 
 
-def build_tools() -> tuple[RobocasaAdapter, dict]:
+def build_tools(horizon: int = HORIZON) -> tuple[RobocasaAdapter, dict]:
     """The same public tool namespace a generated program is given."""
-    adapter = RobocasaAdapter(registry=RobocasaTaskRegistry(), horizon=1000)
+    adapter = RobocasaAdapter(registry=RobocasaTaskRegistry(), horizon=horizon)
     curobo = CuRoboProvider()
     api = CapApi(
         adapter,
@@ -124,32 +132,72 @@ def attempt_grasp(tools: dict, candidate, noun: str) -> dict:
         tools["solve_ik"](candidate.pose).ok
     )
     if not reachable:
-        return {"outcome": "unreachable", "picked": False, "score": float(candidate.score)}
+        return {
+            "outcome": "unreachable",
+            "picked": False,
+            "score": float(candidate.score),
+            "ticks": 0,
+        }
 
-    tools["open_gripper"]()
+    moves = [tools["open_gripper"]()]
     approach_move = tools["move_to_pose"](standoff, TOLERANCE_M, MAX_STEPS)
     grasp_move = tools["move_to_pose"](candidate.pose, TOLERANCE_M, MAX_STEPS)
-    tools["close_gripper"]()
+    moves += [approach_move, grasp_move, tools["close_gripper"]()]
     jaw = float(tools["get_robot_state"]().gripper_positions["primary"])
 
     end_effector = tools["get_robot_state"]().end_effector_poses["primary"]
     lift = tools["move_to_pose"](
         offset_pose(end_effector, np.array([0.0, 0.0, LIFT_M])), 0.03, MAX_STEPS
     )
+    moves.append(lift)
     after, _ = object_centroid(tools, noun)
+
+    # An attempt the episode horizon cut short never ran, so it is not evidence
+    # about the grasp. Filed as its own outcome instead of an ordinary miss.
+    ticks = sum(int(move.steps_executed) for move in moves)
+    truncated = any(bool(move.truncated) for move in moves)
+    terminated = any(bool(move.terminated) for move in moves)
 
     rise = None if before is None or after is None else float(after[2] - before[2])
     picked = rise is not None and rise > PICKED_RISE_M
+    if picked:
+        outcome = "picked"
+    elif truncated or terminated:
+        outcome = "truncated"
+    else:
+        outcome = "not_picked"
     return {
-        "outcome": "picked" if picked else "not_picked",
+        "outcome": outcome,
         "picked": picked,
         "score": float(candidate.score),
         "approach_ok": bool(approach_move.ok),
         "grasp_ok": bool(grasp_move.ok),
         "lift_ok": bool(lift.ok),
-        "jaw_after_close": round(jaw, 4),
+        "jaw_after_close": round(jaw, 4),  # 1.0 is OPEN: ~0.04 closed on nothing
         "object_rise_m": None if rise is None else round(rise, 4),
+        "ticks": ticks,
+        "truncated": truncated,
+        "terminated": terminated,
     }
+
+
+def api_feasible_candidates(tools: dict, grasps, want: int) -> tuple[list, dict]:
+    """Ask the public API for the reachable candidates, ranked, and report what it said.
+
+    This is the shipped code path: `select_grasp(grasps, "all_reachable")`. The
+    local `feasible_candidates` above stays as the recorded baseline's reference.
+    """
+    feasible = tools["select_grasp"](grasps, "all_reachable")
+    counts = dict(feasible.diagnostics) if feasible.ok else dict(feasible.error.details)
+    reported = {
+        "n_ik_feasible": len(feasible.grasps),
+        "ik_probes": int(counts.get("ik_probes", 0)),
+        "standoff_blocked": counts.get("standoff_blocked"),
+        "grasp_blocked": counts.get("grasp_blocked"),
+    }
+    if not feasible.ok:
+        reported["select_error"] = str(feasible.error.code)
+    return list(feasible.grasps[:want]), reported
 
 
 def run_episode(
@@ -158,7 +206,7 @@ def run_episode(
     task: str,
     seed: int,
     attempts: int,
-    ik_filter: bool = False,
+    select: str = "score",
 ) -> dict:
     started = time.perf_counter()
     adapter.reset(task, seed)
@@ -177,7 +225,11 @@ def run_episode(
     grasps = tools["generate_grasps"](CAMERA, segmentation, max_candidates=20)
     ranked = sorted(grasps.grasps, key=lambda c: -c.score) if grasps.ok else []
     record["n_candidates"] = len(ranked)
-    if ik_filter and ranked:
+    record["select"] = select
+    if select == "all_reachable":
+        candidates, reported = api_feasible_candidates(tools, grasps, attempts)
+        record.update(reported)
+    elif select == "ik_filter" and ranked:
         candidates, tested = feasible_candidates(tools, ranked, attempts)
         record["n_ik_tested"] = tested
         record["n_ik_feasible"] = len(candidates)
@@ -199,6 +251,7 @@ def run_episode(
         attempts=tried,
         picked=any(a["picked"] for a in tried),
         failure=None if any(a["picked"] for a in tried) else "no_attempt_succeeded",
+        ticks=sum(int(a.get("ticks", 0)) for a in tried),
     )
     record["seconds"] = round(time.perf_counter() - started, 1)
     return record
@@ -222,9 +275,18 @@ def main(argv: list[str] | None = None) -> int:
         help="rank candidates best-first but only attempt those solve_ik can reach, "
         "so the attempt budget is spent on feasible poses instead of unreachable ones",
     )
+    parser.add_argument(
+        "--select",
+        choices=("score", "ik_filter", "all_reachable"),
+        default="score",
+        help="how the attempt list is chosen: 'score' is the recorded baseline, "
+        "'ik_filter' this file's own reference filter (same as --ik-filter), and "
+        "'all_reachable' the shipped select_grasp strategy",
+    )
     parser.add_argument("--out", default=str(Path(__file__).resolve().parent / "out"))
     arguments = parser.parse_args(argv)
 
+    select = "ik_filter" if arguments.ik_filter else arguments.select
     seeds = parse_seeds(arguments.seeds)
     out = Path(arguments.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -242,7 +304,7 @@ def main(argv: list[str] | None = None) -> int:
                         arguments.task,
                         seed,
                         arguments.attempts,
-                        ik_filter=arguments.ik_filter,
+                        select=select,
                     )
                 except Exception as exc:  # one bad episode must not end the sweep
                     record = {
@@ -277,14 +339,36 @@ def main(argv: list[str] | None = None) -> int:
         rank = next(a for a in record["attempts"] if a["picked"])["rank"]
         by_rank[rank] = by_rank.get(rank, 0) + 1
 
+    all_attempts = [a for r in records for a in r.get("attempts", [])]
+    executed = [a for a in all_attempts if a["outcome"] != "unreachable"]
     summary = {
         "task": arguments.task,
+        "select": select,
         "ik_filter": bool(arguments.ik_filter),
+        "horizon": HORIZON,
         "seeds": f"{seeds[0]}-{seeds[-1]}",
         "episodes": len(records),
         "picked": len(picked),
         "success_rate": round(len(picked) / len(records), 4) if records else 0.0,
         "succeeded_on_rank": by_rank,
+        "attempts": len(all_attempts),
+        "attempts_unreachable": sum(1 for a in all_attempts if a["outcome"] == "unreachable"),
+        "attempts_truncated": sum(1 for a in all_attempts if a["outcome"] == "truncated"),
+        "unreachable_rate": round(
+            sum(1 for a in all_attempts if a["outcome"] == "unreachable") / len(all_attempts), 4
+        )
+        if all_attempts
+        else 0.0,
+        # Comparable to the recorded runs: truncation only ever hit attempt 2.
+        "picked_in_first_two_attempts": sum(
+            1 for r in picked if next(a for a in r["attempts"] if a["picked"])["rank"] < 2
+        ),
+        "mean_ticks_per_executed_attempt": round(
+            float(np.mean([a.get("ticks", 0) for a in executed])), 1
+        )
+        if executed
+        else 0.0,
+        "total_ik_probes": sum(int(r.get("ik_probes", 0)) for r in records),
         "failure_reasons": reasons,
         "episodes_with_no_candidates": sum(
             1 for r in records if r.get("n_candidates", 0) == 0
