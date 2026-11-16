@@ -39,8 +39,11 @@ That figure overstates the problem: the adapter's settle loop converges in joint
 `EXECUTION_FAILED`. This is why "picked" is decided by the object's measured rise and not by
 the move's own flag.
 
-The gripper does usually meet something — 64 of 68 executed attempts left the jaw open past
-0.02 rather than closing flat — but the object stays on the surface.
+The gripper meets nothing. `_measured_gripper` is normalised with 1.0 open and 0.0 closed
+(`adapter.py`, `qpos[0] / 0.04`), so `jaw_after_close ≈ 0.04` means the fingers travelled to
+about 1.6 mm of fully shut. Across the 87 executed attempts of the `--ik-filter` run, 72
+closed flat (jaw < 0.10) and the median object rise is −0.0002 m: the object was never
+touched.
 
 ## The second success is probably spurious
 
@@ -112,8 +115,9 @@ genuinely returned nothing) is 2, essentially unchanged.
 Seeds 119 and 144 report rises of 0.568 m and 0.411 m after a 0.12 m lift, which is
 impossible, and both have near-zero mask scores (0.089, 0.006) — the re-segmentation found a
 different part of the scene, so those two are measurement artifacts, not picks. The three
-with plausible rises (135, 136, 137) all have jaw widths around 0.04, consistent with the
-fingers stalling on an object.
+with plausible rises (135, 136, 137) have jaw widths around 0.04, which on this normalised
+scale is almost fully closed, not a jaw stalled on an object. Why those three lifted anyway
+is open.
 
 Note that **3 of the 5 "successes" came from rank 1 or 2**, not the top-scoring candidate, so
 trying more than one candidate is doing real work.
@@ -125,3 +129,38 @@ no candidate at all, and 29 reached a pose, closed, and left the object where it
 dominant failure is still grasp quality — but reachability is a close second and is purely an
 API-shape problem: `generate_grasps` and `select_grasp` never see the robot, so a third of
 scenes yield 20 candidates and nothing attemptable.
+
+
+---
+
+# Correction (2026-11-15)
+
+Two premises above were wrong. Both were found by re-reading the data, no simulator needed.
+
+**1. The jaw reading was inverted.** `RobocasaAdapter._measured_gripper` returns
+`qpos[0] / 0.04` clipped to [0, 1], so **1.0 is open and 0.0 is closed** — confirmed live
+earlier in the same session, where `open_gripper()` measured 0.986 and `close_gripper()`
+0.014. The original text read `jaw ≈ 0.04` as "the jaw stayed open, so the fingers met
+something". It means the opposite: the fingers closed to within ~1.6 mm of flat and met
+nothing. Recomputed over the 87 executed attempts of the `--ik-filter` run: **72 closed flat
+(jaw < 0.10), 15 never closed (jaw > 0.30), median object rise −0.0002 m.**
+
+The question this changes: not "what is the gripper closing on" but "why is nothing between
+the fingers".
+
+**2. Fifteen of the 87 recorded attempts never happened.** All 15 of the jaw > 0.30 attempts
+are rank 2 — the third attempt — and all have `approach_ok`, `grasp_ok` *and* `lift_ok` false:
+nothing moved. The cause is episode-horizon exhaustion. `adapter._truncated()` is
+`_elapsed_steps >= horizon` with `horizon=1000`, and `_elapsed_steps` resets only on
+`reset()`. Three attempts of (30 open ticks + approach + 30 close ticks + lift) exhaust the
+budget, after which every step returns truncated, `execute_trajectory` bails after one tick,
+and the gripper is never commanded.
+
+**This is a bug in `grasp_bench.py`, not in the API.** `attempt_grasp` ignores
+`ExecutionResult.ok` and the truncation flag and records these as ordinary `not_picked`
+attempts. So "29 episodes reached a pose and closed on nothing" is overstated — in up to 15
+of those attempts the arm never moved at all. The benchmark should reset or budget per
+attempt, and should record truncation.
+
+Unaffected by either correction: the reachability numbers (51% unreachable, 16/48 scenes with
+no feasible candidate), the pick counts, and the grasp-frame conclusion.
