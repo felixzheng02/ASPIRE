@@ -16,6 +16,7 @@ from cap_harness.geometry import (
     crop_point_cloud,
     eef_from_panda_hand,
     estimate_oriented_bounding_box,
+    grasp_standoff_pose,
     mask_to_point_cloud,
     matrix_to_quaternion_wxyz,
     panda_hand_from_eef,
@@ -191,6 +192,37 @@ def test_point_cloud_crop_rejects_invalid_bounds_and_empty_result() -> None:
         crop_point_cloud(cloud, (0.0, 0.0, 0.0), (0.0, 1.0, 1.0))
     with pytest.raises(ValueError, match="no points"):
         crop_point_cloud(cloud, (1.0, 1.0, 1.0), (2.0, 2.0, 2.0))
+
+
+def test_grasp_standoff_retreats_along_the_approach_axis_only() -> None:
+    rotation = Rotation.from_euler("xyz", [30.0, -20.0, 45.0], degrees=True).as_matrix()
+    pose = Pose(
+        position=(0.3, -0.1, 0.9),
+        quaternion_wxyz=matrix_to_quaternion_wxyz(rotation),
+        frame="base",
+    )
+
+    standoff = grasp_standoff_pose(pose, 0.1)
+
+    # Orientation is untouched: only the pre-grasp position changes.
+    np.testing.assert_allclose(standoff.quaternion_wxyz, pose.quaternion_wxyz, atol=1e-12)
+    np.testing.assert_allclose(
+        standoff.position, np.asarray(pose.position) - rotation[:, 2] * 0.1, atol=1e-12
+    )
+    assert standoff.frame == "base"
+    # A zero retreat is the grasp pose itself, and the axis is selectable.
+    np.testing.assert_allclose(grasp_standoff_pose(pose, 0.0).position, pose.position, atol=1e-12)
+    np.testing.assert_allclose(
+        grasp_standoff_pose(pose, 0.2, approach_axis=0).position,
+        np.asarray(pose.position) - rotation[:, 0] * 0.2,
+        atol=1e-12,
+    )
+    with pytest.raises(ValueError, match="non-negative"):
+        grasp_standoff_pose(pose, -0.1)
+    with pytest.raises(ValueError, match="approach_axis"):
+        grasp_standoff_pose(pose, 0.1, approach_axis=3)
+    with pytest.raises(ValueError, match="must be a Pose"):
+        grasp_standoff_pose(object(), 0.1)
 
 
 def test_obb_and_explicit_top_down_selection() -> None:
