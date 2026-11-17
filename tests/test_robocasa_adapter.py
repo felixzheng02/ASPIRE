@@ -46,6 +46,19 @@ def test_densify_joint_waypoints_keeps_already_dense_paths() -> None:
     np.testing.assert_allclose(out, points)
 
 
+def test_densify_does_not_add_a_tick_for_float_noise_at_an_exact_multiple() -> None:
+    """0.1 rad at a 0.05 rad step is 2 ticks, even when the subtraction leaves noise."""
+    start = np.full(7, 0.2)
+    goal = np.full(7, 0.2)
+    goal[0] = 0.1 + 0.2  # 0.30000000000000004
+    span = goal[0] - start[0]
+    assert span / 0.05 > 2.0, "the test must exercise the noisy ratio"
+    out = densify_joint_waypoints(np.vstack([start, goal]), max_step_rad=0.05)
+    assert out.shape[0] == 3  # start + 2 ticks
+    np.testing.assert_allclose(out[1, 0], 0.25)
+    np.testing.assert_allclose(out[-1], goal)
+
+
 def test_planning_context_is_panda_in_robot0_link0() -> None:
     context = RobocasaAdapter().get_planning_context()
     assert context.embodiment == "robocasa"
@@ -189,6 +202,43 @@ def test_execute_trajectory_plays_waypoints_through_step() -> None:
     assert len(calls) == dense.shape[0]
     assert result.steps_executed == dense.shape[0]
     np.testing.assert_allclose(calls[-1].arms["primary"].target, dense[-1])
+
+
+def test_execute_trajectory_ramps_from_the_start_state_to_a_far_first_waypoint() -> None:
+    """A hand-built path whose waypoint 0 is 0.2 rad from the start is not crossed in one tick."""
+    adapter, calls = _adapter_with_recording_step()
+    first = np.array([0.20, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    points = np.vstack([first, first])
+    start = _state(np.zeros(7))
+    trajectory = Trajectory(
+        joint_positions=points,
+        dt_s=0.05,
+        joint_names=tuple(start.joint_names["primary"]),
+        planner="test",
+        collision_aware=False,
+        expected_start=start,
+        arm="primary",
+        embodiment="robocasa",
+    )
+    result = adapter.execute_trajectory(trajectory, settle_steps=4)
+    assert result.ok
+    targets = np.vstack([np.zeros(7)] + [c.arms["primary"].target for c in calls])
+    assert np.max(np.abs(np.diff(targets, axis=0))) <= TRAJECTORY_MAX_JOINT_STEP_RAD + 1e-12
+    # 4 ramp ticks reach waypoint 0, then waypoint 1 (no move) is played as its own tick.
+    assert result.steps_executed == 5
+    np.testing.assert_allclose(calls[3].arms["primary"].target, first)
+
+
+def test_execute_trajectory_keeps_the_tick_count_of_a_path_that_starts_at_the_measured_state() -> (
+    None
+):
+    """Planner paths begin at ``expected_start``; ramping from it must add nothing."""
+    adapter, calls = _adapter_with_recording_step()
+    points = np.vstack([np.zeros(7), np.full(7, 0.04), np.full(7, 0.08)])
+    result = adapter.execute_trajectory(_trajectory(points), settle_steps=4)
+    assert result.ok
+    assert result.steps_executed == points.shape[0]
+    np.testing.assert_allclose(calls[0].arms["primary"].target, points[0])
 
 
 def _sync_trajectory(points: np.ndarray, arm: str = "primary") -> SynchronizedTrajectory:

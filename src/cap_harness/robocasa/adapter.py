@@ -142,12 +142,15 @@ def densify_joint_waypoints(
         return points
     if not np.isfinite(max_step_rad) or max_step_rad <= 0.0:
         raise ValueError("max_step_rad must be positive and finite")
+    # A segment that is an exact multiple of the step, plus float noise (0.30000000000000004 -
+    # 0.2), must not gain a tick: a bare ceil turns 0.1 rad at 0.05 into 3 ticks, not 2.
+    ratio_eps = 1e-9
     densified = [points[0]]
     for nxt in points[1:]:
         prev = densified[-1]
         delta = nxt - prev
         span = float(np.max(np.abs(delta)))
-        count = 1 if span <= max_step_rad else int(np.ceil(span / max_step_rad))
+        count = max(1, int(np.ceil(span / max_step_rad - ratio_eps)))
         for index in range(1, count + 1):
             densified.append(prev + (index / count) * delta)
         densified[-1] = nxt
@@ -593,7 +596,14 @@ class RobocasaAdapter:
         # Each tick must go through ``step()`` so the run recorder gets RGB.
         # ``client.step`` / ``move_to_joints`` move the arm but leave the
         # video at the reset frame (one 0.05 s mp4).
-        waypoints = densify_joint_waypoints(np.asarray(joint_positions, dtype=np.float64))
+        # Densify from the start state, not from waypoint 0, so a hand-built trajectory whose
+        # first waypoint is far away is ramped up to rather than crossed in one tick. This is
+        # safe only behind CapApi's stale-plan check, which rejects any ``expected_start``
+        # more than 0.02 rad from the measured joints before execution reaches here. Planner
+        # paths start at the measured state, so their tick count is unchanged.
+        start = np.asarray(trajectory.expected_start.joint_positions[arm], dtype=np.float64)
+        planned = np.asarray(joint_positions, dtype=np.float64)
+        waypoints = densify_joint_waypoints(np.vstack([start.reshape(1, -1), planned]))[1:]
         raw_grips = (
             None
             if gripper_positions is None

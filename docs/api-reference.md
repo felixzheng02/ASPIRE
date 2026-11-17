@@ -39,14 +39,14 @@ advance environment control time.
 | `shared_atomic` | `plan_motion(goal, start_joints=None, *, arm="primary", strategy=None)` | `PlanResult` | No | Plan to a pose or joint goal using a `MotionStrategy`. |
 | `shared_atomic` | `plan_synchronized_motion(targets, strategy=None)` | `SynchronizedPlanResult` | No | Plan same-tick motion for every arm in the current embodiment. |
 | `shared_atomic` | `step(action)` | `StepResult` | One tick | Apply one normalized `RobotAction`; reward and sensitive diagnostics are removed. |
-| `shared_atomic` | `execute_trajectory(trajectory, stop_on_termination=True)` | `ExecutionResult` | Many ticks | Execute a fixed-rate single- or multi-arm trajectory. |
+| `shared_atomic` | `execute_trajectory(trajectory, stop_on_termination=True)` | `ExecutionResult` | Many ticks | Execute a fixed-rate single- or multi-arm trajectory. Takes no tick cap: it plays every waypoint, then holds the last one for a settle tail until the joints converge -- see [Tick cost of a motion](#tick-cost-of-a-motion). |
 | `shared_atomic` | `set_gripper(position, *, arm="primary")` | `ExecutionResult` | Many ticks | Drive one normalized gripper target, where `0` is closed and `1` is open. On LIBERO, Robosuite and RoboCasa only `0.0` and `1.0` are accepted -- see below. |
 | `shared_atomic` | `set_grippers(positions)` | `ExecutionResult` | One tick | Command every arm's normalized gripper target in the same control tick. |
 | `shared_high_level` | `localize_object(query, *, camera_name=None, target_frame=None)` | `LocalizationResult` | No | Compose text segmentation, RGB-D projection, and geometry estimation; `camera_name` defaults to the benchmark's wide camera (`agentview`, or `head` on BEHAVIOR-1K) and `target_frame` to the robot base frame. |
 | `shared_high_level` | `select_grasp(grasps, strategy="top_down")` | `GraspCandidate | None | GraspSet` | No | Select `top_down` or `highest_score` from a successful grasp set, or `all_reachable` for every IK-solvable candidate as a ranked `GraspSet` -- see [Reachable grasp selection](#reachable-grasp-selection). |
-| `shared_high_level` | `move_to_joints(target, tolerance=0.01, max_steps=120, *, arm="primary")` | `ExecutionResult` | Many ticks | Servo repeatedly to an absolute joint target until the measured state converges. |
-| `shared_high_level` | `move_to_pose(target_pose, tolerance=0.01, max_steps=120, *, arm="primary", strategy=None)` | `ExecutionResult` | Many ticks | Plan, execute, and verify one framed end-effector pose. `max_steps` caps the **planned** waypoint count as well as execution: a plan longer than it fails with `planned trajectory exceeds max_steps` and `steps_executed` 0, without moving the arm. On BEHAVIOR-1K a normal cuRobo reach exceeds the default of 120. |
-| `shared_high_level` | `move_synchronized(targets, tolerance=0.01, max_steps=120, strategy=None)` | `ExecutionResult` | Many ticks | Plan, execute, and verify synchronized targets for all arms. |
+| `shared_high_level` | `move_to_joints(target, tolerance=0.01, max_steps=120, *, arm="primary")` | `ExecutionResult` | Many ticks | Servo repeatedly to an absolute joint target until the measured state converges. `max_steps` is a **hard cap on executed ticks**: the call stops at exactly `max_steps` ticks, converged or not. |
+| `shared_high_level` | `move_to_pose(target_pose, tolerance=0.01, max_steps=120, *, arm="primary", strategy=None)` | `ExecutionResult` | Many ticks | Plan, execute, and verify one framed end-effector pose. `max_steps` limits the **planned** waypoint count only: a plan longer than it fails with `planned trajectory exceeds max_steps` and `steps_executed` 0, without moving the arm. It does **not** cap executed ticks -- execution adds a settle tail of up to 120 ticks, so `steps_executed` can exceed `max_steps`, by the whole tail when the arm is blocked; see [Tick cost of a motion](#tick-cost-of-a-motion). On BEHAVIOR-1K a normal cuRobo reach exceeds the default of 120. |
+| `shared_high_level` | `move_synchronized(targets, tolerance=0.01, max_steps=120, strategy=None)` | `ExecutionResult` | Many ticks | Plan, execute, and verify synchronized targets for all arms. `max_steps` limits the planned waypoint count only, exactly as for `move_to_pose`; executed ticks can exceed it. |
 | `shared_high_level` | `open_gripper(*, arm="primary")` | `ExecutionResult` | Many ticks | Set the normalized gripper target to `1`. |
 | `shared_high_level` | `close_gripper(*, arm="primary")` | `ExecutionResult` | Many ticks | Close with adapter contact-aware completion when available. |
 | `shared_high_level` | `go_home(*, arm="primary")` | `ExecutionResult` | Many ticks | Servo to the arm home captured or configured by the harness. |
@@ -177,6 +177,32 @@ accumulate, which is why repeating works.
 `move_to_joints()` itself does **not** repeat: `max_steps` is a cap, not a guarantee, and a large
 step can return `ok=False` having moved most of the way. Check the result and re-issue, or raise
 `max_steps`.
+
+### Tick cost of a motion
+
+The same `max_steps` name bounds different things:
+
+| Call | `max_steps` bounds | Executed ticks |
+|---|---|---|
+| `move_to_joints` | executed ticks, strictly | at most `max_steps` |
+| `move_to_pose`, `move_synchronized` | planned waypoints, checked before any motion | waypoints + settle tail |
+| `execute_trajectory` | (no parameter) | waypoints + settle tail |
+
+Trajectory execution plays every waypoint once, then holds the last one until the joint error
+is inside tolerance, for up to a fixed **settle tail**: `TRAJECTORY_GOAL_MAX_STEPS` = 120 ticks
+on RoboCasa (`robocasa/adapter.py`, joint L2 error 0.02 rad) and
+`TRAJECTORY_MAX_STEPS_PER_WAYPOINT - 1` = 119 on LIBERO-Pro, Robosuite and BEHAVIOR-1K. The tail
+is separate from `max_steps` and nothing passes `max_steps` to it. RoboCasa also inserts ticks so
+no joint moves more than 0.05 rad per tick, starting from the trajectory's start state; planned
+paths are already that dense, so this adds ticks only to sparse hand-built trajectories.
+
+In free space the tail is short -- measured 2-29 ticks on RoboCasa -- so the difference is easy
+to miss. When the arm is blocked it never converges and pays the whole tail: measured on RoboCasa,
+`move_to_pose(max_steps=150)` against the stove panel ran 32 waypoints + 120 settle = **152**
+ticks and returned `ok=False`. So the worst case of one blocked call is `waypoints + 120`, and
+retrying a blocked move pays it again. Budget from
+`get_task_context().metadata["episode_steps_remaining"]`, not from a sum of `max_steps`; when one
+move needs a hard tick cap, use `move_to_joints`.
 
 ### Motion strategies
 
