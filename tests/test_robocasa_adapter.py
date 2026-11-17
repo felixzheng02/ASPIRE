@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 import math
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from cap_harness.api import CapApi
+from cap_harness.artifacts import RunRecorder, StepLimitReached
 from cap_harness.contracts import (
     CameraObservation,
     Observation,
@@ -16,6 +19,7 @@ from cap_harness.contracts import (
     SynchronizedTrajectory,
     Trajectory,
 )
+from cap_harness.errors import ErrorCode
 from cap_harness.robocasa.adapter import (
     JOINT_LIMIT_SLACK_RAD,
     PANDA_JOINT_NAMES,
@@ -362,6 +366,377 @@ def test_close_gripper_settles_through_step() -> None:
     assert result.ok
     assert len(calls) == 4
     assert all(call.arms["primary"].gripper_position == 0.0 for call in calls)
+
+
+# ------------------------------------------------------- base-step accounting
+
+
+class _FakeSim:
+    """A simulator stand-in on the driver side of the wire.
+
+    ``drive_base`` is a control loop that calls ``self.step`` itself, as the real
+    ``RobotClient.drive_base`` does. ``converge_after=None`` is a wedged base: every tick is
+    accepted, nothing moves, and the loop runs to ``base_max_steps``.
+    """
+
+    def __init__(
+        self,
+        *,
+        base_max_steps: int = 1200,
+        converge_after: int | None = None,
+        gripper_settle_steps: int = 30,
+    ) -> None:
+        self.profile = SimpleNamespace(
+            base_max_steps=base_max_steps, gripper_settle_steps=gripper_settle_steps
+        )
+        self.spec = {"cameras": {"scene": "robot0_agentview_left", "wrist": "robot0_eye_in_hand"}}
+        self.converge_after = converge_after
+        self.sent: list[dict] = []
+        self.base_xy = np.array([1.0, 2.0])
+        self.gripper = 1.0
+        self.last: dict = {}
+
+    def _proprio(self) -> dict:
+        return {
+            "joint_pos": np.linspace(0.1, 0.7, 7),
+            "eef_pos": np.array([1.4, 2.0, 1.0]),
+            "eef_quat_wxyz": np.array([1.0, 0.0, 0.0, 0.0]),
+            "base_pos": np.array([self.base_xy[0], self.base_xy[1], 0.7]),
+            "base_quat_wxyz": np.array([1.0, 0.0, 0.0, 0.0]),
+            "gripper_qpos": np.array([0.04 * self.gripper, -0.04 * self.gripper]),
+            "rgb": np.full((16, 16, 3), len(self.sent) % 256, dtype=np.uint8),
+        }
+
+    def reset(self, seed: int | None = None, *, scene_group: str | None = None) -> dict:
+        del seed, scene_group
+        self.sent.clear()
+        self.last = self._proprio()
+        return {**self.last, "instruction": "Open the drawer."}
+
+    def build_action(self, joints=None, *, base_vel=None) -> dict:
+        target = self.last["joint_pos"] if joints is None else joints
+        return {
+            "joints": np.asarray(target, dtype=np.float64).copy(),
+            "base_vel": None if base_vel is None else np.asarray(base_vel, dtype=np.float64),
+            "gripper": self.gripper,
+        }
+
+    def set_gripper_target(self, fraction: float) -> None:
+        self.gripper = float(fraction)
+
+    def step(self, action: dict) -> dict:
+        self.sent.append(action)
+        self.last = self._proprio()
+        return self.last
+
+    def base_pos(self) -> np.ndarray:
+        return np.asarray(self.last["base_pos"], dtype=np.float64)
+
+    def drive_base(self, dx: float, dy: float, dyaw: float) -> bool:
+        for tick in range(self.profile.base_max_steps):
+            if self.converge_after is not None and tick + 1 >= self.converge_after:
+                self.base_xy = self.base_xy + np.array([dx, dy])
+                self.step(self.build_action(base_vel=np.zeros(3)))
+                return True
+            self.step(self.build_action(base_vel=np.array([dx, dy, dyaw])))
+        return False
+
+    def get_depth(self, camera: str | None = None) -> dict:
+        del camera
+        return {"depth": np.ones((16, 16, 1)), "intrinsics": np.eye(3), "cam_pose_mat": np.eye(4)}
+
+    def render(self, camera: str | None = None) -> np.ndarray:
+        del camera
+        return np.zeros((16, 16, 3), dtype=np.uint8)
+
+    def evaluate(self) -> dict:
+        return {"reward": 0.0, "success": False}
+
+    def close(self, *, shutdown_server: bool = True) -> None:
+        del shutdown_server
+
+
+def _recorded_episode(
+    tmp_path, sim: object, horizon: int
+) -> tuple[RobocasaAdapter, RunRecorder, CapApi]:
+    """Wire adapter, recorder and API the way ``run.py`` does: one number for both limits."""
+    recorder = RunRecorder(
+        output_root=tmp_path,
+        benchmark="robocasa",
+        suite="OpenDrawer",
+        task_id=0,
+        task_name="OpenDrawer",
+        seed=101,
+        max_steps=horizon,
+    )
+    adapter = RobocasaAdapter(
+        client_factory=lambda **_: sim, horizon=horizon, run_observer=recorder
+    )
+    adapter.reset("OpenDrawer", 101)
+    return adapter, recorder, CapApi(adapter, recorder=recorder)  # type: ignore[arg-type]
+
+
+def _budget(api: CapApi) -> tuple[int, int]:
+    """The step budget exactly as a generated program reads it."""
+    metadata = api.get_task_context().metadata
+    return int(metadata["episode_steps_used"]), int(metadata["episode_steps_remaining"])
+
+
+def _step_rows(recorder: RunRecorder) -> list[dict]:
+    text = (recorder.root / "episode/steps.jsonl").read_text(encoding="utf-8")
+    return [json.loads(line) for line in text.splitlines()]
+
+
+def test_a_blocked_base_move_is_charged_to_the_budget_the_program_reads(tmp_path) -> None:
+    """The driver's ticks used to bypass ``step()``: 1200 burned, ``episode_steps_used: 0``."""
+    sim = _FakeSim(base_max_steps=6)
+    adapter, recorder, api = _recorded_episode(tmp_path, sim, horizon=20)
+    assert _budget(api) == (0, 20)
+
+    result = adapter.navigate_to_pose(-0.10, 0.0, 0.0)
+
+    assert not result.ok and not result.truncated
+    assert result.error is not None and "did not converge" in result.error.message
+    assert result.steps_executed == 6
+    assert len(sim.sent) == 6
+    assert _budget(api) == (6, 14)
+    assert adapter._elapsed_steps == recorder.step_count == 6
+    # The steps are in the run record too, not only in the counters.
+    rows = _step_rows(recorder)
+    assert [row["step_index"] for row in rows] == [1, 2, 3, 4, 5, 6]
+    assert all(row["ok"] and not row["truncated"] for row in rows)
+    assert recorder.video_frames == {"agentview": 7, "robot0_eye_in_hand": 7}
+    recorder.close_incomplete(RuntimeError("test over"))
+
+
+def test_a_blocked_base_move_truncates_on_the_counter_the_program_reads(tmp_path) -> None:
+    """The driver's cap (1200) exceeds the horizon (1000): the horizon must stop the move."""
+    sim = _FakeSim(base_max_steps=12)
+    adapter, recorder, api = _recorded_episode(tmp_path, sim, horizon=10)
+
+    result = adapter.navigate_to_pose(-0.10, 0.0, 0.0)
+
+    assert not result.ok and result.truncated
+    assert result.error is not None
+    assert "truncated at the 10-tick horizon" in result.error.message
+    # The driver loop was unwound at the horizon instead of running out its own cap.
+    assert result.steps_executed == 10
+    assert len(sim.sent) == 10
+    # One number: the tick that truncated the episode is the tick that emptied the budget.
+    assert _budget(api) == (10, 0)
+    assert adapter._elapsed_steps == recorder.step_count == 10
+    assert _step_rows(recorder)[-1]["truncated"] is True
+    assert recorder.truncated
+    # And the recorder enforces the same limit: the next tick of any kind is refused.
+    with pytest.raises(StepLimitReached):
+        adapter.navigate_to_pose(0.0, 0.05, 0.0)
+    assert len(sim.sent) == 10
+    recorder.close_incomplete(RuntimeError("test over"))
+
+
+def test_a_converged_base_move_records_each_tick_as_an_arm_hold(tmp_path) -> None:
+    sim = _FakeSim(converge_after=3)
+    adapter, recorder, api = _recorded_episode(tmp_path, sim, horizon=20)
+
+    result = adapter.navigate_to_pose(0.0, 0.08, 0.0)
+
+    assert result.ok and result.error is None
+    assert result.steps_executed == 3
+    assert result.final_observation is not None
+    assert result.final_errors["base_translation_m"] == pytest.approx(0.08)
+    assert _budget(api) == (3, 17)
+    # What was sent is a base command; what is recorded for the arm is what it was told: hold.
+    assert all(action["base_vel"] is not None for action in sim.sent)
+    rows = _step_rows(recorder)
+    assert len(rows) == 3
+    assert rows[0]["action"]["arms"]["primary"]["gripper_position"] is None
+    recorder.close_incomplete(RuntimeError("test over"))
+
+
+def test_base_and_arm_ticks_share_one_count(tmp_path) -> None:
+    sim = _FakeSim(converge_after=4, gripper_settle_steps=5)
+    adapter, recorder, api = _recorded_episode(tmp_path, sim, horizon=40)
+
+    assert adapter.navigate_to_pose(0.0, 0.08, 0.0).ok
+    assert adapter.close_gripper().ok
+    assert adapter.navigate_to_pose(0.0, -0.08, 0.0).ok
+
+    assert _budget(api) == (13, 27)
+    assert adapter._elapsed_steps == recorder.step_count == len(sim.sent) == 13
+    assert [row["step_index"] for row in _step_rows(recorder)] == list(range(1, 14))
+    recorder.close_incomplete(RuntimeError("test over"))
+
+
+def test_the_driver_step_is_restored_after_a_base_move() -> None:
+    """The tick routing shadows ``client.step`` for one call only, even when the call fails."""
+    sim = _FakeSim(base_max_steps=3)
+    adapter = RobocasaAdapter(client_factory=lambda **_: sim, horizon=2)
+    adapter.reset("OpenDrawer", 101)
+
+    assert adapter.navigate_to_pose(0.1, 0.0, 0.0).truncated
+    assert "step" not in vars(sim)
+
+    def broken_drive(dx: float, dy: float, dyaw: float) -> bool:
+        raise TimeoutError("'step' timed out")
+
+    sim.drive_base = broken_drive  # type: ignore[method-assign]
+    with pytest.raises(TimeoutError):
+        adapter.navigate_to_pose(0.1, 0.0, 0.0)
+    assert "step" not in vars(sim)
+
+
+def test_a_gripper_call_that_crosses_the_horizon_returns_a_real_error(tmp_path) -> None:
+    """Repro: ``--max-steps 60``, ``close_gripper()`` then ``open_gripper()``, 30 ticks each.
+
+    The second call's last tick ends the episode. That step is ok and carries no error, so the
+    adapter built ``ExecutionResult(ok=False, error=None)`` and the program was shown the
+    contract's own text: "a failed result must carry an ApiError", with ``steps_executed: 0``.
+    """
+    sim = _FakeSim(gripper_settle_steps=30)
+    adapter, recorder, api = _recorded_episode(tmp_path, sim, horizon=60)
+
+    closed = api.close_gripper()
+    opened = api.open_gripper()
+
+    assert closed.ok and closed.steps_executed == 30
+    assert not opened.ok and opened.truncated
+    assert opened.steps_executed == 30
+    assert opened.error is not None
+    assert opened.error.code is ErrorCode.EXECUTION_FAILED
+    assert opened.error.message == "gripper motion truncated at the 60-tick horizon"
+    assert "ApiError" not in opened.error.message
+    assert _budget(api) == (60, 0)
+    recorder.close_incomplete(RuntimeError("test over"))
+
+
+def test_a_gripper_call_cut_short_mid_settle_reports_the_ticks_that_ran() -> None:
+    sim = _FakeSim(gripper_settle_steps=30)
+    adapter = RobocasaAdapter(client_factory=lambda **_: sim, horizon=7)
+    adapter.reset("OpenDrawer", 101)
+
+    result = adapter.close_gripper()
+
+    assert not result.ok and result.truncated
+    assert result.steps_executed == len(sim.sent) == 7
+    assert result.error is not None
+    assert "truncated at the 7-tick horizon" in result.error.message
+    assert result.final_observation is not None
+
+
+class _CountingObserver:
+    """The recorder's step-limit contract without the files, for a 1000-tick episode."""
+
+    def __init__(self, max_steps: int) -> None:
+        self.max_steps, self.step_count = max_steps, 0
+
+    def on_reset(self, observation: Observation, metadata: object) -> None:
+        del observation, metadata
+
+    def before_step(self, action: object) -> None:
+        del action
+        if self.step_count >= self.max_steps:
+            raise StepLimitReached(f"run reached max_steps={self.max_steps}")
+
+    def after_step(self, action: object, result: StepResult) -> None:
+        del action
+        if result.ok:
+            self.step_count += 1
+
+
+def _driver_backed_sim(*, wedged: bool):
+    """The real ``RobotClient`` control loops over a fake wire, so no socket is opened."""
+    robot_driver = pytest.importorskip("robot_driver")
+    wire = robot_driver.protocol
+
+    class _WireSim(robot_driver.RobotClient):
+        def __init__(self) -> None:
+            self.profile = robot_driver.MotionProfile()
+            self.spec = {
+                "cameras": {"scene": "robot0_agentview_left", "wrist": "robot0_eye_in_hand"}
+            }
+            self.action_dim = 13
+            self.action_split = {
+                "right": [0, 7],
+                "right_gripper": [7, 8],
+                "base": [8, 11],
+                "torso": [11, 12],
+            }
+            self.base_mode_index = 12
+            self.last = {}
+            self._gripper = 1.0
+            self._torso_target = 0.0
+            self._cfg = None
+            self.base_xy = np.array([1.0, 2.0])
+            self.steps = 0
+
+        def _proprio(self) -> dict:
+            return {
+                "joint_pos": np.linspace(0.1, 0.7, 7),
+                "eef_pos": np.array([1.4, 2.0, 1.0]),
+                "eef_quat_wxyz": np.array([1.0, 0.0, 0.0, 0.0]),
+                "base_pos": np.array([self.base_xy[0], self.base_xy[1], 0.7]),
+                "base_quat_wxyz": np.array([1.0, 0.0, 0.0, 0.0]),
+                "gripper_qpos": np.array([0.04, -0.04]),
+                "rgb": np.zeros((16, 16, 3), dtype=np.uint8),
+                "sim_step_count": self.steps,
+            }
+
+        def call(self, method: str, params: dict | None = None, timeout_ms: int | None = None):
+            del timeout_ms
+            if method == wire.STEP:
+                self.steps += 1
+                velocity = np.asarray(params["action"], dtype=np.float64)[8:10]
+                if not wedged:
+                    # Yaw is zero, so base-frame velocity is world-frame velocity.
+                    self.base_xy = self.base_xy + 0.02 * velocity
+                return self._proprio()
+            if method == wire.RESET:
+                return {**self._proprio(), "instruction": "Open the drawer."}
+            if method == wire.GET_DEPTH:
+                return {
+                    "depth": np.ones((16, 16, 1)),
+                    "intrinsics": np.eye(3),
+                    "cam_pose_mat": np.eye(4),
+                }
+            if method == wire.RENDER:
+                return {"rgb": np.zeros((16, 16, 3), dtype=np.uint8)}
+            if method == wire.EVALUATE:
+                return {"reward": 0.0, "success": False}
+            raise AssertionError(f"unexpected wire call {method!r}")
+
+        def close(self, *, shutdown_server: bool = True) -> None:
+            del shutdown_server
+
+    return _WireSim()
+
+
+def test_the_real_drive_base_loop_cannot_outlast_the_horizon() -> None:
+    """``MotionProfile.base_max_steps`` is 1200 against a 1000-tick episode."""
+    sim = _driver_backed_sim(wedged=True)
+    assert sim.profile.base_max_steps > 1000
+    observer = _CountingObserver(1000)
+    adapter = RobocasaAdapter(client_factory=lambda **_: sim, horizon=1000, run_observer=observer)
+    adapter.reset("OpenDrawer", 101)
+
+    result = adapter.navigate_to_pose(-0.10, 0.0, 0.0)
+
+    assert not result.ok and result.truncated
+    assert result.steps_executed == sim.steps == observer.step_count == 1000
+    assert adapter._elapsed_steps == 1000
+
+
+def test_the_real_drive_base_loop_reports_every_tick_of_a_converged_move() -> None:
+    sim = _driver_backed_sim(wedged=False)
+    observer = _CountingObserver(1000)
+    adapter = RobocasaAdapter(client_factory=lambda **_: sim, horizon=1000, run_observer=observer)
+    adapter.reset("OpenDrawer", 101)
+
+    result = adapter.navigate_to_pose(0.0, 0.08, 0.0)
+
+    assert result.ok
+    assert 0 < result.steps_executed < 100
+    assert result.steps_executed == sim.steps == observer.step_count == adapter._elapsed_steps
+    assert result.final_errors["base_translation_m"] == pytest.approx(0.08, abs=0.02)
 
 
 # --------------------------------------------------------------- joint limits
