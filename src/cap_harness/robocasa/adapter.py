@@ -50,6 +50,7 @@ from cap_harness.robocasa.geometry import (
     plan_standoff_pose as standoff_from_clouds,
 )
 from cap_harness.robocasa.registry import (
+    OOPSIEVERSE_FAMILY,
     RobocasaTaskMetadata,
     RobocasaTaskRegistry,
     scene_group_for_seed,
@@ -67,6 +68,10 @@ PANDA_JOINT_NAMES = tuple(f"panda_joint{index}" for index in range(1, 8))
 #: wide enough never to trip on drift and far narrower than the errors worth catching (the
 #: original bug published a zero-width range and a 0.5 rad violation).
 JOINT_LIMIT_SLACK_RAD = 0.05
+
+
+class WrongSimulatorTaskError(RuntimeError):
+    """The connected simulator was started with a task other than the one the suite needs."""
 
 
 def validate_joint_limits(
@@ -262,6 +267,13 @@ class RobocasaAdapter:
 
         return RobotClient(self._endpoint or wire.DEFAULT_ENDPOINT, timeout_ms=self._timeout_ms)
 
+    def _connect(self) -> Any:
+        """Connect to the simulator if needed. Connecting fetches ``get_spec`` and nothing else."""
+        if self._client is None:
+            self._client = self._make_client()
+            self._closed = False
+        return self._client
+
     def _build_camera_map(self, metadata: RobocasaTaskMetadata) -> dict[str, str]:
         """Map ASPIRE's portable camera names onto whatever this simulator advertises.
 
@@ -293,10 +305,7 @@ class RobocasaAdapter:
         if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
             raise ValueError("seed must be a non-negative integer")
         metadata = self.registry.resolve(task_ref)
-        if self._client is None:
-            self._client = self._make_client()
-            self._closed = False
-        client = self._require_client()
+        client = self._connect()
 
         # The seed crosses the wire with the group it belongs to: only the simulator can act
         # on a seed, but which group a seed draws from is this harness's partition, not its.
@@ -766,16 +775,45 @@ class RobocasaAdapter:
         """
         return bool(self._require_client().evaluate()["success"])
 
-    def safety_record(self) -> dict[str, Any]:
-        """The simulator's full scoring record (OopsieVerse adds health), for the host only.
+    def evaluate_episode(self) -> dict[str, Any]:
+        """One snapshot of the simulator's full scoring record, for the host only.
 
-        Like ``check_success``, not in the extension allowlist, so never a tool.
+        Like ``check_success``, not in the extension allowlist, so never a tool. A caller that
+        needs more than one field of the record must take them all from one snapshot: on some
+        tasks a second ``evaluate`` call can answer differently with no step in between.
         """
         return dict(self._require_client().evaluate())
 
     def served_task(self) -> str | None:
-        """The task the connected simulator was started with (``server.py --task``)."""
-        return self._require_client().spec.get("task")
+        """The task the simulator was started with (``server.py --task``).
+
+        Static for the life of the simulator process, so this is legal before ``reset()``; it
+        connects (``get_spec``) but sends no ``reset``.
+        """
+        return self._connect().spec.get("task")
+
+    def require_served_task(
+        self, task_ref: str | tuple[str, int] | RobocasaTaskMetadata
+    ) -> None:
+        """Refuse a simulator that was started with another task, before any ``reset``.
+
+        One simulator process serves one task and ``reset`` cannot change it, so an episode
+        on the wrong simulator would run, and be scored on, a task nobody asked for.
+        """
+        metadata = self.registry.resolve(task_ref)
+        served = self.served_task()
+        if served == metadata.environment:
+            return
+        launcher = (
+            "oopsieverse/aspire_sim/run_server.sh"
+            if metadata.family == OOPSIEVERSE_FAMILY
+            else "robocasa/capx_sim_server/server.py --task"
+        )
+        raise WrongSimulatorTaskError(
+            f"the simulator serves {served!r}, but this suite needs {metadata.environment!r}; "
+            f"start {launcher} {metadata.environment} and point "
+            "CAP_HARNESS_ROBOCASA_ENDPOINT at it"
+        )
 
     def compute_reward(self) -> float | None:
         return self._last_reward
@@ -850,5 +888,6 @@ __all__ = [
     "TRAJECTORY_GOAL_MAX_STEPS",
     "TRAJECTORY_MAX_JOINT_STEP_RAD",
     "RobocasaAdapter",
+    "WrongSimulatorTaskError",
     "densify_joint_waypoints",
 ]

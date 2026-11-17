@@ -6,8 +6,9 @@ directory: the run directory is what a coding agent reads between iterations, an
 benchmark neither generated programs nor the agent may see health. The record keeps the run
 directory's path so the two can be joined afterwards.
 
-The default root is ``oopsie_safety/`` next to this checkout (the workspace root), overridable with
-``CAP_HARNESS_OOPSIE_SAFETY_ROOT``.
+The default root is ``oopsie_safety/`` in the workspace root (the directory that holds the main
+checkout), overridable with ``CAP_HARNESS_OOPSIE_SAFETY_ROOT``. It is the same directory from the
+main checkout and from every git worktree of it, wherever the worktree lives.
 """
 
 from __future__ import annotations
@@ -37,22 +38,59 @@ class SafetyRecordError(RuntimeError):
     """The episode cannot be scored for safety."""
 
 
+def _main_checkout(source: Path) -> Path | None:
+    """The main checkout of the repository that holds ``source``, or None outside a repository.
+
+    Reads git's own files instead of running git. The nearest ancestor with a ``.git`` entry is
+    the top of a working tree. A main checkout has a ``.git`` directory. A linked worktree has a
+    ``.git`` *file*, ``gitdir: <common>/worktrees/<name>``, and ``<gitdir>/commondir`` names the
+    shared git directory, which sits inside the main checkout.
+    """
+    for directory in source.parents:
+        marker = directory / ".git"
+        if marker.is_dir():
+            return directory
+        if not marker.is_file():
+            continue
+        try:
+            text = marker.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if not text.startswith("gitdir:"):
+            return None
+        gitdir = (directory / text.removeprefix("gitdir:").strip()).resolve()
+        try:
+            pointer = (gitdir / "commondir").read_text(encoding="utf-8").strip()
+            common = (gitdir / pointer).resolve()
+        except OSError:
+            # No commondir file: fall back on the layout, <common>/worktrees/<name>.
+            common = gitdir.parents[1] if gitdir.parent.name == "worktrees" else gitdir
+        # A bare or separate git directory says nothing about where the main checkout is.
+        return common.parent if common.name == ".git" else None
+    return None
+
+
+def default_safety_root(source: Path | str | None = None) -> Path:
+    """``oopsie_safety/`` in the workspace root: the parent of the main checkout.
+
+    ``source`` is this file unless a test passes another location. A fixed ``parents[4]`` was
+    right from the fork's checkout only; from a worktree under ``.claude/worktrees/`` it pointed
+    inside the repository tree.
+    """
+    source = Path(source if source is not None else __file__).resolve()
+    main = _main_checkout(source)
+    if main is None:
+        # Not in a git checkout (an exported tree): src/cap_harness/robocasa/safety.py ->
+        # tree -> its parent.
+        return source.parents[4] / "oopsie_safety"
+    return main.parent / "oopsie_safety"
+
+
 def safety_root() -> Path:
     override = os.environ.get(SAFETY_ROOT_ENV)
     if override:
         return Path(override).expanduser().resolve()
-    # src/cap_harness/robocasa/safety.py -> checkout -> workspace root
-    return Path(__file__).resolve().parents[4] / "oopsie_safety"
-
-
-def check_served_task(served: str | None, environment: str) -> None:
-    """Refuse to score an OopsieVerse suite against a simulator serving another task."""
-    if served != environment:
-        raise SafetyRecordError(
-            f"the simulator serves {served!r}, but this suite needs {environment!r}; start "
-            f"oopsieverse/aspire_sim/run_server.sh {environment} and point "
-            "CAP_HARNESS_ROBOCASA_ENDPOINT at it"
-        )
+    return default_safety_root()
 
 
 def write_safety_record(
@@ -111,7 +149,7 @@ __all__ = [
     "SAFETY_KEYS",
     "SAFETY_ROOT_ENV",
     "SafetyRecordError",
-    "check_served_task",
+    "default_safety_root",
     "safety_root",
     "write_safety_record",
 ]
