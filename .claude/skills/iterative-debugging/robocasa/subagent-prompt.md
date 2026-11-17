@@ -25,6 +25,7 @@ MAX_STEPS: 1000
 DEV_SEEDS: 101 102 103
 UNSEEN_SEEDS: 126
 HELDOUT_COUNT: 3
+VERSION_BUDGET: <$VERSION_BUDGET from campaign.json["version_budget"]>
 
 Working directory: $REPO_ROOT (the CaP harness repository root, the directory containing
 `pyproject.toml`). `WORKSPACE_ROOT` is its parent.
@@ -386,9 +387,17 @@ Write `$TASK_DIR/code/v<NN>_<slug>.py`. Never edit a version in place. Sweep wit
 - **More passes than the best so far** — keep it and move to the next mode.
 - **Same or fewer** — say which seeds regressed; repair or revert before continuing.
 
-**Budget: 2 versions per mode, 4 in total** (v00 counts). A mode still unfixed after 2 is
-blocked; write `$TASK_DIR/debug/blocked/<mode>.md` (`## Root Cause`, `## Details`,
-`## What Was Tried`) and move on.
+**Budget: `$VERSION_BUDGET` versions in total** (v00 counts). There is **no per-mode cap**: you
+decide how many versions a mode is worth, because you are the one who assigned its label.
+
+Whenever you **set a mode down** without fixing it -- stuck, judged not worth another version,
+or out of total budget -- write `$TASK_DIR/debug/blocked/<mode>.md` (`## Root Cause`,
+`## Details`, `## What Was Tried`) before moving to the next mode. Do not save these for the
+end: a file written from memory after the budget runs out is worth less than one written while
+the evidence is in front of you.
+
+Record in `CHANGELOG.md` how many versions each mode consumed, so the spend is auditable
+against earlier campaigns run under a different budget.
 
 Probes: observation-only programs into `result`, `--output-root "$TASK_DIR/debug/explore"`
 `--flat-run-dir --no-videos --init-mode saved`. Probes are not numbered versions.
