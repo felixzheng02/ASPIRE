@@ -61,6 +61,7 @@ class FakeAdapter:
 
     def __init__(self) -> None:
         self.state = _state()
+        self.camera_pose = _pose()
         self.executed: list[object] = []
         self.close_calls = 0
 
@@ -78,7 +79,7 @@ class FakeAdapter:
             depth_m=np.ones((2, 2)),
             intrinsics=np.eye(3),
             frame="camera",
-            camera_pose=_pose(),
+            camera_pose=self.camera_pose,
         )
         return Observation(cameras={"agentview": camera}, robot_state=self.state)
 
@@ -892,10 +893,64 @@ def test_camera_name_normalization_preserves_segmentation_box() -> None:
     )
 
 
-def test_generate_grasps_projects_mask_into_robot_base_frame() -> None:
-    provider = FakeGraspProvider()
+class CloudFrameGraspProvider(FakeGraspProvider):
+    """Answers in the frame of the cloud it was given, as Contact-GraspNet does."""
+
+    def __init__(self, frame: str | None = None) -> None:
+        super().__init__()
+        self.frame = frame
+
+    def generate_grasps(
+        self,
+        point_cloud,
+        *,
+        scene_point_cloud=None,
+        geometry=None,
+        max_candidates=None,
+    ):
+        super().generate_grasps(
+            point_cloud,
+            scene_point_cloud=scene_point_cloud,
+            geometry=geometry,
+            max_candidates=max_candidates,
+        )
+        # Approach (local +Z) along the cloud frame's own +Z: for a camera
+        # frame, straight down the optical axis.
+        pose = Pose(
+            position=np.array([0.1, 0.2, 0.9]),
+            quaternion_wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
+            frame=self.frame or point_cloud.frame,
+        )
+        return GraspSet(
+            ok=True,
+            grasps=(
+                GraspCandidate(
+                    pose=pose,
+                    score=0.9,
+                    width_m=0.04,
+                    metadata={"contact_point": (0.1, 0.2, 0.95)},
+                ),
+            ),
+            diagnostics={"frame": point_cloud.frame},
+        )
+
+
+def _camera_looking_down() -> Pose:
+    """A camera 1 m above the base, optical axis along base -Z (180 deg about X)."""
+    return Pose(
+        position=np.array([0.5, 0.0, 1.0]),
+        quaternion_wxyz=np.array([0.0, 1.0, 0.0, 0.0]),
+        frame="base",
+    )
+
+
+def test_generate_grasps_infers_in_the_camera_frame_and_answers_in_base() -> None:
+    provider = CloudFrameGraspProvider()
+    adapter = FakeAdapter()
+    adapter.state = _state_for("behavior")  # not a Panda: no EEF offset on top
+    adapter.camera_pose = _camera_looking_down()
     api = CapApi(  # type: ignore[arg-type]
-        FakeAdapter(),
+        adapter,
         grasp_providers={"contact-graspnet": provider},
     )
 
@@ -904,11 +959,72 @@ def test_generate_grasps_projects_mask_into_robot_base_frame() -> None:
     assert result.ok
     assert provider.point_cloud is not None
     assert provider.scene_point_cloud is not None
-    assert provider.point_cloud.frame == "base"
-    assert provider.scene_point_cloud.frame == "base"
+    # The model sees the cloud as the camera saw it: +Z is depth. Projected into
+    # the base frame instead, these would sit at z = 0 under a camera 1 m up.
+    assert provider.point_cloud.frame == "camera"
+    assert provider.scene_point_cloud.frame == "camera"
+    np.testing.assert_allclose(provider.point_cloud.points[:, 2], 1.0)
+    np.testing.assert_allclose(provider.scene_point_cloud.points[:, 2], 1.0)
     assert provider.max_candidates == 5
     assert len(provider.scene_point_cloud.points) >= len(provider.point_cloud.points)
-    assert result.grasps[0].frame == "base"
+
+    grasp = result.grasps[0]
+    assert grasp.frame == "base"
+    np.testing.assert_allclose(grasp.pose.position, [0.6, -0.2, 0.1], atol=1e-12)
+    # Down the optical axis is straight down in the base frame.
+    approach = quaternion_wxyz_to_matrix(grasp.pose.quaternion_wxyz)[:, 2]
+    np.testing.assert_allclose(approach, [0.0, 0.0, -1.0], atol=1e-12)
+    np.testing.assert_allclose(grasp.metadata["contact_point"], [0.6, -0.2, 0.05], atol=1e-12)
+    assert result.diagnostics["frame"] == "base"
+    assert result.diagnostics["inference_frame"] == "camera"
+
+
+def test_generate_grasps_passes_through_candidates_already_in_base() -> None:
+    provider = CloudFrameGraspProvider(frame="base")
+    adapter = FakeAdapter()
+    adapter.state = _state_for("behavior")
+    adapter.camera_pose = _camera_looking_down()
+    api = CapApi(  # type: ignore[arg-type]
+        adapter,
+        grasp_providers={"contact-graspnet": provider},
+    )
+
+    result = api.generate_grasps("agentview", np.ones((2, 2), dtype=bool))
+
+    assert result.ok
+    np.testing.assert_allclose(result.grasps[0].pose.position, [0.1, 0.2, 0.9], atol=1e-12)
+    np.testing.assert_allclose(result.grasps[0].metadata["contact_point"], [0.1, 0.2, 0.95])
+
+
+def test_generate_grasps_rejects_candidates_in_an_unrelated_frame() -> None:
+    api = CapApi(  # type: ignore[arg-type]
+        FakeAdapter(),
+        grasp_providers={"contact-graspnet": CloudFrameGraspProvider(frame="world")},
+    )
+
+    result = api.generate_grasps("agentview", np.ones((2, 2), dtype=bool))
+
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code is ErrorCode.GRASP_FAILED
+    assert "world" in result.error.message
+
+
+def test_generate_grasps_needs_the_camera_pose_in_the_base_frame() -> None:
+    provider = FakeGraspProvider()
+    adapter = FakeAdapter()
+    adapter.camera_pose = replace(_camera_looking_down(), frame="world")
+    api = CapApi(  # type: ignore[arg-type]
+        adapter,
+        grasp_providers={"contact-graspnet": provider},
+    )
+
+    result = api.generate_grasps("agentview", np.ones((2, 2), dtype=bool))
+
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code is ErrorCode.POINT_CLOUD_FAILED
+    assert provider.point_cloud is None
 
 
 def _state_for(embodiment: str) -> RobotState:

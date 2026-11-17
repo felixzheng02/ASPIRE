@@ -25,6 +25,7 @@ MAX_STEPS: 1000
 DEV_SEEDS: 101 102 103
 UNSEEN_SEEDS: 126
 HELDOUT_COUNT: 3
+VERSION_BUDGET: <$VERSION_BUDGET from campaign.json["version_budget"]>
 
 Working directory: $REPO_ROOT (the CaP harness repository root, the directory containing
 `pyproject.toml`). `WORKSPACE_ROOT` is its parent.
@@ -196,26 +197,31 @@ are kitchen fallbacks when a noun misses; they are not the goal. Confirm overlay
 `media/overlays/` before trusting a centroid. `localize_object` returns SAM's first mask —
 often the counter — so pick the mask that matches the instruction noun, not the first hit.
 
-**`.ok` does not mean the object is in the frame.** The service runs SAM3 with its detection
-threshold at `0.0`, so `segment_text` answers *every* noun with five ranked masks and
-`ok=True`. Measured on `PickPlaceCounterToStove` seed 101 `agentview`, which contains no
-sink: `segment_text("agentview", "sink")` returns the **plate** at score **0.723** — the same
-box, to within a pixel, that `"plate"` (0.828) and `"pan"` (0.035) return. Back-project that
-and you reach for the wrong object with nothing in the result saying so.
+**`segment_text` reports absence, so handle `ok=False`.** On robocasa the harness builds
+SAM3 with a **0.5** presence floor, so a prompt whose best candidate scores below it comes
+back `ok=False` with `NO_SEGMENTATION`, and the message names the rejected score. Measured
+over 78 labelled prompts (seeds 101/102/103, both cameras) the cut is right **88.5%** of the
+time, against 39.7% for a program that trusts a non-empty result.
 
-Read `segmentations[0].score`, not `.ok`:
+**`ok=False` means "SAM3 did not see it", not "the call failed".** Do not retry it unchanged,
+and do not lower the floor. The answer is a different word or a different camera:
 
-- It is SAM3's concept-presence confidence, not mask quality, so a crisp mask of the wrong
-  thing scores *low*. Over 73 labelled prompts (seeds 101/102/103, both cameras) a **0.5**
-  cut separates present from absent **94.5%** of the time, against 39.7% for trusting `.ok`.
-- Treat `score < 0.5` as "probably not in this frame": re-prompt rather than reach.
-  `diagnostics["best_candidate_score"]` records what the model actually believed.
-- 0.5 is a filter, not a proof. A close noun can beat it (`"sink"` 0.723 above the present
-  `"stove"` 0.738), and a present object can fall under it when you use the wrong word (a
-  zucchini scores 0.127 as `"zucchini"` but 0.872 as `"green vegetable"`). If a prompt
-  scores low, **try another word for the same object before concluding it is absent.**
+- Score is SAM3's concept-presence confidence, not mask quality, so a crisp mask of the
+  wrong thing scores *low*. `diagnostics["best_candidate_score"]` (or
+  `error.details["best_candidate_score"]` on a rejection) records what the model believed.
+- **Try another word for the same object before concluding it is absent.** A present object
+  falls under the cut when prompted with the wrong noun: on seed 102 the vegetable on the
+  plate scores 0.127 as `"zucchini"` and **0.872** as `"green vegetable"`. A visible frying
+  pan scores 0.856 as `"pan"` and 0.172 as `"skillet"`.
+- **Try the other camera.** A noun absent from `agentview` is often plain in the wrist frame:
+  at spawn on seed 101 the pan scores 0.035 on `agentview` (that cooktop really is empty) and
+  **0.856** on `robot0_eye_in_hand`.
+- The floor is a filter, not a proof. A close noun can still beat it: on seed 101 `"sink"`
+  scores **0.723** on a kitchen with no sink and returns the **plate**, the same box
+  `"plate"` (0.828) returns. On seed 102 the absent `"fish"` clears it at 0.55.
 - The cheapest check SAM cannot fool: **compare boxes across prompts.** Two nouns returning
   the same box returned the same object, and at most one of them is right.
+- `CAP_HARNESS_SAM3_MIN_SCORE` exists for experiments. Do not set it in a campaign.
 
 ---
 
@@ -386,9 +392,17 @@ Write `$TASK_DIR/code/v<NN>_<slug>.py`. Never edit a version in place. Sweep wit
 - **More passes than the best so far** — keep it and move to the next mode.
 - **Same or fewer** — say which seeds regressed; repair or revert before continuing.
 
-**Budget: 2 versions per mode, 4 in total** (v00 counts). A mode still unfixed after 2 is
-blocked; write `$TASK_DIR/debug/blocked/<mode>.md` (`## Root Cause`, `## Details`,
-`## What Was Tried`) and move on.
+**Budget: `$VERSION_BUDGET` versions in total** (v00 counts). There is **no per-mode cap**: you
+decide how many versions a mode is worth, because you are the one who assigned its label.
+
+Whenever you **set a mode down** without fixing it -- stuck, judged not worth another version,
+or out of total budget -- write `$TASK_DIR/debug/blocked/<mode>.md` (`## Root Cause`,
+`## Details`, `## What Was Tried`) before moving to the next mode. Do not save these for the
+end: a file written from memory after the budget runs out is worth less than one written while
+the evidence is in front of you.
+
+Record in `CHANGELOG.md` how many versions each mode consumed, so the spend is auditable
+against earlier campaigns run under a different budget.
 
 Probes: observation-only programs into `result`, `--output-root "$TASK_DIR/debug/explore"`
 `--flat-run-dir --no-videos --init-mode saved`. Probes are not numbered versions.

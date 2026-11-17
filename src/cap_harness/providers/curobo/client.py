@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-import json
 
 import numpy as np
 import requests
@@ -43,17 +42,16 @@ def _typed_service_failure(exc: ProviderHttpError, code: ErrorCode) -> ApiError:
     if details.get("status_code") != _SERVICE_REFUSAL_STATUS:
         return error
     message = "cuRobo refused the request"
-    raw = details.get("response")
-    if isinstance(raw, str):
-        try:
-            body = json.loads(raw)
-        except ValueError:
-            body = None
-        detail = body.get("detail") if isinstance(body, dict) else None
-        if isinstance(detail, dict) and isinstance(detail.get("message"), str):
-            message = detail["message"]
-        elif isinstance(detail, str):
-            message = detail
+    # Read the decoded body, not details["response"]: that is a 512-character
+    # preview, and a planning refusal with its per-constraint diagnostics is
+    # longer (605 characters measured), so parsing the preview failed and the
+    # reason -- e.g. "cuRobo goal state infeasible (scene_collision)" -- was lost.
+    body = exc.response_body
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if isinstance(detail, dict) and isinstance(detail.get("message"), str):
+        message = detail["message"]
+    elif isinstance(detail, str):
+        message = detail
     details["http_error_code"] = error.code.value
     return ApiError(code=code, message=message, details=details, recoverable=error.recoverable)
 

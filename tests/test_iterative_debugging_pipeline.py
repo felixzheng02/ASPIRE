@@ -375,6 +375,7 @@ def test_init_run_seed_partitions(
         "dev_seeds": dev_seeds,
         "unseen_seeds": unseen_seeds,
         "evosearch": False,
+        "version_budget": 4,
     }
     campaign = load_script("campaign")
     assert campaign.heldout_seeds(root) == list(range(1, heldout_count + 1))
@@ -393,6 +394,8 @@ def test_init_run_seed_partitions(
         ["--unseen-seeds", "66", "66"],
         ["--dev-seeds", "66", "--unseen-seeds", "66"],
         ["--heldout-count", "100", "--dev-seeds", "101", "--unseen-seeds", "50"],
+        ["--version-budget", "0"],
+        ["--version-budget", "-1"],
     ],
 )
 def test_init_run_rejects_invalid_or_overlapping_seeds(tmp_path, monkeypatch, arguments):
@@ -401,9 +404,48 @@ def test_init_run_rejects_invalid_or_overlapping_seeds(tmp_path, monkeypatch, ar
     monkeypatch.setattr(init_run, "RUNS_ROOT", runs)
     monkeypatch.setattr(init_run, "LATEST_LINK", runs / "LATEST")
     monkeypatch.setattr("sys.argv", ["init_run.py", "--tasks", "unused.json", *arguments])
-    with pytest.raises(SystemExit, match=r"--dev-seeds|--heldout-count|--unseen-seeds"):
+    with pytest.raises(
+        SystemExit, match=r"--dev-seeds|--heldout-count|--unseen-seeds|--version-budget"
+    ):
         init_run.main()
     assert not runs.exists()
+
+
+def test_init_run_records_the_version_budget_it_ran_under(tmp_path, monkeypatch):
+    """The budget belongs in campaign.json, not only in the worker prompt: a campaign's
+    artifacts have to be readable later without guessing how many versions it was allowed.
+    """
+    init_run = load_script("init_run")
+    tasks = tmp_path / "tasks.json"
+    tasks.write_text(
+        json.dumps([{"benchmark": "robocasa", "suite": "PickPlaceCounterToStove", "task_id": 0}])
+    )
+    runs = tmp_path / "runs"
+    monkeypatch.setattr(init_run, "RUNS_ROOT", runs)
+    monkeypatch.setattr(init_run, "LATEST_LINK", runs / "LATEST")
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "init_run.py",
+            "--tasks",
+            str(tasks),
+            "--dev-seeds",
+            "101",
+            "102",
+            "103",
+            "--unseen-seeds",
+            "126",
+            "--heldout-count",
+            "3",
+            "--version-budget",
+            "16",
+        ],
+    )
+
+    init_run.main()
+
+    campaign = json.loads(((runs / "LATEST").resolve() / "campaign.json").read_text())
+    assert campaign["version_budget"] == 16
 
 
 def test_existing_validation_and_progress_support_100_heldout_seeds(tmp_path, monkeypatch):

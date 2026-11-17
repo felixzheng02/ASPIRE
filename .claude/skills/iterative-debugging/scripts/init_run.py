@@ -87,7 +87,17 @@ def main() -> None:
         help="enable Stage 1b evolutionary search after the freeze loop "
         "(default off; recorded as campaign.json['evosearch'])",
     )
+    parser.add_argument(
+        "--version-budget",
+        type=int,
+        default=4,
+        help="total numbered program versions one Stage 1 worker may write, v00 included "
+        "(recorded as campaign.json['version_budget']); the RoboCasa sibling reads it, the "
+        "tabletop parent prompts state their own budget in prose",
+    )
     args = parser.parse_args()
+    if args.version_budget < 1:
+        raise SystemExit("--version-budget must be a positive integer")
     if any(seed < 1 for seed in args.dev_seeds) or len(set(args.dev_seeds)) != len(args.dev_seeds):
         raise SystemExit("--dev-seeds must contain unique positive integers")
     if any(seed < 1 for seed in args.unseen_seeds) or len(set(args.unseen_seeds)) != len(
@@ -125,6 +135,7 @@ def main() -> None:
         "dev_seeds": args.dev_seeds,
         "unseen_seeds": args.unseen_seeds,
         "evosearch": evosearch,
+        "version_budget": args.version_budget,
     }
     if args.skills_dir is not None:
         payload["skills_dir"] = args.skills_dir.as_posix()

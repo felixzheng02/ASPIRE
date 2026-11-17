@@ -56,8 +56,11 @@ Optional: append `--evosearch` to enable Stage 1b after the freeze loop (default
 `campaign.json` by passing `--evosearch` (or relying on `init_run.py` to read the env at
 kickoff). Do not flip `evosearch` mid-run.
 
-Read `dev_seeds`, `unseen_seeds`, `heldout_count`, `evosearch`, and `skills_dir` from
-`$RUN_ROOT/campaign.json` when assigning or resuming. Generate progress with
+Read `dev_seeds`, `unseen_seeds`, `heldout_count`, `evosearch`, `version_budget`, and
+`skills_dir` from `$RUN_ROOT/campaign.json` when assigning or resuming. `version_budget` fills
+the worker template's `VERSION_BUDGET` field (`init_run.py --version-budget`, default 4): it is
+the total numbered versions one Stage 1 worker may write, v00 included, with no per-mode cap.
+Do not change it mid-run -- a campaign's budget is part of what its artifacts measure. Generate progress with
 `python3 .claude/skills/iterative-debugging/scripts/gen_progress.py`.
 
 From `$WORKSPACE_ROOT` (parent of `aspire/`):
