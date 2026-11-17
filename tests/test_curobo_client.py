@@ -133,3 +133,23 @@ def test_http_error_keeps_the_decoded_body_next_to_the_text_preview() -> None:
     assert long_error.response_body == long_detail
     assert plain_error.error.details["response"] == "oops"
     assert plain_error.response_body is None
+
+
+def test_curobo_ik_does_not_claim_it_checked_the_scene() -> None:
+    # The service's IK solver has no scene collision checker: it sees joint limits
+    # and self-collision only. A trace must not suggest the kitchen was checked.
+    state = _state()
+    provider = CuRoboProvider(
+        session=FakeSession([FakeResponse(200, {"joint_positions": [0.0] * 7})])  # type: ignore[arg-type]
+    )
+
+    result = provider.solve_ik_with_context(
+        Pose([0.4, 0.0, 0.3], [1.0, 0.0, 0.0, 0.0], "robot_base"),
+        state,
+        context=_context(state),
+    )
+
+    assert result.ok
+    assert result.diagnostics["provider"] == "curobo"
+    assert result.diagnostics["scene_collision_checked"] is False
+    assert "collision_aware" not in result.diagnostics

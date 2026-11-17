@@ -768,3 +768,152 @@ def test_curobo_robot_carve_accepts_the_request_object(monkeypatch: pytest.Monke
     carved = curobo_service._carve_robot_points(request, _Robot(), points)
 
     np.testing.assert_allclose(carved, points[1:])
+
+
+# The cuRobo planner cache is keyed on (robot, interpolation_dt, maximum_dt), not on
+# the scene, and every caller of the service shares it. These tests pin that a plan
+# without a scene is refused rather than checked against a previous caller's world.
+
+
+class _RecordingSolver:
+    """Stands in for a cached cuRobo planner or IK solver; records world loads."""
+
+    def __init__(self) -> None:
+        from types import SimpleNamespace
+
+        self.worlds: list[object] = []
+        self.wp_cache: dict[str, object] = {"public_rgbd_scene": object()}
+        self.scene_collision_checker = SimpleNamespace(
+            data=SimpleNamespace(meshes=SimpleNamespace(wp_cache=self.wp_cache))
+        )
+
+    def update_world(self, scene: object) -> None:
+        self.worlds.append(scene)
+
+
+def _panda_plan_request(scene_points_base64: str | None = None) -> PlanRequest:
+    return PlanRequest(
+        base_frame="robot_base",
+        model="panda",
+        joint_positions={"primary": [0.0] * 7},
+        joint_names={"primary": [f"robot0_joint{index}" for index in range(1, 8)]},
+        base_transforms={"primary": np.eye(4).tolist()},
+        end_effector_links={"primary": "panda_hand"},
+        scene_points_base64=scene_points_base64,
+        arm="primary",
+        target=Target(type="joints", joint_positions=[0.0] * 7),
+    )
+
+
+@pytest.fixture
+def curobo_caches(monkeypatch: pytest.MonkeyPatch) -> tuple[dict[Any, Any], dict[Any, Any]]:
+    """Empty planner/IK caches, a fake robot config, and collision checking on."""
+    planners: dict[Any, Any] = {}
+    solvers: dict[Any, Any] = {}
+    monkeypatch.setattr(curobo_service, "_PLANNERS", planners)
+    monkeypatch.setattr(curobo_service, "_IK_SOLVERS", solvers)
+    monkeypatch.setattr(curobo_service, "_robot_config", lambda request: "fake.yml")
+    monkeypatch.delenv("CAP_HARNESS_CUROBO_DISABLE_COLLISION", raising=False)
+    return planners, solvers
+
+
+def test_curobo_scene_free_plan_is_refused_not_checked_against_a_stale_world(
+    curobo_caches: tuple[dict[Any, Any], dict[Any, Any]],
+) -> None:
+    from fastapi import HTTPException
+
+    planners, _ = curobo_caches
+    cached = _RecordingSolver()
+    planners[("fake.yml", None, None)] = cached
+
+    with pytest.raises(HTTPException) as raised:
+        curobo_service._plan(_panda_plan_request())
+
+    assert raised.value.status_code == 400
+    assert "scene_points_base64" in str(raised.value.detail)
+    assert cached.worlds == []
+
+
+def test_curobo_scene_free_synchronized_plan_is_refused(
+    curobo_caches: tuple[dict[Any, Any], dict[Any, Any]],
+) -> None:
+    from fastapi import HTTPException
+
+    arms = ("primary", "secondary")
+    request = curobo_service.SynchronizedPlanRequest(
+        base_frame="robot_base",
+        model="dual_panda",
+        joint_positions={arm: [0.0] * 7 for arm in arms},
+        joint_names={arm: [f"{arm}_joint{index}" for index in range(1, 8)] for arm in arms},
+        base_transforms={arm: np.eye(4).tolist() for arm in arms},
+        end_effector_links=dict.fromkeys(arms, "panda_hand"),
+        targets={
+            arm: Target(type="pose", position=[0.5, 0.0, 0.3], quaternion_wxyz=[0, 1, 0, 0])
+            for arm in arms
+        },
+    )
+
+    with pytest.raises(HTTPException) as raised:
+        curobo_service._plan_synchronized(request)
+
+    assert raised.value.status_code == 400
+    assert "scene_points_base64" in str(raised.value.detail)
+
+
+def test_curobo_scene_bearing_plan_still_replaces_the_world(
+    curobo_caches: tuple[dict[Any, Any], dict[Any, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    planners, _ = curobo_caches
+    cached = _RecordingSolver()
+    planners[("fake.yml", None, None)] = cached
+    scene = object()
+    monkeypatch.setattr(curobo_service, "_scene", lambda request, planner: scene)
+
+    assert curobo_service._planner(_panda_plan_request("points")) is cached
+
+    assert cached.worlds == [scene]
+    assert cached.wp_cache == {}
+
+
+def test_curobo_scene_free_plan_is_allowed_when_collision_is_disabled(
+    curobo_caches: tuple[dict[Any, Any], dict[Any, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # With collision disabled the service discards every scene and the planner has
+    # no collision terms, so there is no world to go stale.
+    planners, _ = curobo_caches
+    cached = _RecordingSolver()
+    planners[("fake.yml", None, None)] = cached
+    monkeypatch.setenv("CAP_HARNESS_CUROBO_DISABLE_COLLISION", "1")
+
+    assert curobo_service._planner(_panda_plan_request()) is cached
+    assert cached.worlds == []
+
+
+def test_curobo_ik_stays_scene_free_and_refuses_a_scene(
+    curobo_caches: tuple[dict[Any, Any], dict[Any, Any]],
+) -> None:
+    # The IK solver is built without a scene checker, so it can never use a scene.
+    # Sending one used to fail with an AttributeError (HTTP 500); now it is a 400.
+    from fastapi import HTTPException
+
+    _, solvers = curobo_caches
+    cached = _RecordingSolver()
+    solvers["fake.yml"] = cached
+
+    def ik_request(scene_points_base64: str | None) -> Any:
+        fields = _panda_plan_request(scene_points_base64).model_dump(exclude={"arm", "target"})
+        return curobo_service.IkRequest(
+            **fields,
+            arm="primary",
+            target=Target(type="pose", position=[0.5, 0.0, 0.3], quaternion_wxyz=[0, 1, 0, 0]),
+        )
+
+    assert curobo_service._ik_solver(ik_request(None)) is cached
+    assert cached.worlds == []
+
+    with pytest.raises(HTTPException) as raised:
+        curobo_service._ik_solver(ik_request("points"))
+
+    assert raised.value.status_code == 400
+    assert "scene_points_base64" in str(raised.value.detail)
+    assert cached.worlds == []
