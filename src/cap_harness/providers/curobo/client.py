@@ -161,7 +161,9 @@ class CuRoboProvider:
             joint_positions=joints,
             arm=arm,
             embodiment=robot_state.embodiment,
-            diagnostics={"provider": "curobo", "collision_aware": True},
+            # The service's IK solver checks joint limits and self-collision only; it
+            # has no scene checker, so the result says nothing about the kitchen.
+            diagnostics={"provider": "curobo", "scene_collision_checked": False},
         )
 
     def plan_to_pose(

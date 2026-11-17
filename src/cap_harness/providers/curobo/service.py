@@ -527,6 +527,21 @@ def _purge_scene_mesh_cache(planner: Any) -> None:
 
 
 def _planner(request: BaseRequest) -> Any:
+    # The planner cache below is keyed on (robot, interpolation_dt, maximum_dt), not
+    # on the scene, and every caller of the service shares it. The world is only
+    # replaced when a scene is sent, so a scene-free plan would be checked against
+    # whatever scene the previous request loaded -- the verdict would depend on call
+    # order. Refuse it, as the client already does. Checked before any planner is
+    # built, so a refused request never pays for a warmup.
+    if request.scene_points_base64 is None and not _collision_disabled(request.model):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "cuRobo planning requires scene_points_base64: the planner is cached and "
+                "shared, so a plan without a scene would be checked against the scene of "
+                "an earlier request"
+            ),
+        )
     robot = _robot_config(request)
     interpolation_dt = request.interpolation_dt_s
     maximum_dt = request.maximum_trajectory_dt_s
@@ -575,6 +590,18 @@ def _planner(request: BaseRequest) -> Any:
 
 
 def _ik_solver(request: BaseRequest) -> Any:
+    # The IK solver is built with scene_model=None, and cuRobo then creates no scene
+    # collision checker at all (collision_cache is ignored without a scene model).
+    # IK checks joint limits and self-collision only; it cannot use a scene. Refuse
+    # one rather than fail later with an AttributeError (HTTP 500).
+    if request.scene_points_base64 is not None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "cuRobo /ik does not check scene collision; omit scene_points_base64 "
+                "(use /plan for a scene-checked motion)"
+            ),
+        )
     robot = _robot_config(request)
     solver = _IK_SOLVERS.get(robot)
     try:
@@ -594,15 +621,6 @@ def _ik_solver(request: BaseRequest) -> Any:
             )
             solver = InverseKinematics(config)
             _IK_SOLVERS[robot] = solver
-        scene = _scene(request, solver)
-        if scene is not None:
-            # Same name-keyed mesh cache as the planner above, and _IK_SOLVERS
-            # keeps one solver per robot for the life of the service: without
-            # this purge a cached solver screens every later request against the
-            # first scene it ever loaded -- another step of the episode, or
-            # another task entirely -- and rejects poses the planner accepts.
-            _purge_scene_mesh_cache(solver)
-            solver.update_world(scene)
         return solver
     except HTTPException:
         raise
