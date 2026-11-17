@@ -344,6 +344,19 @@ def run_program(
         protocol_success = bool(evidence["protocol_success"])
         protocol_saved = True
 
+    episode_evaluation: dict[str, object] | None = None
+
+    def score_episode() -> bool:
+        # OopsieVerse: task success and the host-only record must come from ONE evaluate
+        # snapshot. A second evaluate can answer differently with no step in between (one
+        # task counts its success checks), so the snapshot is taken once and kept.
+        nonlocal episode_evaluation
+        if not oopsieverse:
+            return adapter.check_success()  # type: ignore[attr-defined]
+        if episode_evaluation is None:
+            episode_evaluation = adapter.evaluate_episode()  # type: ignore[attr-defined]
+        return bool(episode_evaluation["success"])
+
     safety_saved = False
 
     def save_safety_record(final_task_success: bool | None) -> None:
@@ -356,8 +369,13 @@ def run_program(
         from cap_harness.robocasa.safety import safety_root, write_safety_record
 
         try:
+            # The snapshot the task result came from. It is missing only when scoring itself
+            # failed (task result None), so a fresh one cannot disagree with anything.
+            evaluation = episode_evaluation
+            if evaluation is None:
+                evaluation = adapter.evaluate_episode()  # type: ignore[attr-defined]
             write_safety_record(
-                evaluation=adapter.safety_record(),  # type: ignore[attr-defined]
+                evaluation=evaluation,
                 run_root=recorder.root,
                 suite=metadata.suite_name,
                 environment=metadata.environment,
@@ -403,12 +421,12 @@ def run_program(
                 recorder.frequency = adapter.control_frequency
             else:
                 adapter = adapter_type(**adapter_kwargs)
+            if oopsieverse:
+                # Before any reset: a simulator started with another task must not have its
+                # episode reset by a run that is then refused.
+                adapter.require_served_task(metadata)  # type: ignore[attr-defined]
         with recorder.timing.measure("reset"):
             adapter.reset(metadata, seed)
-        if oopsieverse:
-            from cap_harness.robocasa.safety import check_served_task
-
-            check_served_task(adapter.served_task(), metadata.environment)  # type: ignore[attr-defined]
         # Take the embodiment's real control rate before anything is recorded:
         # RunRecorder defaults to 20 Hz, and an adapter that knows its own rate
         # exposes control_frequency. Probed after reset, not before, because an
@@ -520,7 +538,7 @@ def run_program(
         sanitized_stdout = redact(execution.stdout)
         (recorder.root / "logs/program.stdout").write_text(str(sanitized_stdout), encoding="utf-8")
         (recorder.root / "logs/program.stderr").write_text("", encoding="utf-8")
-        task_success = adapter.check_success()  # type: ignore[attr-defined]
+        task_success = score_episode()
         save_protocol_evidence(bool(task_success))
         save_safety_record(task_success)
         if recorder.terminal_reason == "step_limit":
@@ -551,7 +569,7 @@ def run_program(
     except KeyboardInterrupt:
         if adapter is not None:
             try:
-                task_success = adapter.check_success()  # type: ignore[attr-defined]
+                task_success = score_episode()
             # Record teardown errors without discarding the episode evidence.
             except Exception:
                 task_success = None
@@ -576,7 +594,7 @@ def run_program(
         task_success = None
         if adapter is not None:
             try:
-                task_success = adapter.check_success()  # type: ignore[attr-defined]
+                task_success = score_episode()
             except Exception:
                 task_success = None
         save_protocol_evidence(bool(task_success))
