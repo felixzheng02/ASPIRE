@@ -197,26 +197,31 @@ are kitchen fallbacks when a noun misses; they are not the goal. Confirm overlay
 `media/overlays/` before trusting a centroid. `localize_object` returns SAM's first mask —
 often the counter — so pick the mask that matches the instruction noun, not the first hit.
 
-**`.ok` does not mean the object is in the frame.** The service runs SAM3 with its detection
-threshold at `0.0`, so `segment_text` answers *every* noun with five ranked masks and
-`ok=True`. Measured on `PickPlaceCounterToStove` seed 101 `agentview`, which contains no
-sink: `segment_text("agentview", "sink")` returns the **plate** at score **0.723** — the same
-box, to within a pixel, that `"plate"` (0.828) and `"pan"` (0.035) return. Back-project that
-and you reach for the wrong object with nothing in the result saying so.
+**`segment_text` reports absence, so handle `ok=False`.** On robocasa the harness builds
+SAM3 with a **0.5** presence floor, so a prompt whose best candidate scores below it comes
+back `ok=False` with `NO_SEGMENTATION`, and the message names the rejected score. Measured
+over 78 labelled prompts (seeds 101/102/103, both cameras) the cut is right **88.5%** of the
+time, against 39.7% for a program that trusts a non-empty result.
 
-Read `segmentations[0].score`, not `.ok`:
+**`ok=False` means "SAM3 did not see it", not "the call failed".** Do not retry it unchanged,
+and do not lower the floor. The answer is a different word or a different camera:
 
-- It is SAM3's concept-presence confidence, not mask quality, so a crisp mask of the wrong
-  thing scores *low*. Over 73 labelled prompts (seeds 101/102/103, both cameras) a **0.5**
-  cut separates present from absent **94.5%** of the time, against 39.7% for trusting `.ok`.
-- Treat `score < 0.5` as "probably not in this frame": re-prompt rather than reach.
-  `diagnostics["best_candidate_score"]` records what the model actually believed.
-- 0.5 is a filter, not a proof. A close noun can beat it (`"sink"` 0.723 above the present
-  `"stove"` 0.738), and a present object can fall under it when you use the wrong word (a
-  zucchini scores 0.127 as `"zucchini"` but 0.872 as `"green vegetable"`). If a prompt
-  scores low, **try another word for the same object before concluding it is absent.**
+- Score is SAM3's concept-presence confidence, not mask quality, so a crisp mask of the
+  wrong thing scores *low*. `diagnostics["best_candidate_score"]` (or
+  `error.details["best_candidate_score"]` on a rejection) records what the model believed.
+- **Try another word for the same object before concluding it is absent.** A present object
+  falls under the cut when prompted with the wrong noun: on seed 102 the vegetable on the
+  plate scores 0.127 as `"zucchini"` and **0.872** as `"green vegetable"`. A visible frying
+  pan scores 0.856 as `"pan"` and 0.172 as `"skillet"`.
+- **Try the other camera.** A noun absent from `agentview` is often plain in the wrist frame:
+  at spawn on seed 101 the pan scores 0.035 on `agentview` (that cooktop really is empty) and
+  **0.856** on `robot0_eye_in_hand`.
+- The floor is a filter, not a proof. A close noun can still beat it: on seed 101 `"sink"`
+  scores **0.723** on a kitchen with no sink and returns the **plate**, the same box
+  `"plate"` (0.828) returns. On seed 102 the absent `"fish"` clears it at 0.55.
 - The cheapest check SAM cannot fool: **compare boxes across prompts.** Two nouns returning
   the same box returned the same object, and at most one of them is right.
+- `CAP_HARNESS_SAM3_MIN_SCORE` exists for experiments. Do not set it in a campaign.
 
 ---
 

@@ -15,7 +15,11 @@ from .libero.registry import LiberoSuiteRegistry
 from .providers.curobo.client import DEFAULT_CUROBO_URL, CuRoboProvider
 from .providers.graspnet.client import ContactGraspNetProvider
 from .providers.pyroki.client import DEFAULT_PYROKI_URL, PyRokiProvider
-from .providers.sam3.client import DEFAULT_SAM3_URL, Sam3Provider
+from .providers.sam3.client import (
+    DEFAULT_SAM3_URL,
+    SUGGESTED_PRESENCE_THRESHOLD,
+    Sam3Provider,
+)
 from .registry import ToolRegistry
 from .runtime import ProgramExecutionResult, ProgramExecutor
 
@@ -26,6 +30,46 @@ PYROKI_UNAVAILABLE = "PyRoki is not running on :8116"
 _CLOSE_AFTER_RECORDING = frozenset({"behavior"})
 """Benchmarks whose simulator must outlive artifact finalization (Isaac Sim ends the process)."""
 BEHAVIOR_VIDEO_FRAME_STRIDE = 3
+
+SEGMENTATION_MIN_SCORE = {"robocasa": SUGGESTED_PRESENCE_THRESHOLD}
+"""Per-benchmark client-side floor on ``Segmentation.score``, by benchmark name.
+
+A benchmark absent from this mapping keeps 0.0, which returns SAM3's five best-ranked
+regions for every prompt and never reports absence.
+
+RoboCasa only, and client-side only, because the floor is a *measured* property of one
+prompt style rather than a property of SAM3. On RoboCasa the prompts are bare scene
+nouns, and over 78 labelled ones (``PickPlaceCounterToStove``, seeds 101/102/103, both
+cameras, labelled against the saved frames) 0.5 separates present from absent 88.5% of
+the time against 39.7% at 0.0. The service on :8114 is shared with LIBERO, BEHAVIOR,
+Robosuite and CaP-X, whose prompts are long descriptive phrases whose score distribution
+nobody has measured, so raising the service default would change four benchmarks on one
+benchmark's evidence.
+
+The value tracks SAM3's own ``Sam3Processor`` default rather than a constant fitted to
+this kitchen. 0.55 was the sweep argmax on an earlier 73-prompt set (95.9% against
+94.5%); on the 78-prompt set above it is *worse*, 87.2%.
+"""
+
+SAM3_MIN_SCORE_ENV = "CAP_HARNESS_SAM3_MIN_SCORE"
+
+
+def segmentation_min_score(benchmark: str) -> float:
+    """The floor ``Sam3Provider`` is built with for ``benchmark``.
+
+    ``CAP_HARNESS_SAM3_MIN_SCORE`` overrides every benchmark, so a campaign can restore
+    the old 0.0 behaviour or re-sweep the cut without editing code.
+    """
+    raw = os.environ.get(SAM3_MIN_SCORE_ENV)
+    if raw is None or not raw.strip():
+        return float(SEGMENTATION_MIN_SCORE.get(benchmark, 0.0))
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"{SAM3_MIN_SCORE_ENV} must be a number in [0, 1], not {raw!r}") from None
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"{SAM3_MIN_SCORE_ENV} must be in [0, 1], not {value!r}")
+    return value
 
 
 class Sam3ServiceUnavailable(RuntimeError):
@@ -68,17 +112,13 @@ def _require_healthz(
 def require_sam3_health(base_url: str | None = None, timeout_s: float = 2.0) -> None:
     """GET /healthz on the SAM3 URL. The fake matcher does not serve that route."""
     url = base_url or os.environ.get("CAP_HARNESS_SAM3_URL") or DEFAULT_SAM3_URL
-    _require_healthz(
-        url, timeout_s, error=Sam3ServiceUnavailable, message=SAM3_UNAVAILABLE
-    )
+    _require_healthz(url, timeout_s, error=Sam3ServiceUnavailable, message=SAM3_UNAVAILABLE)
 
 
 def require_pyroki_health(base_url: str | None = None, timeout_s: float = 2.0) -> None:
     """GET /healthz on the PyRoki URL. OpenAPI-only listeners are not a solver."""
     url = base_url or os.environ.get("CAP_HARNESS_PYROKI_URL") or DEFAULT_PYROKI_URL
-    _require_healthz(
-        url, timeout_s, error=PyRokiServiceUnavailable, message=PYROKI_UNAVAILABLE
-    )
+    _require_healthz(url, timeout_s, error=PyRokiServiceUnavailable, message=PYROKI_UNAVAILABLE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,9 +181,7 @@ def run_program(
 ) -> RunOutcome:
     """Run an episode, using its task horizon when max_steps is not supplied."""
     if benchmark not in {"behavior", "libero-pro", "robocasa", "robosuite", "yam_real"}:
-        raise ValueError(
-            "benchmark must be behavior, libero-pro, robocasa, robosuite, or yam_real"
-        )
+        raise ValueError("benchmark must be behavior, libero-pro, robocasa, robosuite, or yam_real")
     if init_mode not in {"saved", "seeded"}:
         raise ValueError("init_mode must be 'saved' or 'seeded'")
     if init_mode != "saved" and benchmark != "libero-pro":
@@ -368,7 +406,10 @@ def run_program(
         # started service (CAP_HARNESS_SAM3_URL, CAP_HARNESS_CUROBO_URL) instead
         # of the shared stack.
         segmentation = TracedProvider(
-            Sam3Provider(base_url=os.environ.get("CAP_HARNESS_SAM3_URL", DEFAULT_SAM3_URL)),
+            Sam3Provider(
+                base_url=os.environ.get("CAP_HARNESS_SAM3_URL", DEFAULT_SAM3_URL),
+                min_score=segmentation_min_score(benchmark),
+            ),
             recorder,
             "sam3",
         )

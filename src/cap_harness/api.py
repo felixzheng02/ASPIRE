@@ -251,15 +251,18 @@ class CapApi:
     ) -> SegmentationSet:
         """Segment ``text`` in one camera image.
 
-        ``ok=True`` does not mean ``text`` is in the frame. The SAM3 service runs at a
-        0.0 detection threshold, so it answers every noun with its five best-ranked
-        regions: on a RoboCasa kitchen with no sink, ``segment_text("agentview",
-        "sink")`` returns the plate at score 0.72, in the same box ``"plate"`` returns.
+        On RoboCasa this reports absence: the provider is built with a 0.5 floor on
+        ``Segmentation.score``, so a prompt SAM3 scores below that returns ``ok=False``
+        with ``NO_SEGMENTATION``. Elsewhere the floor is 0.0 and ``ok=True`` does not mean
+        ``text`` is in the frame -- the service answers every noun with its five
+        best-ranked regions.
 
-        Read ``segmentations[0].score`` instead -- it is a concept-presence confidence,
-        not mask quality -- and treat values below 0.5 as "probably absent". That cut is
-        94.5% accurate over 73 labelled RoboCasa prompts and is still not sound; see
-        "Segmentation scores are not a presence test" in ``docs/api-reference.md``.
+        The floor is a filter, not a presence test, and both residual failures are
+        semantic: on a kitchen with no sink ``segment_text("agentview", "sink")`` clears
+        it at 0.72 (returning the plate), while a present object prompted with the wrong
+        word falls under it. Read ``segmentations[0].score``, try another word before
+        concluding absent, and see "Segmentation scores are not a presence test" in
+        ``docs/api-reference.md``.
         """
         return self._segment_text(camera_name, text, self.get_observation(camera_name))
 

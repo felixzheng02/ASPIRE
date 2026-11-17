@@ -96,14 +96,24 @@ Two things a program can do:
    object, and at most one of them is right. This catches the `sink`/`plate` case, which no
    threshold does.
 
-Enforcement is opt-in and off by default, because `ok=False` would be a new outcome for
-existing callers: `examples/robocasa/connectivity_check.py` and the tool-check catalog both
-segment scene nouns and read `ok`, and the catalog's wrist-camera prompts legitimately score
-below 0.5 (`"cabinet"` 0.049, `"counter"` 0.398 on `robot0_eye_in_hand`, where neither is
-really visible). Construct `Sam3Provider(min_score=0.5)` to turn `segment_text` into a
-detector, or start the service with `--confidence-threshold 0.5` to filter for every client
-including CaP-X. A single call can also override it with a `confidence_threshold` field on
-`POST /segment`.
+**On RoboCasa this is enforced by default**: `run.py` builds `Sam3Provider` with
+`min_score=0.5`, so `segment_text` and `localize_object` return `ok=False` with
+`NO_SEGMENTATION` when SAM3's best candidate falls below the cut, and the error names the
+rejected score. Programs must handle that outcome; the remedy for a low score is another
+word for the same object, not a lower threshold.
+
+The default is per benchmark and client-side (`SEGMENTATION_MIN_SCORE` in `run.py`), not a
+service setting. `:8114` is shared with LIBERO, BEHAVIOR, Robosuite and CaP-X, whose prompts
+are long descriptive phrases whose score distribution nobody has measured, so they stay at
+0.0. `CAP_HARNESS_SAM3_MIN_SCORE` overrides every benchmark, which is how to reproduce the
+old permissive behaviour. A caller constructing `Sam3Provider()` directly still defaults to
+0.0; the service can be moved for every client with `--confidence-threshold`, and one call
+with a `confidence_threshold` field on `POST /segment`.
+
+Known fallout, measured and accepted: the tool-check catalog's wrist-camera prompts now
+report absence (`"cabinet"` 0.049, `"counter"` 0.398 on `robot0_eye_in_hand`, where neither
+is really visible), and `connectivity_check.py` localizes its receptacle across both cameras
+because the pan is not always in `agentview`.
 
 ### Gripper targets
 
