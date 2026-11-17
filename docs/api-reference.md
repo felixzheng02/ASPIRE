@@ -187,6 +187,7 @@ The same `max_steps` name bounds different things:
 | `move_to_joints` | executed ticks, strictly | at most `max_steps` |
 | `move_to_pose`, `move_synchronized` | planned waypoints, checked before any motion | waypoints + settle tail |
 | `execute_trajectory` | (no parameter) | waypoints + settle tail |
+| `robocasa.navigate_to_pose` | (no parameter) | until the base converges; blocked, 1200 or the rest of the episode, whichever is less |
 
 Trajectory execution plays every waypoint once, then holds the last one until the joint error
 is inside tolerance, for up to a fixed **settle tail**: `TRAJECTORY_GOAL_MAX_STEPS` = 120 ticks
@@ -203,6 +204,23 @@ ticks and returned `ok=False`. So the worst case of one blocked call is `waypoin
 retrying a blocked move pays it again. Budget from
 `get_task_context().metadata["episode_steps_remaining"]`, not from a sum of `max_steps`; when one
 move needs a hard tick cap, use `move_to_joints`.
+
+RoboCasa base motion is charged to the same budget. Every tick `robocasa.navigate_to_pose` runs
+is one episode step: it counts in `episode_steps_used`, is scored, and appears in
+`episode/steps.jsonl` and the videos. A base tick is recorded with the arm command it carried,
+which is "hold the measured joints"; the base velocity has no field in the step record. A move
+that converges is cheap -- measured 9 ticks for 0.08 m sideways and 7 for a 0.2 rad turn. A
+blocked move is not. The base loop gives up only after 1200 ticks and the call takes no tick
+cap. RoboCasa's episode is 1000 ticks, so at the default horizon **one blocked base move runs
+until the episode is truncated**. It returns `ok=False` with `truncated=True` and the real
+`steps_executed`, and `episode_steps_remaining` then reads 0. (With more than 1200 ticks left it
+returns `ok=False` after 1200, not truncated.) `robocasa.base_pose_is_free` can rule out an occupied
+goal before driving; it does not check the path.
+
+Runs recorded before 2026-11-17 did not record base ticks at all: `episode_steps_used` stayed
+unchanged across a base move while the episode horizon still counted it, and those ticks are
+missing from their `steps.jsonl` and videos. Do not compare step counts or artifacts of
+base-driving runs across that date.
 
 ### Motion strategies
 
@@ -260,8 +278,8 @@ schema.
 | `extension` | `robocasa.get_task_metadata()` | `arms`, `camera_names`, `environment`, `family`, `language`, `robots`, `suite_name`, task identity |
 | `extension` | `robocasa.get_controller_metadata()` | Action dimension, arms, base frame `robot0_link0`, cameras, frequency/period, controller, gripper semantics, action modes, `mobile_base`, `joint_limits` |
 | `extension` | `robocasa.get_base_pose()` | `Pose` of the mobile base in `world`. Proprioception a real mobile robot also has, not simulator state |
-| `extension` | `robocasa.navigate_to_pose(dx, dy, dyaw)` | Closed-loop RELATIVE base motion in the current base frame. No collision checking by design: a blocked path fails to converge and returns `ExecutionResult(ok=False)` with a `base_translation_m` diagnostic. Forward motion from the spawn pose is usually blocked by a counter; lateral and yaw converge |
-| `extension` | `robocasa.base_pose_is_free(x, y)` | Whether a PandaOmron footprint at world `(x, y)` is empty of scene geometry. Same frame as `robocasa.get_base_pose`. Returns a boolean, not a map. Arm poses and default SAM clouds are `robot0_link0` — transform before mixing |
+| `extension` | `robocasa.navigate_to_pose(dx, dy, dyaw)` | Closed-loop RELATIVE base motion in the current base frame. No collision checking by design: a blocked path fails to converge and returns `ExecutionResult(ok=False)` with a `base_translation_m` diagnostic. Forward motion from the spawn pose is usually blocked by a counter; lateral and yaw converge. Every tick is an episode step and the call takes no tick cap, so at the default 1000-tick horizon a blocked move runs until the episode is truncated (`truncated=True`) -- see [Tick cost of a motion](#tick-cost-of-a-motion) |
+| `extension` | `robocasa.base_pose_is_free(x, y, yaw=None)` | Whether a PandaOmron footprint at world `(x, y)` is empty of scene geometry. `yaw` defaults to the base's CURRENT yaw, not zero: the footprint is a rectangle offset 0.20 m behind `robot0_link0` and this robot spawns near 90°, so a zero default reports the robot's own pose blocked. Same frame as `robocasa.get_base_pose`. Returns a boolean, not a map. Arm poses and default SAM clouds are `robot0_link0` — transform before mixing |
 | `extension` | `robocasa.plan_standoff_pose(support_cloud, object_cloud, standoff_m=0.3)` | Pure geometry: `(x, y, yaw)` outside the support hull's nearest edge, facing the object. Both clouds must share a frame, which is the frame of the answer |
 | `extension` | `robocasa.plan_approach_pose(object_cloud, distance_m=0.7)` | Pure geometry: `(x, y, yaw)` `distance_m` short of the object along the current line of sight. Answer is in the cloud's frame |
 | `extension` | `behavior.get_task_metadata()` | `activity_name`, `arms`, `camera_names`, `family`, `instance_id`, `language`, `scene_model`, `suite_name`, `support_prompt`, `target_prompt`, task identity |
