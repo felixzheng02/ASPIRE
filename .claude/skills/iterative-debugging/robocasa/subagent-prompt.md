@@ -124,7 +124,6 @@ Provenance, not only an API-name ban:
   Gripper:      open_gripper(), close_gripper()
   Extensions:   robocasa.get_base_pose(), robocasa.navigate_to_pose(dx, dy, dyaw),
                 robocasa.base_pose_is_free(x, y, yaw=None),
-                robocasa.plan_base_offset(targets, standoff_m=..., min_reachable=...),
                 robocasa.plan_standoff_pose(support_cloud, object_cloud, standoff_m),
                 robocasa.plan_approach_pose(object_cloud, distance_m),
                 robocasa.get_task_metadata(), robocasa.get_controller_metadata()
@@ -230,13 +229,6 @@ Read `segmentations[0].score`, not `.ok`:
   testing a standoff/approach candidate. The answer is a boolean, not a map. `yaw` defaults
   to the base's current yaw, which is the one a lateral `navigate_to_pose` preserves; pass it
   explicitly only to ask about a turned pose.
-- `robocasa.plan_base_offset(targets)` answers **where to stand**, for zero simulator ticks.
-  Neither IK backend plans the base, so a target on the arm's far side is unreachable from
-  wherever the robot is standing. Hand it the poses you want to reach (grasp candidates work
-  directly) and it returns `dx`/`dy`/`dyaw` for `navigate_to_pose`, plus `reachable_now` and
-  `reachable_after`. `(0, 0, 0)` means stand still, and it means it -- a base move costs ~15
-  ticks of the horizon and moves `agentview`, which is robot-mounted, so re-segment after
-  moving. It never suggests an occupied pose. Use it when `solve_ik` rejects your candidates.
 - `robocasa.plan_standoff_pose(support, object)` / `robocasa.plan_approach_pose(object)`
   return `(x, y, yaw)` in the cloud frame. Choose support and object clouds from what the
   instruction names (a counter as support is common; do not assume a cabinet/handle pair).

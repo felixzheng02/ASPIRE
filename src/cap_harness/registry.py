@@ -56,7 +56,6 @@ ROBOCASA_PUBLIC_TOOL_NAMES = frozenset(
         "robocasa.get_task_metadata",
         "robocasa.navigate_to_pose",
         "robocasa.plan_approach_pose",
-        "robocasa.plan_base_offset",
         "robocasa.plan_standoff_pose",
     }
 )
@@ -67,9 +66,6 @@ these the generated program cannot reposition and every target beyond the arm's 
 from the spawn pose is unreachable. ``base_pose_is_free`` is a world-frame yes/no against
 scene geoms (same frame as ``get_base_pose``). ``plan_standoff_pose`` / ``plan_approach_pose``
 are the BEHAVIOR hull helpers copied here; they inherit the cloud frame.
-``plan_base_offset`` closes the gap left by fixed-base IK: neither provider plans the base, so
-without it a program has no way to learn that a target it cannot reach becomes reachable 20 cm
-to the left.
 """
 
 ROBOSUITE_PUBLIC_TOOL_NAMES = frozenset(

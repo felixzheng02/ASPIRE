@@ -1,13 +1,9 @@
-"""Pure XY standoff / approach geometry and base-offset kinematics for RoboCasa.
+"""Pure XY standoff / approach geometry for RoboCasa.
 
-The standoff / approach hull helpers are copied from ``cap_harness.behavior.adapter``
-rather than imported: the harness must not grow a dependency from this embodiment onto
-BEHAVIOR. Both clouds share one frame, and that frame is the frame of the answer.
-``base_pose_is_free`` is world-frame on the wire; transform before mixing the two.
-
-The base-offset helpers at the bottom are this embodiment's own. They are pure so that the
-one thing a silent error would invert -- the sign and frame of the shift -- is testable
-without a simulator or an IK service.
+Copied from ``cap_harness.behavior.adapter`` rather than imported: the harness
+must not grow a dependency from this embodiment onto BEHAVIOR. Both clouds share
+one frame, and that frame is the frame of the answer. ``base_pose_is_free`` is
+world-frame on the wire; transform before mixing the two.
 """
 
 from __future__ import annotations
@@ -16,8 +12,6 @@ import math
 from typing import Any
 
 import numpy as np
-
-from cap_harness.contracts import Pose
 
 
 def _closest_point_on_segment(point: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -117,70 +111,3 @@ def plan_approach_pose(
     goal = object_xy - unit * min(distance, span)
     yaw = math.atan2(unit[1], unit[0])
     return float(goal[0]), float(goal[1]), float(yaw)
-
-
-def lateral_base_offsets(max_offset_m: float = 0.40, step_m: float = 0.05) -> tuple[float, ...]:
-    """Candidate lateral base offsets in metres, nearest first, excluding zero.
-
-    Lateral only, and that is a measured choice rather than a simplification: on this kitchen
-    yaw alone rescues no scene, and forward is the direction the counter blocks (5.5 cm
-    achieved of 30 cm commanded). An axis that cannot move the robot does not belong in a
-    sweep that costs an IK call per entry.
-
-    Nearest first so that a caller breaking ties on sweep order automatically prefers the
-    smallest move, which is the one that perturbs the robot-mounted camera least.
-    """
-    span = float(max_offset_m)
-    step = float(step_m)
-    if not np.isfinite(span) or span <= 0.0:
-        raise ValueError("max_offset_m must be positive")
-    if not np.isfinite(step) or step <= 0.0:
-        raise ValueError("step_m must be positive")
-    if step > span:
-        raise ValueError("step_m must not exceed max_offset_m")
-    count = int(math.floor(span / step + 1e-9))
-    magnitudes = [round(step * index, 9) for index in range(1, count + 1)]
-    offsets: list[float] = []
-    for magnitude in magnitudes:
-        offsets.extend((-magnitude, magnitude))
-    return tuple(offsets)
-
-
-def pose_after_base_offset(pose: Pose, dx: float, dy: float) -> Pose:
-    """Re-express ``pose`` in the base frame the robot would have after moving ``(dx, dy)``.
-
-    The simulator reports ``robot0_link0`` as the base pose, and ``drive_base`` servos a
-    relative command in that same frame, so a pure translation of the base by ``(dx, dy)``
-    with no yaw change moves a fixed world point to ``p - (dx, dy, 0)`` in the new frame and
-    leaves its orientation alone. The frame label is unchanged because it names the same link.
-    """
-    if not isinstance(pose, Pose):
-        raise ValueError("pose must be a Pose")
-    shift = np.array([float(dx), float(dy), 0.0], dtype=np.float64)
-    if not bool(np.all(np.isfinite(shift))):
-        raise ValueError("dx and dy must be finite")
-    return Pose(
-        position=np.asarray(pose.position, dtype=np.float64) - shift,
-        quaternion_wxyz=pose.quaternion_wxyz,
-        frame=pose.frame,
-    )
-
-
-def retreat_pose(pose: Pose, standoff_m: float) -> Pose:
-    """``standoff_m`` back along the gripper's own approach axis (the pose's local +z).
-
-    The arm cannot arrive at a closed-gripper pose from an arbitrary direction -- the fingers
-    have to straddle the object -- so an executable candidate needs this pose to solve as well
-    as the grasp itself. Same convention as ``examples/robocasa/grasp_bench``.
-    """
-    if not isinstance(pose, Pose):
-        raise ValueError("pose must be a Pose")
-    distance = float(standoff_m)
-    if not np.isfinite(distance) or distance < 0.0:
-        raise ValueError("standoff_m must be non-negative")
-    approach = np.asarray(pose.as_matrix(), dtype=np.float64)[:3, 2]
-    return Pose(
-        position=np.asarray(pose.position, dtype=np.float64) - approach * distance,
-        quaternion_wxyz=pose.quaternion_wxyz,
-        frame=pose.frame,
-    )

@@ -6,10 +6,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from cap_harness.api import CapApi
 from cap_harness.contracts import (
     CameraObservation,
-    IKResult,
     Observation,
     PointCloud,
     Pose,
@@ -18,8 +16,6 @@ from cap_harness.contracts import (
     SynchronizedTrajectory,
     Trajectory,
 )
-from cap_harness.errors import ApiError, ErrorCode
-from cap_harness.registry import ROBOCASA_PUBLIC_TOOL_NAMES, ToolRegistry
 from cap_harness.robocasa.adapter import (
     JOINT_LIMIT_SLACK_RAD,
     PANDA_JOINT_NAMES,
@@ -95,202 +91,44 @@ SPAWN_YAW = math.pi / 2
 
 
 class _FakeFootprintClient:
-    """Enough of the driver for the base queries: a cached state and a footprint oracle.
-
-    ``blocked_x`` lists world x values whose footprint is occupied, so a test can place a
-    counter exactly where the sweep wants to stand.
-    """
-
-    def __init__(self, yaw: float = 0.0, blocked_x: tuple[float, ...] = ()) -> None:
+    def __init__(self, yaw: float = 0.0) -> None:
         self.calls: list[tuple[float, float, float]] = []
-        self.blocked_x = {round(value, 2) for value in blocked_x}
-        self.steps = 0
         self.last = {
             "base_pos": np.array([1.0, 2.0, 0.7]),
             "base_quat_wxyz": np.array([math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)]),
-            "joint_pos": np.zeros(7),
-            "gripper_qpos": np.array([0.04]),
-            "eef_pos": np.array([0.4, 0.0, 1.0]),
-            "eef_quat_wxyz": np.array([1.0, 0.0, 0.0, 0.0]),
         }
 
     def base_pose_is_free(self, x: float, y: float, yaw: float = 0.0) -> bool:
         self.calls.append((float(x), float(y), float(yaw)))
-        return round(float(x), 2) not in self.blocked_x
-
-    def sim_step_count(self) -> int:
-        return self.steps
-
-    def step(self, action: object) -> object:  # pragma: no cover - must never be reached
-        raise AssertionError("the base queries must not drive the simulator")
+        return True
 
 
-class _StubIkProvider:
-    """IK whose feasibility is a pure function of the target's y in the arm's frame.
-
-    The arm reaches ``|y| <= reach_m``, which is the whole point of the sweep: a target
-    outside that band becomes reachable only once the base has moved under it.
-    """
-
-    def __init__(self, reach_m: float = 0.30) -> None:
-        self.reach_m = float(reach_m)
-        self.requested: list[np.ndarray] = []
-
-    def solve_ik(
-        self, target_pose: Pose, robot_state: RobotState, arm: str = "primary"
-    ) -> IKResult:
-        self.requested.append(np.asarray(target_pose.position, dtype=np.float64).copy())
-        if abs(float(target_pose.position[1])) <= self.reach_m:
-            return IKResult(ok=True, arm=arm, embodiment="robocasa", joint_positions=np.zeros(7))
-        return IKResult(
-            ok=False,
-            arm=arm,
-            embodiment="robocasa",
-            error=ApiError(code=ErrorCode.IK_FAILED, message="outside the reach band"),
-        )
-
-
-def _base_adapter(
-    *, yaw: float = SPAWN_YAW, blocked_x: tuple[float, ...] = (), reach_m: float = 0.30
-) -> tuple[RobocasaAdapter, _FakeFootprintClient, _StubIkProvider]:
-    provider = _StubIkProvider(reach_m)
-    adapter = RobocasaAdapter(ik_provider=provider)
-    adapter._metadata = adapter.registry.resolve("PickPlaceCounterToStove")
-    client = _FakeFootprintClient(yaw=yaw, blocked_x=blocked_x)
+def _footprint_adapter(yaw: float = 0.0) -> tuple[RobocasaAdapter, _FakeFootprintClient]:
+    adapter = RobocasaAdapter()
+    client = _FakeFootprintClient(yaw)
     adapter._client = client
     adapter._closed = False
-    return adapter, client, provider
-
-
-def _target(y: float) -> Pose:
-    return Pose(
-        position=np.array([0.5, float(y), 0.9]),
-        quaternion_wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
-        frame="robot0_link0",
-    )
+    return adapter, client
 
 
 def test_adapter_base_pose_is_free_is_world_yes_no() -> None:
-    adapter, client, _ = _base_adapter(yaw=0.0)
+    adapter, fake = _footprint_adapter(0.0)
     assert adapter.base_pose_is_free(1.5, 2.5) is True
-    assert client.calls == [(1.5, 2.5, 0.0)]
+    assert fake.calls == [(1.5, 2.5, 0.0)]
 
 
 def test_base_pose_is_free_defaults_to_the_current_base_yaw() -> None:
     """A zero default tested a box turned across the counter and blocked every valid pose."""
-    adapter, client, _ = _base_adapter(yaw=SPAWN_YAW)
+    adapter, fake = _footprint_adapter(SPAWN_YAW)
     assert adapter.base_pose_is_free(1.5, 2.5) is True
-    assert client.calls[-1][2] == pytest.approx(SPAWN_YAW, abs=1e-9)
+    assert fake.calls[-1][2] == pytest.approx(SPAWN_YAW, abs=1e-9)
 
 
 def test_base_pose_is_free_still_accepts_an_explicit_yaw() -> None:
-    adapter, client, _ = _base_adapter(yaw=SPAWN_YAW)
+    """An explicit yaw is how a program asks about a turned pose, so it must pass through."""
+    adapter, fake = _footprint_adapter(SPAWN_YAW)
     adapter.base_pose_is_free(1.5, 2.5, 0.0)
-    assert client.calls[-1] == (1.5, 2.5, 0.0)
-
-
-def test_plan_base_offset_shifts_targets_opposite_the_base_move() -> None:
-    """The one error that would be silent: the sign and frame of the shift.
-
-    A target at y=+0.55 is outside the arm's band. The base must move toward it -- positive
-    dy -- which brings the target's y down in ``robot0_link0``. An inverted sign would sweep
-    away from every target and rescue nothing.
-    """
-    adapter, _, provider = _base_adapter()
-    result = adapter.plan_base_offset([_target(0.55)], standoff_m=0.0)
-    assert result["ok"] is True
-    assert result["reachable_now"] == 0
-    assert result["reachable_after"] == 1
-    assert float(result["dy"]) > 0.0
-    assert float(result["dy"]) == pytest.approx(0.30, abs=0.051)
-    assert result["dx"] == 0.0 and result["dyaw"] == 0.0
-    # Every pose actually handed to IK kept the target's x and z and moved only y.
-    for position in provider.requested:
-        assert position[0] == pytest.approx(0.5)
-        assert position[2] == pytest.approx(0.9)
-
-
-def test_plan_base_offset_stands_still_when_targets_are_already_reachable() -> None:
-    """Moving costs ticks and shifts the robot-mounted camera, so it must not be gratuitous."""
-    adapter, client, provider = _base_adapter()
-    result = adapter.plan_base_offset([_target(0.10)], standoff_m=0.0)
-    assert result["ok"] is True
-    assert result["dy"] == 0.0
-    assert result["reachable_now"] == 1 and result["reachable_after"] == 1
-    assert result["offsets_tested"] == 1
-    assert len(provider.requested) == 1, "no sweep should have been run"
-    assert client.calls == [], "no footprint query should have been needed"
-
-
-def test_plan_base_offset_never_returns_an_occupied_offset() -> None:
-    """Do not tell a program to stand inside a counter.
-
-    The base sits at world (1.0, 2.0) facing +y, so a lateral dy maps to world x = 1.0 - dy.
-    Blocking the x values of every rescuing offset leaves the sweep with nothing to offer.
-    """
-    rescuing_x = tuple(round(1.0 - dy / 100.0, 2) for dy in range(25, 41))
-    adapter, client, _ = _base_adapter(blocked_x=rescuing_x)
-    result = adapter.plan_base_offset([_target(0.55)], standoff_m=0.0)
-    assert result["ok"] is False
-    assert result["dy"] == 0.0, "a blocked offset must never be the answer"
-    assert client.calls, "the sweep must have consulted the footprint"
-    blocked = [entry for entry in result["offsets"] if entry["free"] is False]
-    assert blocked, "blocked offsets stay visible in the diagnostics"
-    assert all(entry["reachable"] is None for entry in blocked), "no IK spent on a blocked pose"
-
-
-def test_plan_base_offset_spends_no_simulator_ticks() -> None:
-    """The whole point: a program can ask where to stand without paying from its horizon."""
-    adapter, client, _ = _base_adapter()
-    before = adapter._elapsed_steps
-    adapter.plan_base_offset([_target(0.55)], standoff_m=0.0)
-    assert adapter._elapsed_steps == before
-    assert client.steps == 0
-
-
-def test_plan_base_offset_counts_the_retreat_pose_too() -> None:
-    """A candidate is executable only if the approach it must pass through also solves."""
-    adapter, _, _ = _base_adapter(reach_m=0.30)
-    # Rotated 90 degrees about x, so the gripper's approach axis (local +z) is -y: the
-    # retreat pose sits 0.20 m further out in y than the grasp, which puts it outside the
-    # band while the grasp itself is inside it.
-    rotated = Pose(
-        position=np.array([0.5, 0.25, 0.9]),
-        quaternion_wxyz=np.array([math.cos(math.pi / 4), math.sin(math.pi / 4), 0.0, 0.0]),
-        frame="robot0_link0",
-    )
-    bare = adapter.plan_base_offset([rotated], standoff_m=0.0)
-    assert bare["reachable_now"] == 1
-
-    adapter2, _, _ = _base_adapter(reach_m=0.30)
-    strict = adapter2.plan_base_offset([rotated], standoff_m=0.20)
-    assert strict["reachable_now"] == 0, "the retreat pose is out of reach, so this is not usable"
-    assert strict["standoff_m"] == pytest.approx(0.20)
-
-
-def test_plan_base_offset_rejects_bad_requests() -> None:
-    adapter, _, _ = _base_adapter()
-    world = Pose(
-        position=np.array([1.0, 2.0, 0.9]),
-        quaternion_wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
-        frame="world",
-    )
-    with pytest.raises(ValueError, match="robot0_link0"):
-        adapter.plan_base_offset([world])
-    with pytest.raises(ValueError):
-        adapter.plan_base_offset([])
-    with pytest.raises(ValueError):
-        adapter.plan_base_offset([_target(0.1)], min_reachable=0)
-
-
-def test_plan_base_offset_is_a_public_robocasa_extension() -> None:
-    """Allowlisted, and reachable through the mapping a generated program is handed."""
-    assert "robocasa.plan_base_offset" in ROBOCASA_PUBLIC_TOOL_NAMES
-    adapter, _, _ = _base_adapter()
-    registry = CapApi(adapter).register_tools(
-        ToolRegistry(public_extension_allowlist=ROBOCASA_PUBLIC_TOOL_NAMES)
-    )
-    assert "robocasa.plan_base_offset" in dict(registry.public_tools())
+    assert fake.calls[-1] == (1.5, 2.5, 0.0)
 
 
 def test_adapter_plan_approach_pose_in_link0_does_not_need_client() -> None:

@@ -44,11 +44,6 @@ from cap_harness.errors import ApiError, ErrorCode
 from cap_harness.geometry import invert_transform, matrix_to_pose, quaternion_wxyz_to_matrix
 from cap_harness.robocasa.codec import RobocasaActionCodec
 from cap_harness.robocasa.geometry import (
-    lateral_base_offsets,
-    pose_after_base_offset,
-    retreat_pose,
-)
-from cap_harness.robocasa.geometry import (
     plan_approach_pose as approach_from_cloud,
 )
 from cap_harness.robocasa.geometry import (
@@ -193,7 +188,6 @@ class RobocasaAdapter:
         camera_width: int = 128,
         horizon: int = 1000,
         run_observer: Any | None = None,
-        ik_provider: Any | None = None,
     ) -> None:
         if camera_height <= 0 or camera_width <= 0 or horizon <= 0:
             raise ValueError("camera dimensions and horizon must be positive")
@@ -221,7 +215,6 @@ class RobocasaAdapter:
         self._elapsed_steps = 0
         self._seed: int | None = None
         self._last_reward: float | None = None
-        self._ik_provider = ik_provider
         self._closed = False
 
     # ------------------------------------------------------------------ identity
@@ -264,7 +257,9 @@ class RobocasaAdapter:
         from robot_driver import RobotClient
         from robot_driver import protocol as wire
 
-        return RobotClient(self._endpoint or wire.DEFAULT_ENDPOINT, timeout_ms=self._timeout_ms)
+        return RobotClient(
+            self._endpoint or wire.DEFAULT_ENDPOINT, timeout_ms=self._timeout_ms
+        )
 
     def _build_camera_map(self, metadata: RobocasaTaskMetadata) -> dict[str, str]:
         """Map ASPIRE's portable camera names onto whatever this simulator advertises.
@@ -310,7 +305,9 @@ class RobocasaAdapter:
         self._elapsed_steps = 0
         self._last_reward = None
         self._camera_map = self._build_camera_map(metadata)
-        self._codec = RobocasaActionCodec(metadata.arms, control_frequency=self.control_frequency)
+        self._codec = RobocasaActionCodec(
+            metadata.arms, control_frequency=self.control_frequency
+        )
         # Per-episode instruction from the simulator is authoritative; RoboCasa composes it from
         # the sampled objects, so it is not knowable from the static registry.
         language = str(episode.get("instruction") or metadata.language)
@@ -507,137 +504,6 @@ class RobocasaAdapter:
             )
         return approach_from_cloud(object_cloud, base, distance_m)
 
-    def _ik(self) -> Any:
-        """The IK provider this adapter asks about hypothetical base poses.
-
-        Lazily constructed and injectable, mirroring ``BehaviorAdapter.planner()``: the
-        adapter exists before ``CapApi`` owns any provider, so an extension that needs IK has
-        to hold its own. Deliberately **not** the run's traced provider -- a single
-        :meth:`plan_base_offset` call can issue several hundred solves, and that many spans
-        would bury everything else in the trace. The returned counts are the record instead.
-        """
-        if self._ik_provider is None:
-            from cap_harness.providers.pyroki.client import PyRokiProvider
-
-            self._ik_provider = PyRokiProvider()
-        return self._ik_provider
-
-    def plan_base_offset(
-        self,
-        targets: Any,
-        *,
-        standoff_m: float = 0.10,
-        max_offset_m: float = 0.40,
-        step_m: float = 0.05,
-        min_reachable: int = 1,
-    ) -> Mapping[str, object]:
-        """Where to stand so that ``targets`` become reachable. Costs **no** simulator ticks.
-
-        Neither IK provider here plans the base: PyRoki solves a fixed-base Panda and cuRobo
-        plans the same seven joints against a frozen base transform, so reachability is always
-        judged from wherever the robot happens to be standing. A whole-body solver would
-        answer this question by itself; absent one, this sweeps hypothetical base offsets
-        *outside* the solver and asks the arm-only solver about each.
-
-        ``targets`` are poses in ``robot0_link0`` -- grasp candidates, or any pose the arm
-        must reach. A target counts as reachable only when the pose ``standoff_m`` back along
-        its own approach axis solves too, because the gripper has to arrive along that axis
-        rather than from an arbitrary direction. Pass ``standoff_m=0.0`` to test the bare
-        poses handed in.
-
-        The answer is a plain mapping, and ``dx`` / ``dy`` / ``dyaw`` go straight into
-        :meth:`navigate_to_pose`. ``(0, 0, 0)`` means stand still, which is returned whenever
-        standing still already clears ``min_reachable``: a base move costs ~15 ticks of the
-        horizon and shifts the robot-mounted camera, and a blind fixed offset is worse than
-        nothing. Offsets whose footprint is occupied are listed in ``offsets`` with
-        ``free: False`` and are never returned -- this query will not tell a program to stand
-        inside a counter.
-        """
-        poses = [targets] if isinstance(targets, Pose) else list(targets)
-        if not poses:
-            raise ValueError("targets must contain at least one Pose")
-        for pose in poses:
-            if not isinstance(pose, Pose):
-                raise ValueError("targets must be Pose values")
-            if pose.frame != self.BASE_FRAME:
-                raise ValueError(
-                    f"targets must be expressed in {self.BASE_FRAME!r}, got {pose.frame!r}"
-                )
-        wanted = int(min_reachable)
-        if wanted < 1:
-            raise ValueError("min_reachable must be at least 1")
-        standoff = float(standoff_m)
-        if not np.isfinite(standoff) or standoff < 0.0:
-            raise ValueError("standoff_m must be non-negative")
-
-        # A target is usable only if every pose in its group solves. Ordering puts the retreat
-        # pose first so the short circuit skips the grasp solve when the approach is hopeless.
-        groups = tuple(
-            (pose,) if standoff == 0.0 else (retreat_pose(pose, standoff), pose) for pose in poses
-        )
-        # Read once: the state is the cached observation, and the hypothetical move changes
-        # where the arm is, not how it is folded, so the current configuration is the right
-        # seed for every offset in the sweep.
-        state = self.get_robot_state()
-        provider = self._ik()
-        arm = self.arms[0]
-
-        def reachable_at(dy: float) -> int:
-            return sum(
-                1
-                for group in groups
-                if all(
-                    bool(
-                        provider.solve_ik(pose_after_base_offset(pose, 0.0, dy), state, arm=arm).ok
-                    )
-                    for pose in group
-                )
-            )
-
-        reachable_now = reachable_at(0.0)
-        # The robot is standing here, so this pose is occupiable by definition; asking the
-        # simulator would spend a round trip to be told what we already know.
-        sweep: list[Mapping[str, object]] = [
-            MappingProxyType({"dx": 0.0, "dy": 0.0, "free": True, "reachable": reachable_now})
-        ]
-        best_dy, best_count = 0.0, reachable_now
-        if reachable_now < wanted:
-            base = self.get_base_pose()
-            yaw = self._base_yaw()
-            cosine, sine = math.cos(yaw), math.sin(yaw)
-            for dy in lateral_base_offsets(max_offset_m, step_m):
-                # Same world mapping drive_base uses, so the footprint is tested at the pose
-                # navigate_to_pose would actually reach.
-                world_x = float(base.position[0]) - sine * dy
-                world_y = float(base.position[1]) + cosine * dy
-                if not self.base_pose_is_free(world_x, world_y, yaw):
-                    sweep.append(
-                        MappingProxyType({"dx": 0.0, "dy": dy, "free": False, "reachable": None})
-                    )
-                    continue
-                count = reachable_at(dy)
-                sweep.append(
-                    MappingProxyType({"dx": 0.0, "dy": dy, "free": True, "reachable": count})
-                )
-                # Strict, over a nearest-first sweep: ties go to the smallest move.
-                if count > best_count:
-                    best_dy, best_count = dy, count
-        return MappingProxyType(
-            {
-                "ok": best_count >= wanted,
-                "dx": 0.0,
-                "dy": best_dy,
-                "dyaw": 0.0,
-                "free": True,
-                "reachable_now": reachable_now,
-                "reachable_after": best_count,
-                "targets_tested": len(groups),
-                "offsets_tested": len(sweep),
-                "standoff_m": standoff,
-                "offsets": tuple(sweep),
-            }
-        )
-
     # ---------------------------------------------------------------------- step
 
     def _truncated(self) -> bool:
@@ -733,7 +599,9 @@ class RobocasaAdapter:
             return ExecutionResult(
                 ok=False,
                 steps_executed=0,
-                error=ApiError(code=ErrorCode.INVALID_REQUEST, message=f"unknown arm {arm!r}"),
+                error=ApiError(
+                    code=ErrorCode.INVALID_REQUEST, message=f"unknown arm {arm!r}"
+                ),
             )
         # Each tick must go through ``step()`` so the run recorder gets RGB.
         # ``client.step`` / ``move_to_joints`` move the arm but leave the
