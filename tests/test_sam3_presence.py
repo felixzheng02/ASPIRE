@@ -1,9 +1,10 @@
-"""What ``Segmentation.score`` means, and what ``ok=True`` does not promise.
+"""What ``Segmentation.score`` means, and which benchmarks act on it.
 
 The service runs SAM3 at a 0.0 detection threshold, so ``/segment`` answers every noun
-with five ranked masks. These tests pin the two things that make that legible to a
-caller: the score the model actually produced is reported even when nothing survives
-filtering, and the default client keeps behaving exactly as it always has.
+with five ranked masks. These tests pin three things: the score the model actually
+produced is reported even when nothing survives filtering, the bare client keeps
+behaving exactly as it always has, and the RoboCasa path alone turns that score into a
+present/absent answer.
 
 No live service: every response is a stub.
 """
@@ -21,6 +22,11 @@ from cap_harness.errors import ErrorCode
 from cap_harness.providers.sam3.client import (
     SUGGESTED_PRESENCE_THRESHOLD,
     Sam3Provider,
+)
+from cap_harness.run import (
+    SAM3_MIN_SCORE_ENV,
+    SEGMENTATION_MIN_SCORE,
+    segmentation_min_score,
 )
 
 
@@ -80,9 +86,11 @@ def _payload(scores: list[float], **extra: object) -> dict[str, Any]:
 
 
 def test_default_provider_still_returns_masks_for_a_low_scoring_prompt() -> None:
-    """The long-standing contract. ``connectivity_check.py`` and the tool-check catalog
-    both read ``ok`` for scene nouns, including nouns that score badly on the wrist
-    camera, so the default must not start rejecting them.
+    """The bare provider stays permissive.
+
+    The presence floor is applied per benchmark in ``run.py``, not here, so a caller that
+    constructs ``Sam3Provider()`` itself -- the agent server, a scratch script -- keeps
+    ranking candidates for itself and never sees a new ``ok=False``.
     """
     session = FakeSession([FakeResponse(200, _payload([0.0347], threshold=0.0, best_score=0.0347))])
 
@@ -203,3 +211,86 @@ def test_an_empty_results_list_names_the_prompt_and_the_best_score() -> None:
     assert result.error.code is ErrorCode.NO_SEGMENTATION
     assert "bicycle" in result.error.message
     assert result.error.details["best_candidate_score"] == pytest.approx(0.02)
+
+
+# ------------------------------------------------------------------ per-benchmark default
+
+
+def test_robocasa_enforces_the_presence_floor_and_other_benchmarks_do_not() -> None:
+    """The scope of this change, stated as a test.
+
+    :8114 is shared with LIBERO, BEHAVIOR, Robosuite and CaP-X, whose prompts are long
+    descriptive phrases nobody has scored. Only RoboCasa's bare scene nouns were measured,
+    so only RoboCasa acts on the number.
+    """
+    assert segmentation_min_score("robocasa") == pytest.approx(SUGGESTED_PRESENCE_THRESHOLD)
+    for benchmark in ("libero-pro", "behavior", "robosuite", "yam_real"):
+        assert segmentation_min_score(benchmark) == pytest.approx(0.0)
+
+
+def test_an_unknown_benchmark_keeps_the_permissive_default() -> None:
+    assert segmentation_min_score("a-benchmark-that-does-not-exist-yet") == pytest.approx(0.0)
+
+
+def test_the_floor_tracks_sam3s_own_threshold_rather_than_a_fitted_constant() -> None:
+    """0.55 was this kitchen's sweep argmax, better by one prompt out of 73. The cut
+    deliberately follows ``Sam3Processor``'s own default instead.
+    """
+    assert SEGMENTATION_MIN_SCORE["robocasa"] is SUGGESTED_PRESENCE_THRESHOLD
+
+
+def test_the_environment_can_restore_the_old_permissive_behaviour(monkeypatch) -> None:
+    monkeypatch.setenv(SAM3_MIN_SCORE_ENV, "0.0")
+
+    assert segmentation_min_score("robocasa") == pytest.approx(0.0)
+
+
+def test_the_environment_can_raise_the_floor_for_a_benchmark_without_one(monkeypatch) -> None:
+    monkeypatch.setenv(SAM3_MIN_SCORE_ENV, "0.55")
+
+    assert segmentation_min_score("libero-pro") == pytest.approx(0.55)
+
+
+def test_a_blank_override_is_ignored_rather_than_read_as_zero(monkeypatch) -> None:
+    """An exported-but-empty variable is a shell accident, not a request for 0.0."""
+    monkeypatch.setenv(SAM3_MIN_SCORE_ENV, "   ")
+
+    assert segmentation_min_score("robocasa") == pytest.approx(SUGGESTED_PRESENCE_THRESHOLD)
+
+
+@pytest.mark.parametrize("value", ["1.5", "-0.1", "half", "nan", "inf"])
+def test_an_unusable_override_names_the_variable_instead_of_silently_passing(
+    monkeypatch, value: str
+) -> None:
+    monkeypatch.setenv(SAM3_MIN_SCORE_ENV, value)
+
+    with pytest.raises(ValueError, match=SAM3_MIN_SCORE_ENV):
+        segmentation_min_score("robocasa")
+
+
+def test_the_robocasa_floor_rejects_the_measured_absent_pan() -> None:
+    """End to end through the provider, at the default a RoboCasa run now gets.
+
+    "pan" on seed 101 agentview scored 0.0347 and returned the *plate's* box. Before this
+    change that was ``ok=True`` and a program reached for it.
+    """
+    session = FakeSession([FakeResponse(200, _payload([0.0347], threshold=0.0, best_score=0.0347))])
+    provider = Sam3Provider(session=session, min_score=segmentation_min_score("robocasa"))  # type: ignore[arg-type]
+
+    result = provider.segment_text(_camera(), "pan")
+
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code is ErrorCode.NO_SEGMENTATION
+    assert result.error.details["min_score"] == pytest.approx(0.5)
+
+
+def test_the_libero_floor_still_returns_that_same_weak_mask() -> None:
+    """The other side of the scope: an identical response, a different benchmark."""
+    session = FakeSession([FakeResponse(200, _payload([0.0347], threshold=0.0, best_score=0.0347))])
+    provider = Sam3Provider(session=session, min_score=segmentation_min_score("libero-pro"))  # type: ignore[arg-type]
+
+    result = provider.segment_text(_camera(), "pan")
+
+    assert result.ok
+    assert len(result.segmentations) == 1

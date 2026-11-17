@@ -12,6 +12,7 @@ from cap_harness.contracts import (
     DEFAULT_EMBODIMENT,
     JOINT_DIMENSIONS,
     ArmCommand,
+    CameraObservation,
     ExecutionResult,
     GraspCandidate,
     GraspSet,
@@ -44,6 +45,8 @@ from .geometry import (
     grasp_standoff_pose,
     pose_from_mapping,
     select_top_down_grasp,
+    transform_points,
+    transform_pose,
 )
 from .geometry import (
     crop_point_cloud as crop_observed_point_cloud,
@@ -248,15 +251,18 @@ class CapApi:
     ) -> SegmentationSet:
         """Segment ``text`` in one camera image.
 
-        ``ok=True`` does not mean ``text`` is in the frame. The SAM3 service runs at a
-        0.0 detection threshold, so it answers every noun with its five best-ranked
-        regions: on a RoboCasa kitchen with no sink, ``segment_text("agentview",
-        "sink")`` returns the plate at score 0.72, in the same box ``"plate"`` returns.
+        On RoboCasa this reports absence: the provider is built with a 0.5 floor on
+        ``Segmentation.score``, so a prompt SAM3 scores below that returns ``ok=False``
+        with ``NO_SEGMENTATION``. Elsewhere the floor is 0.0 and ``ok=True`` does not mean
+        ``text`` is in the frame -- the service answers every noun with its five
+        best-ranked regions.
 
-        Read ``segmentations[0].score`` instead -- it is a concept-presence confidence,
-        not mask quality -- and treat values below 0.5 as "probably absent". That cut is
-        94.5% accurate over 73 labelled RoboCasa prompts and is still not sound; see
-        "Segmentation scores are not a presence test" in ``docs/api-reference.md``.
+        The floor is a filter, not a presence test, and both residual failures are
+        semantic: on a kitchen with no sink ``segment_text("agentview", "sink")`` clears
+        it at 0.72 (returning the plate), while a present object prompted with the wrong
+        word falls under it. Read ``segmentations[0].score``, try another word before
+        concluding absent, and see "Segmentation scores are not a presence test" in
+        ``docs/api-reference.md``.
         """
         return self._segment_text(camera_name, text, self.get_observation(camera_name))
 
@@ -362,13 +368,31 @@ class CapApi:
                 camera_name=camera_name,
                 frame=camera.frame,
             )
+        base_frame = observation.robot_state.base_frame
+        # The clouds go to the provider in the CAMERA's optical frame, and the
+        # grasps are mapped to the base frame afterwards. Contact-GraspNet is
+        # view-dependent: it reads +Z as the viewing direction (its inference
+        # entry point converts "from OpenCV" camera coordinates, and the
+        # service's own retry samples virtual cameras around the origin). Handed
+        # base-frame clouds, where +Z is up, it takes the scene to be seen from
+        # underneath and answers with near-horizontal approaches. Measured on
+        # RoboCasa ``PickPlaceCounterToStove``, 10 seeds: 194 of 194 candidates
+        # approached within 13 degrees of horizontal, which put the hand 3-6 cm
+        # inside the counter; the arm jammed on it and joint 6 (the 12 N m wrist
+        # motor) stalled 0.2-0.45 rad short. The same clouds in the camera frame
+        # gave 184 of 184 approaches 47-89 degrees from above.
         try:
+            if camera.camera_pose.frame != base_frame:
+                raise ValueError(
+                    f"camera pose only defines {camera.frame!r} to "
+                    f"{camera.camera_pose.frame!r}, not {base_frame!r}"
+                )
             point_cloud = self._stage(
                 "mask_to_point_cloud",
                 self._project_mask,
                 segmentation,
                 camera_name=camera_name,
-                target_frame=observation.robot_state.base_frame,
+                target_frame=camera.frame,
                 observation=observation,
             )
             scene_point_cloud = self._stage(
@@ -376,7 +400,7 @@ class CapApi:
                 self._project_mask,
                 np.ones(camera.depth_m.shape, dtype=bool),
                 camera_name=camera_name,
-                target_frame=observation.robot_state.base_frame,
+                target_frame=camera.frame,
                 observation=observation,
             )
         except ValueError as exc:
@@ -395,7 +419,65 @@ class CapApi:
             scene_point_cloud=scene_point_cloud,
             max_candidates=max_candidates,
         )
+        result = self._grasps_in_base_frame(result, camera, base_frame)
         return self._public_eef_grasps(result, observation.robot_state.embodiment)
+
+    @staticmethod
+    def _grasps_in_base_frame(
+        result: GraspSet, camera: CameraObservation, base_frame: str
+    ) -> GraspSet:
+        """Map candidates from the camera frame they were inferred in to the base frame.
+
+        A provider answers in the frame of the cloud it was given. Frames are
+        labelled, so a candidate that already says ``base_frame`` is passed
+        through, and one in any third frame is an error rather than a guess.
+        """
+        if not result.ok:
+            return result
+        base_from_camera = camera.camera_pose.as_matrix()
+        grasps: list[GraspCandidate] = []
+        for candidate in result.grasps:
+            if candidate.frame == base_frame:
+                grasps.append(candidate)
+                continue
+            if candidate.frame != camera.frame:
+                return GraspSet(
+                    ok=False,
+                    error=ApiError(
+                        code=ErrorCode.GRASP_FAILED,
+                        message=(
+                            f"grasp candidate is in frame {candidate.frame!r}, expected "
+                            f"{camera.frame!r} or {base_frame!r}"
+                        ),
+                        details={"frame": candidate.frame},
+                    ),
+                )
+            metadata = dict(candidate.metadata)
+            contact = metadata.get("contact_point")
+            if contact is not None:
+                moved = transform_points(np.asarray(contact).reshape(1, 3), base_from_camera)
+                metadata["contact_point"] = tuple(float(value) for value in moved[0])
+            grasps.append(
+                replace(
+                    candidate,
+                    pose=transform_pose(
+                        candidate.pose,
+                        base_from_camera,
+                        source_frame=camera.frame,
+                        target_frame=base_frame,
+                    ),
+                    metadata=metadata,
+                )
+            )
+        return GraspSet(
+            ok=True,
+            grasps=tuple(grasps),
+            diagnostics={
+                **dict(result.diagnostics),
+                "frame": base_frame,
+                "inference_frame": camera.frame,
+            },
+        )
 
     def _public_eef_grasps(self, result: GraspSet, embodiment: str) -> GraspSet:
         """Lift provider panda_hand poses to the public EEF ``move_to_pose`` consumes.

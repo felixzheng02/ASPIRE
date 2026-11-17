@@ -104,10 +104,12 @@ def box_area(seg):
     return width * height
 
 
-def pick_mask(prompt):
-    found = segment_text("agentview", prompt)
+def pick_mask(camera, prompt):
+    # segment_text enforces a 0.5 presence floor on robocasa, so ok=False here means
+    # "SAM3 did not believe this noun was in this frame" and the error names the score.
+    found = segment_text(camera, prompt)
     if not found.ok:
-        return None, error_text(found.error)
+        return None, camera + "/" + prompt + ": " + error_text(found.error)
     pool = list(found.segmentations)
     if len(pool) == 0:
         return None, "no masks for " + prompt
@@ -140,8 +142,10 @@ def parse_pick_place(text):
     return obj_name, cont_name
 
 
-def cloud_centroid(seg, frame):
-    cloud = mask_to_point_cloud(seg, "agentview", target_frame=frame)
+def cloud_centroid(seg, frame, camera="agentview"):
+    # Through the camera the mask came from: a wrist mask projected with agentview's
+    # calibration lands somewhere arbitrary.
+    cloud = mask_to_point_cloud(seg, camera, target_frame=frame)
     if cloud is None or len(cloud.points) == 0:
         return None
     return centroid_of(cloud.points)
@@ -219,10 +223,19 @@ record("open_gripper", opened.ok, error_text(opened.error))
 
 # --------------------------------------------------------------------------- food (named object, not SAM's first mask)
 
-obj_set = segment_text("agentview", obj_name)
+# The instruction's own noun is not always the word SAM3 knows the object by, and with the
+# 0.5 presence floor a wrong word is a reported absence rather than a low-scoring mask. On
+# seed 102 the instruction says "corn" but the plate holds a green vegetable: "corn" scores
+# 0.065 and is rejected. Measured on agentview, "object on the plate" clears the floor on
+# all three development seeds (0.875 / 0.910 / 0.594) and returns the same box the
+# instruction noun returns, so it is the fallback rather than a second guess at the food.
 obj_seg = None
-if obj_set.ok and obj_set.segmentations:
-    obj_seg = obj_set.segmentations[0]
+for obj_prompt in [obj_name, "object on the plate"]:
+    obj_set = segment_text("agentview", obj_prompt)
+    if obj_set.ok and obj_set.segmentations:
+        obj_seg = obj_set.segmentations[0]
+        obj_name = obj_prompt
+        break
 obj_xyz = None if obj_seg is None else cloud_centroid(obj_seg, frame)
 record(
     "localize_object",
@@ -231,6 +244,42 @@ record(
         "prompt": obj_name,
         "box": None if obj_seg is None else [round(float(v), 1) for v in obj_seg.box_xyxy],
         "centroid": None if obj_xyz is None else [round(v, 3) for v in obj_xyz],
+    },
+)
+
+# --------------------------------------------------------------------------- pan, located BEFORE the arm occludes it
+
+# The receptacle has to be found now, not after the grasp. segment_text enforces a 0.5
+# presence floor on robocasa, and once the arm is over the stove holding the food the pan
+# scores below it from every camera -- on seed 103 it is 0.922 on agentview at spawn and
+# rejected mid-episode. Which camera sees it also varies: at spawn seed 101 has the pan
+# only in the wrist frame (0.856 there, 0.035 on agentview, where that cooktop really is
+# empty). So try both cameras, and try another word before concluding absent.
+cont_seg = None
+cont_cam = "agentview"
+cont_err = "no container prompt tried"
+for camera_name in ["agentview", "robot0_eye_in_hand"]:
+    for cont_prompt in [cont_name, "pan", "frying pan", "pot"]:
+        cont_seg, cont_err = pick_mask(camera_name, cont_prompt)
+        if cont_seg is not None:
+            cont_cam = camera_name
+            cont_name = cont_prompt
+            break
+    if cont_seg is not None:
+        break
+cont_xyz = None if cont_seg is None else cloud_centroid(cont_seg, frame, cont_cam)
+# note, not record: whether a pan is visible from the spawn pose is a property of the
+# kitchen, not of the plumbing this gate measures. Seed 102 has none in either camera,
+# and before the presence floor this "passed" by returning the plate's own box at 0.065 --
+# the gate then placed the food back onto the plate it picked from and called it success.
+note(
+    "localize_container",
+    cont_seg is not None and cont_xyz is not None,
+    {
+        "prompt": cont_name,
+        "camera": cont_cam,
+        "error": cont_err,
+        "centroid": None if cont_xyz is None else [round(v, 3) for v in cont_xyz],
     },
 )
 
@@ -322,19 +371,6 @@ note(
     },
 )
 
-cont_seg, cont_err = pick_mask(cont_name)
-if cont_seg is None:
-    cont_seg, cont_err = pick_mask("pan")
-cont_xyz = None if cont_seg is None else cloud_centroid(cont_seg, frame)
-record(
-    "localize_container",
-    cont_seg is not None and cont_xyz is not None,
-    {
-        "prompt": cont_name,
-        "error": cont_err,
-        "centroid": None if cont_xyz is None else [round(v, 3) for v in cont_xyz],
-    },
-)
 
 placed_ok = False
 if cont_xyz is not None:
@@ -367,8 +403,8 @@ note("retreat", retreat.ok, error_text(retreat.error))
 
 # --------------------------------------------------------------------------- public witness: food cloud moved toward the pan
 
-after_seg, after_err = pick_mask(obj_name)
-after_xyz = None if after_seg is None else cloud_centroid(after_seg, frame)
+after_seg, after_err = pick_mask("agentview", obj_name)
+after_xyz = None if after_seg is None else cloud_centroid(after_seg, frame, "agentview")
 if obj_xyz is None or after_xyz is None:
     note("object_moved", False, "missing before/after object cloud")
 elif cont_xyz is None:

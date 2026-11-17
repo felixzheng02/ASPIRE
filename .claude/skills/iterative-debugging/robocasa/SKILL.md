@@ -121,8 +121,9 @@ campaign's seed lists **and** `--skills-dir` (see [main-agent-prompt.md](main-ag
    this library.
 
 Evolutionary search is **default off**. Enable it only with `init_run.py --evosearch` (or the
-init-time env override above). When false: today's Stage 1 (4 versions / 2 per failure mode)
-then freeze, then 126 once. No candidate population.
+init-time env override above). When false: today's Stage 1 (`campaign.json["version_budget"]`
+versions in total, no per-mode cap; `init_run.py --version-budget`, default 4) then freeze,
+then 126 once. No candidate population.
 
 Restart the simulator with `--task` matching the next suite before switching tasks. The
 library is the only sanctioned cross-task channel: a later suite reads whatever earlier
