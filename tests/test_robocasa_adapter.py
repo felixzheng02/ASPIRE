@@ -99,12 +99,16 @@ def test_plan_approach_pose_uses_cloud_frame_origin_for_link0() -> None:
     assert x == pytest.approx(0.4, abs=0.05)
 
 
+#: The real robot spawns near this yaw, which is what made a zero default wrong.
+SPAWN_YAW = math.pi / 2
+
+
 class _FakeFootprintClient:
-    def __init__(self) -> None:
+    def __init__(self, yaw: float = 0.0) -> None:
         self.calls: list[tuple[float, float, float]] = []
         self.last = {
             "base_pos": np.array([1.0, 2.0, 0.7]),
-            "base_quat_wxyz": np.array([1.0, 0.0, 0.0, 0.0]),
+            "base_quat_wxyz": np.array([math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)]),
         }
 
     def base_pose_is_free(self, x: float, y: float, yaw: float = 0.0) -> bool:
@@ -112,13 +116,32 @@ class _FakeFootprintClient:
         return True
 
 
-def test_adapter_base_pose_is_free_is_world_yes_no() -> None:
+def _footprint_adapter(yaw: float = 0.0) -> tuple[RobocasaAdapter, _FakeFootprintClient]:
     adapter = RobocasaAdapter()
-    fake = _FakeFootprintClient()
-    adapter._client = fake
+    client = _FakeFootprintClient(yaw)
+    adapter._client = client
     adapter._closed = False
+    return adapter, client
+
+
+def test_adapter_base_pose_is_free_is_world_yes_no() -> None:
+    adapter, fake = _footprint_adapter(0.0)
     assert adapter.base_pose_is_free(1.5, 2.5) is True
     assert fake.calls == [(1.5, 2.5, 0.0)]
+
+
+def test_base_pose_is_free_defaults_to_the_current_base_yaw() -> None:
+    """A zero default tested a box turned across the counter and blocked every valid pose."""
+    adapter, fake = _footprint_adapter(SPAWN_YAW)
+    assert adapter.base_pose_is_free(1.5, 2.5) is True
+    assert fake.calls[-1][2] == pytest.approx(SPAWN_YAW, abs=1e-9)
+
+
+def test_base_pose_is_free_still_accepts_an_explicit_yaw() -> None:
+    """An explicit yaw is how a program asks about a turned pose, so it must pass through."""
+    adapter, fake = _footprint_adapter(SPAWN_YAW)
+    adapter.base_pose_is_free(1.5, 2.5, 0.0)
+    assert fake.calls[-1] == (1.5, 2.5, 0.0)
 
 
 def test_adapter_plan_approach_pose_in_link0_does_not_need_client() -> None:

@@ -454,14 +454,27 @@ class RobocasaAdapter:
             final_errors={"base_translation_m": moved},
         )
 
-    def base_pose_is_free(self, x: float, y: float, yaw: float = 0.0) -> bool:
+    def _base_yaw(self) -> float:
+        """World yaw of ``robot0_link0`` right now. Reads the cached state; costs no ticks."""
+        return _yaw_from_wxyz(self.get_base_pose().quaternion_wxyz)
+
+    def base_pose_is_free(self, x: float, y: float, yaw: float | None = None) -> bool:
         """Whether a PandaOmron footprint at world ``(x, y)`` is empty of scene geometry.
+
+        ``yaw`` defaults to the yaw the base has **now**, not to zero. The footprint is a
+        rectangle offset 0.20 m behind ``robot0_link0``, both rotated by ``yaw``, and this
+        robot spawns near 90 degrees -- so a zero default tested a box turned across the
+        counter and reported the robot's own pose blocked in every scene. A relative
+        ``navigate_to_pose`` keeps the yaw it started with, so the current yaw is the right
+        one for every pose a program reached by driving laterally. Pass ``yaw`` explicitly to
+        ask about a turned pose.
 
         Same frame as :meth:`get_base_pose`. Arm poses and default SAM clouds are
         ``robot0_link0``; transform those into world before calling this. The
         answer is a boolean, not a map.
         """
-        return bool(self._require_client().base_pose_is_free(float(x), float(y), float(yaw)))
+        angle = self._base_yaw() if yaw is None else float(yaw)
+        return bool(self._require_client().base_pose_is_free(float(x), float(y), angle))
 
     @staticmethod
     def plan_standoff_pose(
