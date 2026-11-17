@@ -19,6 +19,7 @@ from cap_harness.contracts import (
     SynchronizedTrajectory,
     Trajectory,
 )
+from cap_harness.errors import ErrorCode
 from cap_harness.robocasa.adapter import (
     JOINT_LIMIT_SLACK_RAD,
     PANDA_JOINT_NAMES,
@@ -582,6 +583,44 @@ def test_the_driver_step_is_restored_after_a_base_move() -> None:
     with pytest.raises(TimeoutError):
         adapter.navigate_to_pose(0.1, 0.0, 0.0)
     assert "step" not in vars(sim)
+
+
+def test_a_gripper_call_that_crosses_the_horizon_returns_a_real_error(tmp_path) -> None:
+    """Repro: ``--max-steps 60``, ``close_gripper()`` then ``open_gripper()``, 30 ticks each.
+
+    The second call's last tick ends the episode. That step is ok and carries no error, so the
+    adapter built ``ExecutionResult(ok=False, error=None)`` and the program was shown the
+    contract's own text: "a failed result must carry an ApiError", with ``steps_executed: 0``.
+    """
+    sim = _FakeSim(gripper_settle_steps=30)
+    adapter, recorder, api = _recorded_episode(tmp_path, sim, horizon=60)
+
+    closed = api.close_gripper()
+    opened = api.open_gripper()
+
+    assert closed.ok and closed.steps_executed == 30
+    assert not opened.ok and opened.truncated
+    assert opened.steps_executed == 30
+    assert opened.error is not None
+    assert opened.error.code is ErrorCode.EXECUTION_FAILED
+    assert opened.error.message == "gripper motion truncated at the 60-tick horizon"
+    assert "ApiError" not in opened.error.message
+    assert _budget(api) == (60, 0)
+    recorder.close_incomplete(RuntimeError("test over"))
+
+
+def test_a_gripper_call_cut_short_mid_settle_reports_the_ticks_that_ran() -> None:
+    sim = _FakeSim(gripper_settle_steps=30)
+    adapter = RobocasaAdapter(client_factory=lambda **_: sim, horizon=7)
+    adapter.reset("OpenDrawer", 101)
+
+    result = adapter.close_gripper()
+
+    assert not result.ok and result.truncated
+    assert result.steps_executed == len(sim.sent) == 7
+    assert result.error is not None
+    assert "truncated at the 7-tick horizon" in result.error.message
+    assert result.final_observation is not None
 
 
 class _CountingObserver:

@@ -824,17 +824,31 @@ class RobocasaAdapter:
         executed = 0
         for _ in range(max(1, settle)):
             result = self.step(self._arm_action(joints, float(position)))
-            executed += 1
+            # A refused step did not run; the tick that ends the episode did.
+            executed += int(result.ok)
             if result.observation is not None:
                 final_observation = result.observation
             if not result.ok or result.terminated or result.truncated:
+                # A step that ends the episode is itself ok and carries no error, but the
+                # gripper call it interrupted has failed and must say so. Passing
+                # ``result.error`` (None) alone made ExecutionResult raise its own contract
+                # text, "a failed result must carry an ApiError", which the program then
+                # read as the error, with ``steps_executed`` lost.
                 return ExecutionResult(
                     ok=False,
                     steps_executed=executed,
                     final_observation=final_observation,
                     truncated=result.truncated,
                     terminated=result.terminated,
-                    error=result.error,
+                    error=result.error
+                    or ApiError(
+                        code=ErrorCode.EXECUTION_FAILED,
+                        message=(
+                            f"gripper motion truncated at the {self.horizon}-tick horizon"
+                            if result.truncated
+                            else "episode ended before the gripper finished"
+                        ),
+                    ),
                 )
         measured = self._measured_gripper()
         return ExecutionResult(
