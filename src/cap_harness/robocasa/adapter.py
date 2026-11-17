@@ -19,7 +19,9 @@ Consequences worth knowing before reading on:
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass
 import math
 from types import MappingProxyType
 from typing import Any
@@ -172,6 +174,18 @@ def _transform_from_quaternion_and_position(quaternion_wxyz: Any, position: Any)
 def _yaw_from_wxyz(quaternion_wxyz: Any) -> float:
     w, x, y, z = (float(v) for v in np.asarray(quaternion_wxyz, dtype=np.float64).reshape(4))
     return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+class _EpisodeOver(Exception):
+    """Unwinds a driver control loop when a tick ends the episode. Never leaves this module."""
+
+
+@dataclass(slots=True)
+class _DriverTicks:
+    """What a driver control loop spent while its ticks went through the adapter."""
+
+    executed: int = 0
+    last: StepResult | None = None
 
 
 class RobocasaAdapter:
@@ -439,38 +453,70 @@ class RobocasaAdapter:
         There is no collision checking, by design: a blocked path simply fails to converge and
         reports ``ok=False``. Forward motion from the spawn pose is usually blocked by a
         counter.
+
+        Every tick the driver takes is a recorded step, exactly like an arm or gripper tick:
+        it is counted against the horizon, scored, and written to ``steps.jsonl`` and the
+        videos. A blocked move is therefore expensive in plain sight. The driver gives up
+        only after ``MotionProfile.base_max_steps`` ticks (1200, more than RoboCasa's
+        1000-tick horizon), so a blocked move runs until the episode is truncated and
+        ``steps_executed`` says how many ticks it took.
         """
         client = self._require_client()
         before = np.asarray(client.base_pos(), dtype=np.float64)[:2].copy()
-        start_steps = client.sim_step_count()
-        ok = bool(client.drive_base(float(dx), float(dy), float(dyaw)))
+        converged = False
+        with self._driver_ticks(client) as ticks:
+            converged = bool(client.drive_base(float(dx), float(dy), float(dyaw)))
         moved = float(np.linalg.norm(np.asarray(client.base_pos(), dtype=np.float64)[:2] - before))
-        steps = max(0, client.sim_step_count() - start_steps)
-        self._elapsed_steps += steps
+        last = ticks.last
+        truncated = last is not None and last.truncated
+        # A move that converges on the very tick that ends the episode is still truncated:
+        # the loop was unwound before the driver could report, and ExecutionResult refuses
+        # a successful truncated result.
+        ok = converged and not truncated
+        final_observation: Observation | None = None
+        if ok:
+            final_observation = last.observation if last is not None else self.get_observation()
         return ExecutionResult(
             ok=ok,
-            steps_executed=steps,
-            final_observation=self.get_observation() if ok else None,
+            steps_executed=ticks.executed,
+            final_observation=final_observation,
+            truncated=truncated,
             error=None
             if ok
             else ApiError(
                 code=ErrorCode.EXECUTION_FAILED,
                 message=(
-                    "base did not converge; the path is probably blocked "
+                    f"base motion truncated at the {self.horizon}-tick horizon "
+                    f"(moved {moved:.3f} m of the requested motion)"
+                    if truncated
+                    else "base did not converge; the path is probably blocked "
                     f"(moved {moved:.3f} m of the requested motion)"
                 ),
             ),
             final_errors={"base_translation_m": moved},
         )
 
-    def base_pose_is_free(self, x: float, y: float, yaw: float = 0.0) -> bool:
+    def _base_yaw(self) -> float:
+        """World yaw of ``robot0_link0`` right now. Reads the cached state; costs no ticks."""
+        return _yaw_from_wxyz(self.get_base_pose().quaternion_wxyz)
+
+    def base_pose_is_free(self, x: float, y: float, yaw: float | None = None) -> bool:
         """Whether a PandaOmron footprint at world ``(x, y)`` is empty of scene geometry.
+
+        ``yaw`` defaults to the yaw the base has **now**, not to zero. The footprint is a
+        rectangle offset 0.20 m behind ``robot0_link0``, both rotated by ``yaw``, and this
+        robot spawns near 90 degrees -- so a zero default tested a box turned across the
+        counter and reported the robot's own pose blocked in every scene. A relative
+        ``navigate_to_pose`` keeps the yaw it started with, so the current yaw is the right
+        one for every pose a program reached by driving laterally. Pass ``yaw`` explicitly to
+        ask about a turned pose.
 
         Same frame as :meth:`get_base_pose`. Arm poses and default SAM clouds are
         ``robot0_link0``; transform those into world before calling this. The
         answer is a boolean, not a map.
         """
-        return bool(self._require_client().base_pose_is_free(float(x), float(y), float(yaw)))
+        angle = self._base_yaw() if yaw is None else float(yaw)
+        return bool(self._require_client().base_pose_is_free(float(x), float(y), angle))
 
     @staticmethod
     def plan_standoff_pose(
@@ -530,21 +576,83 @@ class RobocasaAdapter:
 
         if command.gripper_position is not None:
             client.set_gripper_target(command.gripper_position)
-        client.step(client.build_action(command.joint_target))
+        return self._tick(action, lambda: client.step(client.build_action(command.joint_target)))
+
+    def _tick(self, action: RobotAction, send: Callable[[], object]) -> StepResult:
+        """Run one control period and account for it. The only place a tick is counted.
+
+        Arm, gripper and base ticks all end here. That keeps ``_elapsed_steps``, which decides
+        truncation, equal to the run observer's own step count, which is the budget a program
+        reads (``episode_steps_used``) and the source of ``steps.jsonl`` and the videos. A
+        tick counted anywhere else is a tick the program is charged for and cannot see.
+
+        ``send`` performs the driver call. The caller has already run ``before_step``.
+        """
+        send()
         self._elapsed_steps += 1
         self._last_reward = self._reward()
-        truncated = self._truncated()
         result = StepResult(
             ok=True,
             observation=self.get_observation(),
             terminated=False,
-            truncated=truncated,
+            truncated=self._truncated(),
             reward=self._last_reward,
             diagnostics={"elapsed_steps": self._elapsed_steps},
         )
         if self._run_observer is not None:
             self._run_observer.after_step(action, result)
         return result
+
+    def _hold_action(self) -> RobotAction:
+        """The arm's share of a base tick: hold the measured joints, leave the grip alone.
+
+        This is what ``RobotClient.build_action`` sends for the arm when it is given no joint
+        target, so the recorded action is the commanded one. The base velocity has no field
+        in ``RobotAction``; the base's effect is visible in the tick's video frame.
+        """
+        joints = np.asarray(self._require_client().last["joint_pos"], dtype=np.float64)
+        return self._arm_action(joints, None)
+
+    @contextmanager
+    def _driver_ticks(self, client: Any) -> Iterator[_DriverTicks]:
+        """Route every tick a driver control loop takes through :meth:`_tick`.
+
+        ``drive_base`` is a closed loop inside ``robot_driver`` and calls ``client.step``
+        itself. The loop stays there on purpose: CaP-X uses the same one, and a second copy
+        of its stiction handling here would let the two harnesses drift apart. But a tick
+        taken inside the driver never reached the run observer, so a blocked base move could
+        spend the whole episode while the program still read ``episode_steps_used: 0``.
+
+        Inside this block ``client.step`` is shadowed on the instance, so each driver tick
+        becomes a recorded step. A tick that ends the episode unwinds the driver loop;
+        ``ticks.last`` then says why. The observer's own ``StepLimitReached`` is not caught
+        here and propagates as it does from :meth:`step`.
+        """
+        ticks = _DriverTicks()
+        send = client.step
+        shadowed = "step" in getattr(client, "__dict__", {})
+
+        def observed_step(raw_action: Any) -> Any:
+            action = self._hold_action()
+            if self._run_observer is not None:
+                self._run_observer.before_step(action)
+            result = self._tick(action, lambda: send(raw_action))
+            ticks.executed += 1
+            ticks.last = result
+            if result.terminated or result.truncated:
+                raise _EpisodeOver
+            return client.last
+
+        client.step = observed_step
+        try:
+            yield ticks
+        except _EpisodeOver:
+            pass
+        finally:
+            if shadowed:
+                client.step = send
+            else:
+                del client.step
 
     def _arm_action(self, joints: np.ndarray, gripper: float | None) -> RobotAction:
         return RobotAction(
@@ -725,17 +833,31 @@ class RobocasaAdapter:
         executed = 0
         for _ in range(max(1, settle)):
             result = self.step(self._arm_action(joints, float(position)))
-            executed += 1
+            # A refused step did not run; the tick that ends the episode did.
+            executed += int(result.ok)
             if result.observation is not None:
                 final_observation = result.observation
             if not result.ok or result.terminated or result.truncated:
+                # A step that ends the episode is itself ok and carries no error, but the
+                # gripper call it interrupted has failed and must say so. Passing
+                # ``result.error`` (None) alone made ExecutionResult raise its own contract
+                # text, "a failed result must carry an ApiError", which the program then
+                # read as the error, with ``steps_executed`` lost.
                 return ExecutionResult(
                     ok=False,
                     steps_executed=executed,
                     final_observation=final_observation,
                     truncated=result.truncated,
                     terminated=result.terminated,
-                    error=result.error,
+                    error=result.error
+                    or ApiError(
+                        code=ErrorCode.EXECUTION_FAILED,
+                        message=(
+                            f"gripper motion truncated at the {self.horizon}-tick horizon"
+                            if result.truncated
+                            else "episode ended before the gripper finished"
+                        ),
+                    ),
                 )
         measured = self._measured_gripper()
         return ExecutionResult(

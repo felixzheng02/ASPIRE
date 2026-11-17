@@ -124,7 +124,7 @@ Provenance, not only an API-name ban:
                 plan_motion(goal, strategy=MotionStrategy(...)), go_home(), step(action)
   Gripper:      open_gripper(), close_gripper()
   Extensions:   robocasa.get_base_pose(), robocasa.navigate_to_pose(dx, dy, dyaw),
-                robocasa.base_pose_is_free(x, y),
+                robocasa.base_pose_is_free(x, y, yaw=None),
                 robocasa.plan_standoff_pose(support_cloud, object_cloud, standoff_m),
                 robocasa.plan_approach_pose(object_cloud, distance_m),
                 robocasa.get_task_metadata(), robocasa.get_controller_metadata()
@@ -232,7 +232,9 @@ and do not lower the floor. The answer is a different word or a different camera
   Lateral and yaw converge. Targets beyond ~0.85 m from spawn need a base move first.
 - `robocasa.base_pose_is_free(x, y)` is world-frame (same as `get_base_pose`). Arm poses and
   default SAM clouds are `robot0_link0`. Transform, or request clouds in `world`, before
-  testing a standoff/approach candidate. The answer is a boolean, not a map.
+  testing a standoff/approach candidate. The answer is a boolean, not a map. `yaw` defaults
+  to the base's current yaw, which is the one a lateral `navigate_to_pose` preserves; pass it
+  explicitly only to ask about a turned pose.
 - `robocasa.plan_standoff_pose(support, object)` / `robocasa.plan_approach_pose(object)`
   return `(x, y, yaw)` in the cloud frame. Choose support and object clouds from what the
   instruction names (a counter as support is common; do not assume a cabinet/handle pair).
