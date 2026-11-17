@@ -161,6 +161,12 @@ copied onto this adapter; they inherit the cloud frame. Request those clouds in 
 transform `robot0_link0` points, before feeding a candidate to `base_pose_is_free`.
 `navigate_to_pose` stays relative P-control — it does not consult the footprint query.
 
+Base ticks are episode steps like arm and gripper ticks: they count in `episode_steps_used`,
+are scored, and are written to `episode/steps.jsonl` and the videos. A blocked move does not
+give up before the 1000-tick horizon (the base loop's own cap is 1200), so it runs until the
+episode is truncated and returns `ok=False`, `truncated=True`. See "Tick cost of a motion" in
+`docs/api-reference.md`.
+
 ## Things that will cost you time
 
 1. **`robot0_base` is a decoy.** PandaOmron's nominal root is a dummy parked at world
