@@ -6,15 +6,20 @@
 #       --save-images localize_check examples/stretch4/localize_check.py
 #
 # OBJECT comes from --set. Moves, each one joint from the measured pose:
-#   Home -> wrist pitch +0.8 rad (camera about 46 deg down) -> view 1
+#   Home -> wrist pitch +0.5 rad (camera about 29 deg down) -> view 1
 #   -> lift 10 cm lower -> view 2 -> wrist roll +20 deg -> view 3 -> Home.
-# Base, arm and wrist yaw are never changed. If view 1 fails, it goes straight
-# back Home. Each view's wrist image and SAM3 mask are saved; check that the
-# object is in view and is what was segmented.
+# With a 0.75 m table, view 1 looks at it about 1.0 m in front of the base and
+# view 2 about 0.8 m. Base, arm and wrist yaw are never changed. If view 1 fails
+# (SAM3 down, nothing found, or a SAM3 score below 0.3), it goes straight back
+# Home. Each view's wrist image and SAM3 mask are saved; check that the object
+# is in view and is what was segmented.
 # Positions are in odom (metres); z is height above the floor.
 import math
 
-LOOK_DOWN_PITCH = 0.8  # rad; URDF convention, positive tilts the camera down
+# rad; positive tilts the camera down. Kept under the executor's default soft
+# stop of 0.56 rad for downward pitch.
+LOOK_DOWN_PITCH = 0.5
+MIN_SAM3_SCORE = 0.3  # a lower score counts as not found
 LIFT_DROP = 0.10  # m
 ROLL_STEP = math.radians(20.0)
 LIFT, PITCH, ROLL = 3, 6, 7  # joint indices in the 8-joint Stretch arm
@@ -36,9 +41,14 @@ def localize(label):
         views[label] = {"ok": False, "error": found.error}
         print(f"{label}: localize_object failed: {found.error}")
         return
+    score = round(float(found.segmentation.score), 3)
+    images[label + "_mask"] = found.segmentation.mask
+    if score < MIN_SAM3_SCORE:
+        views[label] = {"ok": False, "sam3_score": score, "error": "SAM3 score below 0.3"}
+        print(f"{label}: SAM3 score {score} < {MIN_SAM3_SCORE}, treated as not found")
+        return
     center = [round(float(value), 4) for value in found.geometry.pose.position]
     top_z = round(float(max(found.point_cloud.points[:, 2])), 4)
-    images[label + "_mask"] = found.segmentation.mask
     views[label] = {
         "ok": True,
         "center_odom": center,
@@ -46,9 +56,12 @@ def localize(label):
         "top_z": top_z,
         "extents": [round(float(value), 4) for value in found.geometry.extents],
         "points": found.geometry.point_count,
-        "sam3_score": round(float(found.segmentation.score), 3),
+        "sam3_score": score,
     }
-    print(f"{label}: center (odom) {center}, center z {center[2]} m, top z {top_z} m")
+    print(
+        f"{label}: SAM3 score {score}, center (odom) {center}, "
+        f"center z {center[2]} m, top z {top_z} m"
+    )
 
 
 def step(name, outcome):

@@ -265,7 +265,7 @@ def test_localize_check_moves_one_joint_at_a_time_and_returns_home(fake, kinemat
     }
     moves = [targets for name, targets in fake.robot.calls if name == "move"]
     assert [name for name, _ in fake.robot.calls] == ["home", "move", "move", "move", "home"]
-    assert moves[0]["wrist_pitch"] == pytest.approx(0.8)
+    assert moves[0]["wrist_pitch"] == pytest.approx(0.5)
     assert moves[1]["lift"] == pytest.approx(FAKE_HOME["lift"] - 0.10)
     assert moves[2]["wrist_roll"] == pytest.approx(np.radians(20.0))
     for targets in moves:  # base, arm and yaw stay at their measured values
@@ -294,3 +294,47 @@ def test_localize_check_goes_home_after_a_failed_first_view(rig, fake):
     assert execution.ok, execution.error
     assert [name for name, _ in fake.robot.calls] == ["home", "move", "home"]
     assert set(execution.result["images"]) == {"view1_home_lift"}
+
+
+class _LowScoreSegmenter(_CenterSquareSegmenter):
+    def segment_text(self, observation, query):
+        from dataclasses import replace
+
+        result = super().segment_text(observation, query)
+        return replace(result, segmentations=(replace(result.segmentations[0], score=0.2),))
+
+
+def test_localize_check_treats_low_sam3_score_as_not_found(fake, kinematics):
+    station = Stretch4Station(BridgeClient(fake.url), kinematics)
+    adapter, runtime = build_stretch4_runtime(
+        station, allow_motion=True, segmentation_provider=_LowScoreSegmenter()
+    )
+    try:
+        source = 'OBJECT = "mug"\n' + open("examples/stretch4/localize_check.py").read()
+        execution = runtime.session.executor.execute_program(source)
+    finally:
+        runtime.close()
+        adapter.close()
+    assert execution.ok, execution.error
+    assert execution.result["views"]["view1_home_lift"] == {
+        "ok": False,
+        "sam3_score": 0.2,
+        "error": "SAM3 score below 0.3",
+    }
+    assert "SAM3 score 0.2 < 0.3" in execution.stdout
+    assert [name for name, _ in fake.robot.calls] == ["home", "move", "home"]
+
+
+def test_wrist_joint_move_moves_pitch_then_roll_and_back(rig, fake):
+    execution = rig.runtime.session.executor.execute_program(
+        open("examples/stretch4/wrist_joint_move.py").read()
+    )
+    assert execution.ok, execution.error
+    steps = execution.result["steps"]
+    assert [step["ok"] for step in steps] == [True] * 4
+    assert [step["commanded"] for step in steps] == pytest.approx([0.3, 0.0, 0.3, 0.0])
+    assert [step["measured"] for step in steps] == pytest.approx([0.3, 0.0, 0.3, 0.0])
+    moves = [targets for name, targets in fake.robot.calls if name == "move"]
+    assert [(m["wrist_pitch"], m["wrist_roll"]) for m in moves] == pytest.approx(
+        [(0.3, 0.0), (0.0, 0.0), (0.0, 0.3), (0.0, 0.0)]
+    )
