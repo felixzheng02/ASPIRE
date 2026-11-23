@@ -28,6 +28,10 @@ WRIST_SIZE = (400, 640)  # rows, columns; the 640x400 wrist setting
 HEAD_SIZE = (800, 1280)
 WRIST_INTRINSICS = [[450.0, 0.0, 320.0], [0.0, 450.0, 200.0], [0.0, 0.0, 1.0]]
 FAKE_DEPTH_MM = 500
+#: A dome this many pixels across and millimetres tall in the middle of the wrist
+#: view, so a segmented object there has 3D extent (a flat patch is degenerate).
+FAKE_OBJECT_RADIUS_PX = 60
+FAKE_OBJECT_HEIGHT_MM = 60
 CAMERAS = ("wrist", "head_center", "head_left", "head_right")
 
 
@@ -42,7 +46,10 @@ def _jpeg(rows: int, columns: int, tint: int) -> str:
 
 
 def _depth_png(rows: int, columns: int) -> str:
-    depth = np.full((rows, columns), FAKE_DEPTH_MM, dtype=np.uint16)
+    y, x = np.mgrid[0:rows, 0:columns]
+    radius = np.hypot(y - rows // 2, x - columns // 2) / FAKE_OBJECT_RADIUS_PX
+    dome = FAKE_OBJECT_HEIGHT_MM * np.sqrt(np.clip(1.0 - radius**2, 0.0, 1.0))
+    depth = (FAKE_DEPTH_MM - dome).astype(np.uint16)
     buffer = io.BytesIO()
     Image.fromarray(depth).save(buffer, format="PNG")
     return base64.b64encode(buffer.getvalue()).decode("ascii")

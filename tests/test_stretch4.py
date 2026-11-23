@@ -125,7 +125,7 @@ def test_observation_has_calibrated_wrist_and_view_only_head_cameras(rig):
     wrist = observation.cameras["wrist"]
     assert wrist.depth_m.shape == wrist.rgb.shape[:2]
     assert wrist.camera_pose.frame == "odom"
-    np.testing.assert_allclose(wrist.depth_m, 0.5)
+    assert wrist.depth_m[0, 0] == pytest.approx(0.5)  # background; the middle has a dome
     snapshot = rig.adapter.monitor_snapshot()
     assert set(snapshot["cameras"]) == {"wrist", "head_center", "head_left", "head_right"}
 
@@ -225,3 +225,72 @@ def test_examples_run_on_fake_bridge(name, capsys):
 
     assert main(["--sim", "--allow-motion", f"examples/stretch4/{name}.py"]) == 0
     assert '"code": "' not in capsys.readouterr().out  # no ApiError anywhere in the result
+
+
+class _CenterSquareSegmenter:
+    """Stands in for SAM3: the object is always the central 40x40 pixels."""
+
+    def segment_text(self, observation, query):
+        from cap_harness.contracts import Segmentation, SegmentationSet
+
+        mask = np.zeros(observation.rgb.shape[:2], dtype=bool)
+        rows, columns = mask.shape
+        mask[rows // 2 - 20 : rows // 2 + 20, columns // 2 - 20 : columns // 2 + 20] = True
+        segmentation = Segmentation(
+            mask=mask, label=query, score=0.9, camera_name="wrist", frame=observation.frame
+        )
+        return SegmentationSet(ok=True, segmentations=(segmentation,))
+
+
+def test_localize_check_moves_one_joint_at_a_time_and_returns_home(fake, kinematics):
+    station = Stretch4Station(BridgeClient(fake.url), kinematics)
+    adapter, runtime = build_stretch4_runtime(
+        station, allow_motion=True, segmentation_provider=_CenterSquareSegmenter()
+    )
+    try:
+        source = 'OBJECT = "mug"\n' + open("examples/stretch4/localize_check.py").read()
+        execution = runtime.session.executor.execute_program(source)
+    finally:
+        runtime.close()
+        adapter.close()
+    assert execution.ok, execution.error
+    result = execution.result
+    assert all(result["steps"].values())
+    assert [view["ok"] for view in result["views"].values()] == [True, True, True]
+    assert result["largest_distance_m"] is not None
+    assert set(result["images"]) == {
+        f"{view}{suffix}"
+        for view in ("view1_home_lift", "view2_lift_lower", "view3_roll")
+        for suffix in ("", "_mask")
+    }
+    moves = [targets for name, targets in fake.robot.calls if name == "move"]
+    assert [name for name, _ in fake.robot.calls] == ["home", "move", "move", "move", "home"]
+    assert moves[0]["wrist_pitch"] == pytest.approx(0.8)
+    assert moves[1]["lift"] == pytest.approx(FAKE_HOME["lift"] - 0.10)
+    assert moves[2]["wrist_roll"] == pytest.approx(np.radians(20.0))
+    for targets in moves:  # base, arm and yaw stay at their measured values
+        for name in ("base_x", "base_y", "base_theta", "arm", "wrist_yaw"):
+            assert targets[name] == pytest.approx(FAKE_HOME.get(name, 0.0))
+
+
+def test_run_program_sets_variables_and_saves_images(tmp_path, capsys):
+    from cap_harness.stretch4.run_program import main
+
+    program = tmp_path / "program.py"
+    program.write_text(
+        'image = get_observation().cameras["wrist"].rgb\n'
+        'result = {"name": NAME, "images": {"wrist": image, "mask": image[:, :, 0] > 0}}\n'
+    )
+    out = tmp_path / "images"
+    assert main(["--sim", "--set", "NAME=red mug", "--save-images", str(out), str(program)]) == 0
+    printed = capsys.readouterr().out
+    assert '"name": "red mug"' in printed
+    assert sorted(path.name for path in out.iterdir()) == ["mask.png", "wrist.png"]
+
+
+def test_localize_check_goes_home_after_a_failed_first_view(rig, fake):
+    source = 'OBJECT = "mug"\n' + open("examples/stretch4/localize_check.py").read()
+    execution = rig.runtime.session.executor.execute_program(source)  # no segmenter: view 1 fails
+    assert execution.ok, execution.error
+    assert [name for name, _ in fake.robot.calls] == ["home", "move", "home"]
+    assert set(execution.result["images"]) == {"view1_home_lift"}
