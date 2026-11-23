@@ -23,6 +23,14 @@ Native MCP schemas are authoritative. The low-level action tools are:
 | `cap_move_to_joints` | `target` containing six joint angles in radians, with `arm` |
 | `cap_set_gripper` | `position` from 0 closed to 1 open, with `arm` |
 
+On the Stretch 4 (embodiment `stretch4`) there is one arm, `primary`; `cap_move_synchronized`
+does not apply. `cap_move_to_joints` takes eight values: `base_x, base_y, base_theta` (odom
+pose, metres and radians), `lift`, `arm` (metres), `wrist_yaw, wrist_pitch, wrist_roll`
+(radians). Use `strategy={"ik_solver":"mink","trajectory_planner":"interpolation"}` for
+`cap_move_to_pose`; nothing checks collisions, so add clearance waypoints yourself. A move
+outside joint limits, or one that would move the base more than 0.5 m along a body axis or turn it more than
+about 90 degrees in one call, is rejected without motion; split large base moves.
+
 An absolute pose includes `position: [x, y, z]` in metres, `frame`, and exactly one
 of `rpy_deg: [roll, pitch, yaw]` or `quaternion_wxyz: [w, x, y, z]`. RPY uses degrees
 and fixed-axis XYZ: `R = Rz(yaw) @ Ry(pitch) @ Rx(roll)` in the declared frame.

@@ -20,6 +20,8 @@ JOINT_DIMENSIONS: Mapping[str, int] = MappingProxyType(
         "robocasa": 7,
         "robosuite": 7,
         "yam_real": 6,
+        # Hello Robot Stretch 4: planar base (x, y, theta) + lift, arm, three wrist joints.
+        "stretch4": 8,
     }
 )
 SUPPORTED_JOINT_DIMENSIONS = frozenset(JOINT_DIMENSIONS.values())

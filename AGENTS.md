@@ -129,3 +129,23 @@ Keep operator communication concise. Report material stage transitions, interven
 completion, and concrete blockers. Do not expose routine monitoring narration or repeat settled
 facts. End with Home only when requested or when the task contract explicitly requires it.
 Home opens both grippers; when placement is requested, place and release the object before Home.
+
+## Stretch 4 station
+
+When the runtime reports embodiment `stretch4` (it exposes `cap_stretch4__get_controller_metadata`),
+the robot is a Hello Robot Stretch 4, not the YAM station. The rules above still apply; these replace
+the YAM-specific details:
+
+- One arm, `primary`, with eight joints in this order: `base_x`, `base_y`, `base_theta`, `lift`,
+  `arm`, `wrist_yaw`, `wrist_pitch`, `wrist_roll` (metres and radians). The base joints are the
+  planar base pose in `odom`; all poses use frame `odom`. There is one gripper.
+- Pose motion uses `strategy={"ik_solver":"mink","trajectory_planner":"interpolation"}`. There is
+  no cuRobo and **no collision checking**: each motion goes directly to its target, every joint on
+  its own speed profile, and nothing avoids the table, objects or the robot body. Plan clearance
+  yourself with intermediate targets.
+- IK may move the base to reach a pose. To keep the base still, use `cap_move_to_joints` with the
+  measured base values.
+- Home moves lift, arm and wrists to the robot's `kitchen_manipulation` pose (lift 0.9 m, arm 0.1 m, wrists 0) and never moves the base. It opens the
+  single gripper; "both grippers" and "both arms" in the startup text mean that one gripper and arm.
+- `wrist` is the only calibrated RGB-D camera; use it for localization. `head_center`,
+  `head_left` and `head_right` are view-only images.

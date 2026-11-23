@@ -32,3 +32,7 @@ Do not home again between tasks unless requested.
 Camera frames include acquisition age and stale/missing flags. Cached pixels do
 not become fresh merely because they were polled again. CAP motions finish
 atomically; the session is not the controller's emergency-stop mechanism.
+
+On the Stretch 4 station (embodiment `stretch4`), read the Stretch 4 section of
+[AGENTS.md](../AGENTS.md) before the first robot command: one 8-joint arm with a
+planar base, mink IK with interpolation, and no collision checking.

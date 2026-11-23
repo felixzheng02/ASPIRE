@@ -101,7 +101,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-video", action="store_true")
     parser.add_argument("--sam3-url")
     parser.add_argument("--curobo-url")
+    parser.add_argument(
+        "--bridge-url", default="http://127.0.0.1:8230", help="aspire_bridge for --station stretch4"
+    )
     args = parser.parse_args(argv)
+    if args.station == "stretch4":
+        from cap_harness.stretch4.runtime import serve
+
+        return serve(args)
     from contextlib import ExitStack
 
     import uvicorn

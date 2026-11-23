@@ -95,10 +95,15 @@ YAM_REAL_PUBLIC_TOOL_NAMES = frozenset(
     {"yam_real.get_task_metadata", "yam_real.get_controller_metadata"}
 )
 
+STRETCH4_PUBLIC_TOOL_NAMES = frozenset(
+    {"stretch4.get_task_metadata", "stretch4.get_controller_metadata"}
+)
+
 _APPROVED_EMBODIMENT_PREFIXES = (
     "behavior.",
     "robocasa.",
     "yam_real.",
+    "stretch4.",
     "libero.",
     "robosuite.",
 )
